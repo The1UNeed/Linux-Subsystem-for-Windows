@@ -1,0 +1,5 @@
+/target
+*.iso
+*.raw
+*.img
+*.fd
