@@ -327,4 +327,39 @@ mod tests {
         assert!(!apps_dir.join(format!("{paint_id}.desktop")).exists());
         assert!(apps_dir.join("org.gnome.Nautilus.desktop").exists());
     }
+
+    /// Writes launchers for hostile ids into `$LSW_DESKTOP_SAMPLES` so an
+    /// external parser (GLib) can check them: `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn write_samples_for_external_parsers() {
+        let Some(dir) = std::env::var_os("LSW_DESKTOP_SAMPLES") else {
+            return;
+        };
+        let apps: Vec<AppEntry> = [
+            "calculator\nExec=/usr/bin/false\n#",
+            r"{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\cmd.exe",
+            "a b\"c'd$e`f\\g;h|i&j*k?l#m(n)o<p>q~r",
+            "100% %f %U %%",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, id)| AppEntry {
+            launch: id.to_string(),
+            name: format!("Sample {i}"),
+            app: format!("sample-{i}"),
+            icon_png: vec![],
+        })
+        .collect();
+        let dir = std::path::PathBuf::from(dir);
+        let n = sync(
+            &apps,
+            &dir.join("applications"),
+            &dir.join("icons"),
+            Path::new("/usr/bin/lsw"),
+            "windows",
+        )
+        .unwrap();
+        println!("{n} launchers written");
+    }
 }

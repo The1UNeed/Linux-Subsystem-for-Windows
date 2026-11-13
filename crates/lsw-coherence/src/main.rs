@@ -365,7 +365,7 @@ impl App {
 
     fn handle_inner(&mut self, update: Update) {
         match update {
-            Update::Guest(msg) => match msg {
+            Update::Guest(msg) => match *msg {
                 CoMessage::Opened(info) => self.open(info),
                 CoMessage::Changed(info) => self.changed(info),
                 CoMessage::Closed { id } => {

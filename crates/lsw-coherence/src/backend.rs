@@ -36,7 +36,8 @@ pub enum Request {
 /// To the Wayland side.
 #[derive(Debug)]
 pub enum Update {
-    Guest(CoMessage),
+    /// Boxed: queue entries stay small whatever the message size.
+    Guest(Box<CoMessage>),
     Disconnected(String),
 }
 
@@ -109,7 +110,7 @@ async fn connection(
                 // blocks, the socket stops being read and the guest is
                 // slowed down instead of filling host memory.
                 let msg = msg?;
-                if tokio::task::block_in_place(|| updates.send(Update::Guest(msg))).is_err() {
+                if tokio::task::block_in_place(|| updates.send(Update::Guest(Box::new(msg)))).is_err() {
                     return Ok(());
                 }
             }
