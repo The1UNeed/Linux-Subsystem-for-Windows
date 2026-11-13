@@ -310,7 +310,7 @@ fn describe(hwnd: HWND) -> Option<WindowInfo> {
     // A popup is mirrored only as part of a window that is mirrored itself:
     // taskbar and desktop tooltips (owned by the shell) are not.
     if kind == WindowKind::Popup {
-        let Some(o) = owner_id else { return None };
+        let o = owner_id?;
         // SAFETY: plain query.
         if !unsafe { IsWindowVisible(o) }.as_bool()
             || SHELL_CLASSES.contains(&class_name(o).as_str())
