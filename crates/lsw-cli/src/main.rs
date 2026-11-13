@@ -13,7 +13,8 @@ mod guest;
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use lsw_daemon::channel::{AgentEvent, Channel, ControlSession, serve_control};
+use lsw_daemon::api;
+use lsw_daemon::channel::{AgentEvent, Channel, ControlCommand, ControlSession, serve_control};
 use lsw_daemon::config::{
     Firmware, GpuTier, InstallMedia, Network, Profile, Share, VmConfig, parse_user_dirs,
 };
@@ -26,6 +27,8 @@ use lsw_daemon::vm::{self, Vm};
 use lsw_installer::{download, media, unattend};
 use lsw_proto::ShareSpec;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -117,6 +120,16 @@ enum Cmd {
         #[command(subcommand)]
         action: UsbAction,
     },
+    /// Windows apps as Linux launchers.
+    Apps {
+        #[command(subcommand)]
+        action: AppsAction,
+    },
+    /// Start a Windows app (starting Windows and Coherence if needed).
+    Launch {
+        /// App id from its launcher (`shell:AppsFolder` id).
+        app: String,
+    },
 }
 
 #[derive(clap::Args, Clone)]
@@ -136,6 +149,12 @@ struct LaunchArgs {
     /// No display for the LSW app (screenshots through `lsw ctl` still work).
     #[arg(long)]
     headless: bool,
+}
+
+#[derive(Subcommand)]
+enum AppsAction {
+    /// Write a launcher for every installed Windows app.
+    Sync,
 }
 
 #[derive(Subcommand)]
@@ -202,6 +221,14 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Ctl { action } => ctl(&paths, action).await,
         Cmd::Clip { action } => clip(&paths, action).await,
         Cmd::Usb { action } => usb(&paths, action).await,
+        Cmd::Apps {
+            action: AppsAction::Sync,
+        } => {
+            let r = api_call(&paths, &api::Request::SyncApps, Duration::from_secs(120)).await?;
+            println!("{} Windows app launcher(s) written", r.apps.unwrap_or(0));
+            Ok(())
+        }
+        Cmd::Launch { app } => launch(&cli.name, &paths, &app).await,
         Cmd::Display { width, height } => {
             let mut s = attach_session(&paths).await?;
             s.display_hint(width, height, 100).await?;
@@ -718,6 +745,7 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
             None
         }
     };
+    let cfg_name = cfg.name.clone();
     let mut running = Vm::new(cfg, paths.clone())
         .start(&host.binaries, &opts)
         .await?;
@@ -734,7 +762,27 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
         shares.len()
     );
     let (port_tx, port_rx) = tokio::sync::mpsc::unbounded_channel();
-    let agent = tokio::spawn(supervise_agent(paths.agent_socket(), shares, port_rx));
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<ControlCommand>();
+    let connected = Arc::new(AtomicBool::new(false));
+    let agent = tokio::spawn(supervise_agent(
+        paths.agent_socket(),
+        shares,
+        port_rx,
+        cmd_rx,
+        connected.clone(),
+        AppSync {
+            paths: paths.clone(),
+            vm: cfg_name,
+            commands: cmd_tx.clone(),
+        },
+    ));
+    let (call_tx, mut call_rx) = tokio::sync::mpsc::unbounded_channel::<api::Call>();
+    let api_path = paths.api_socket();
+    let api_server = tokio::spawn(async move {
+        if let Err(e) = api::serve(&api_path, call_tx).await {
+            tracing::warn!("API socket: {e}");
+        }
+    });
     let result = loop {
         tokio::select! {
             activity = running.next_activity() => match activity {
@@ -758,10 +806,101 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
                 println!("VM powered off ({status}).");
                 break Ok(());
             }
+            call = call_rx.recv() => {
+                if let Some(call) = call {
+                    handle_api_call(call, &connected, &cmd_tx, paths);
+                }
+            }
         }
     };
     agent.abort();
+    api_server.abort();
+    let _ = std::fs::remove_file(paths.api_socket());
     result
+}
+
+/// Answer one API request without blocking the supervisor loop.
+fn handle_api_call(
+    call: api::Call,
+    connected: &AtomicBool,
+    commands: &tokio::sync::mpsc::UnboundedSender<ControlCommand>,
+    paths: &VmPaths,
+) {
+    let api::Call { request, reply } = call;
+    match request {
+        api::Request::Status => {
+            let _ = reply.send(api::Response {
+                agent: Some(connected.load(Ordering::Acquire)),
+                ..api::Response::ok()
+            });
+        }
+        api::Request::Launch { launch } => {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = commands.send(ControlCommand::Launch(launch, tx));
+            tokio::spawn(async move {
+                let r = match rx.await {
+                    Ok(Ok(())) => api::Response::ok(),
+                    Ok(Err(e)) => api::Response::err(e),
+                    Err(_) => api::Response::err("the agent channel closed"),
+                };
+                let _ = reply.send(r);
+            });
+        }
+        api::Request::SyncApps => {
+            let sync = AppSync {
+                paths: paths.clone(),
+                vm: paths
+                    .data
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                commands: commands.clone(),
+            };
+            tokio::spawn(async move {
+                let r = match sync.run().await {
+                    Ok(n) => api::Response {
+                        apps: Some(n),
+                        ..api::Response::ok()
+                    },
+                    Err(e) => api::Response::err(format!("{e:#}")),
+                };
+                let _ = reply.send(r);
+            });
+        }
+    }
+}
+
+/// Writes Linux launchers for the installed Windows apps.
+#[derive(Clone)]
+struct AppSync {
+    paths: VmPaths,
+    vm: String,
+    commands: tokio::sync::mpsc::UnboundedSender<ControlCommand>,
+}
+
+impl AppSync {
+    async fn run(&self) -> anyhow::Result<usize> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.commands
+            .send(ControlCommand::ListApps(tx))
+            .map_err(|_| anyhow::anyhow!("the agent channel is gone"))?;
+        let apps = tokio::time::timeout(Duration::from_secs(90), rx)
+            .await
+            .context("the agent did not list its apps in time")??
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let data_home = guest::data_home(&self.paths)?;
+        let lsw = std::env::current_exe()?;
+        let n = lsw_daemon::apps::sync(
+            &apps,
+            &data_home.join("applications"),
+            &data_home.join("lsw/icons"),
+            &lsw,
+            &self.vm,
+        )?;
+        guest::gnome_app_folder();
+        tracing::info!("{n} Windows app launchers written");
+        Ok(n)
+    }
 }
 
 /// Keep the control channel to the guest agent up for the VM's lifetime.
@@ -769,7 +908,11 @@ async fn supervise_agent(
     socket: PathBuf,
     shares: Vec<ShareSpec>,
     mut port_open: tokio::sync::mpsc::UnboundedReceiver<bool>,
+    mut commands: tokio::sync::mpsc::UnboundedReceiver<ControlCommand>,
+    connected: Arc<AtomicBool>,
+    app_sync: AppSync,
 ) {
+    let mut synced = false;
     loop {
         let mut channel = match Channel::connect(&socket, Duration::from_secs(30)).await {
             Ok(c) => c,
@@ -780,12 +923,25 @@ async fn supervise_agent(
             }
         };
         let mut session = ControlSession::new(shares.clone());
-        let r = serve_control(&mut channel, &mut session, &mut port_open, |event| match event {
+        let r = serve_control(&mut channel, &mut session, &mut port_open, &mut commands, |event| match event {
             AgentEvent::Connected {
                 agent_version,
                 os_build,
                 protocol,
-            } => println!("Agent connected: lsw-agent {agent_version}, Windows {os_build}, protocol {protocol}"),
+            } => {
+                println!("Agent connected: lsw-agent {agent_version}, Windows {os_build}, protocol {protocol}");
+                connected.store(true, Ordering::Release);
+                if !synced {
+                    // Launchers appear once Windows is installed and running.
+                    synced = true;
+                    let sync = app_sync.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = sync.run().await {
+                            tracing::warn!("app launchers: {e:#}");
+                        }
+                    });
+                }
+            }
             AgentEvent::Share { tag, ok, detail } => {
                 if ok {
                     println!("Shared folder {tag} mounted at {detail}");
@@ -796,6 +952,7 @@ async fn supervise_agent(
         })
         .await;
         tracing::info!("agent channel ended: {r:?}");
+        connected.store(false, Ordering::Release);
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
@@ -864,6 +1021,68 @@ async fn clip(paths: &VmPaths, action: ClipAction) -> anyhow::Result<()> {
             println!("clipboard offered to Windows");
         }
     }
+    Ok(())
+}
+
+async fn api_call(
+    paths: &VmPaths,
+    request: &api::Request,
+    timeout: Duration,
+) -> anyhow::Result<api::Response> {
+    let r = api::call(&paths.api_socket(), request, timeout)
+        .await
+        .context("Windows is not running (start it with `lsw run` or the LSW app)")?;
+    if !r.ok {
+        bail!("{}", r.error.unwrap_or_else(|| "request failed".into()));
+    }
+    Ok(r)
+}
+
+/// Start a Windows app from a launcher: bring up Windows and the Coherence
+/// view if needed, then ask the agent to start the app.
+async fn launch(name: &str, paths: &VmPaths, app: &str) -> anyhow::Result<()> {
+    let status = api::call(
+        &paths.api_socket(),
+        &api::Request::Status,
+        Duration::from_secs(2),
+    )
+    .await;
+    if status.is_err() {
+        guest::start_detached("lsw", &["--name", name, "run"], &format!("lsw-vm-{name}"))?;
+    }
+    // Wait for the agent (a cold start takes Windows' boot time).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+    loop {
+        if let Ok(r) = api::call(
+            &paths.api_socket(),
+            &api::Request::Status,
+            Duration::from_secs(2),
+        )
+        .await
+            && r.agent == Some(true)
+        {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            bail!("Windows did not become ready in time");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    if guest::coherence_idle(paths) {
+        guest::start_detached(
+            "lsw-coherence",
+            &["--name", name],
+            &format!("lsw-coherence-{name}"),
+        )?;
+    }
+    api_call(
+        paths,
+        &api::Request::Launch {
+            launch: app.to_owned(),
+        },
+        Duration::from_secs(10),
+    )
+    .await?;
     Ok(())
 }
 

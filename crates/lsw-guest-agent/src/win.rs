@@ -291,7 +291,9 @@ extern "system" fn clipboard_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
         if owner != hwnd
             && let Some(tx) = CLIPBOARD_TX.get()
         {
-            let _ = tx.lock().map(|t| t.send(Event::ClipboardChanged));
+            if let Ok(t) = tx.lock() {
+                let _ = t.send(Event::ClipboardChanged);
+            }
         }
         return LRESULT(0);
     }
@@ -689,6 +691,17 @@ impl Platform for Windows {
         let r = self.change_display(width, height, scale_percent);
         log(format!("display {width}x{height} @{scale_percent}%: {r:?}"));
         r
+    }
+
+    fn list_apps(&mut self) -> Vec<lsw_proto::AppEntry> {
+        let apps = crate::apps::list();
+        log(format!("listed {} apps", apps.len()));
+        apps
+    }
+
+    fn launch(&mut self, launch: &str) -> Result<(), String> {
+        log(format!("launch {launch}"));
+        crate::apps::launch(launch)
     }
 
     fn clipboard_formats(&mut self) -> Vec<ClipFormat> {

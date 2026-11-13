@@ -3,6 +3,8 @@
 //! M0 scope: host probing, VM configuration, QEMU command line, QMP control
 //! and the process supervisor used to boot and install Windows 11.
 
+pub mod api;
+pub mod apps;
 pub mod channel;
 pub mod coherence;
 pub mod config;

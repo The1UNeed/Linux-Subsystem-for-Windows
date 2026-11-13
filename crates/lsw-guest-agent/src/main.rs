@@ -12,6 +12,8 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 #[cfg(windows)]
+mod apps;
+#[cfg(windows)]
 mod coherence;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod core;

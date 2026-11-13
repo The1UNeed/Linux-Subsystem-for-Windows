@@ -6,8 +6,8 @@
 #![forbid(unsafe_code)]
 
 use lsw_proto::{
-    ClipFormat, ClipboardAssembler, Envelope, ErrorCode, Message, PROTOCOL_VERSION, ShareSpec,
-    clipboard_chunks,
+    AppEntry, ClipFormat, ClipboardAssembler, Envelope, ErrorCode, Message, PROTOCOL_VERSION,
+    ShareSpec, clipboard_chunks,
 };
 
 /// Agent version reported in [`Message::Hello`].
@@ -71,6 +71,10 @@ pub trait Platform {
     fn clipboard_read(&mut self, format: ClipFormat) -> Option<Vec<u8>>;
     /// Replace the Windows clipboard with these representations.
     fn clipboard_write(&mut self, items: &[(ClipFormat, Vec<u8>)]) -> Result<(), String>;
+    /// Installed apps, as in Start.
+    fn list_apps(&mut self) -> Vec<AppEntry>;
+    /// Start an app by its shell id.
+    fn launch(&mut self, launch: &str) -> Result<(), String>;
 }
 
 /// Port state: the host attached, and accepted our Hello.
@@ -204,6 +208,20 @@ impl<P: Platform> Agent<P> {
                     Err(e) => vec![error(ErrorCode::Internal, &e)],
                 }
             }
+            (PortId::Control, Message::ListApps) => {
+                let mut out: Vec<Out> = self
+                    .platform
+                    .list_apps()
+                    .into_iter()
+                    .map(|app| reply(Message::App(app)))
+                    .collect();
+                out.push(reply(Message::AppsDone));
+                out
+            }
+            (PortId::Control, Message::Launch { launch }) => match self.platform.launch(&launch) {
+                Ok(()) => Vec::new(),
+                Err(e) => vec![error(ErrorCode::Internal, &e)],
+            },
             (PortId::Control, Message::ShareFolders { shares }) => shares
                 .iter()
                 .map(|share| {
@@ -330,6 +348,7 @@ mod tests {
         shutdowns: Vec<bool>,
         displays: Vec<(u32, u32, u16)>,
         mounts: Vec<String>,
+        launched: Vec<String>,
     }
 
     impl Platform for Mock {
@@ -362,6 +381,18 @@ mod tests {
         }
         fn clipboard_write(&mut self, items: &[(ClipFormat, Vec<u8>)]) -> Result<(), String> {
             self.clipboard = items.to_vec();
+            Ok(())
+        }
+        fn list_apps(&mut self) -> Vec<AppEntry> {
+            vec![AppEntry {
+                launch: "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App".into(),
+                name: "Calculator".into(),
+                app: "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App".into(),
+                icon_png: vec![],
+            }]
+        }
+        fn launch(&mut self, launch: &str) -> Result<(), String> {
+            self.launched.push(launch.to_owned());
             Ok(())
         }
     }
@@ -457,6 +488,30 @@ mod tests {
         );
         assert!(matches!(out[0].msg, Message::Error { .. }));
         assert!(a.platform.displays.is_empty());
+    }
+
+    #[test]
+    fn apps_are_listed_and_launched_on_the_control_port() {
+        let mut a = Agent::new(Mock::default());
+        attach(&mut a, PortId::Control);
+        let out = a.on_message(PortId::Control, env(5, Message::ListApps));
+        assert!(matches!(&out[0].msg, Message::App(app) if app.name == "Calculator"));
+        assert_eq!(out.last().unwrap().msg, Message::AppsDone);
+        assert!(out.iter().all(|o| o.reply_to == Some(5)));
+        a.on_message(
+            PortId::Control,
+            env(
+                6,
+                Message::Launch {
+                    launch: "x!App".into(),
+                },
+            ),
+        );
+        assert_eq!(a.platform.launched, ["x!App"]);
+        // Not on the session port.
+        attach(&mut a, PortId::Session);
+        let out = a.on_message(PortId::Session, env(7, Message::ListApps));
+        assert!(matches!(out[0].msg, Message::Error { .. }));
     }
 
     #[test]

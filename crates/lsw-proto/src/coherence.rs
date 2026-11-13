@@ -78,9 +78,12 @@ pub struct WindowInfo {
     pub owner: Option<u64>,
     pub kind: WindowKind,
     pub title: String,
-    /// Executable path, e.g. `C:\Windows\System32\notepad.exe` (identifies
-    /// the app: one Linux app per Windows app).
+    /// Executable path, e.g. `C:\Windows\System32\notepad.exe`.
     pub exe: String,
+    /// App identity (AppUserModelID, else the executable file name); the
+    /// same value as [`crate::AppEntry::app`], so a window and its launcher
+    /// are one Linux app.
+    pub app: String,
     pub rect: Rect,
     pub state: WindowState,
 }
@@ -172,7 +175,11 @@ fn check_window(width: u32, height: u32) -> Result<(), ProtoError> {
 }
 
 fn check_info(info: &WindowInfo) -> Result<(), ProtoError> {
-    for (field, s) in [("title", &info.title), ("exe", &info.exe)] {
+    for (field, s) in [
+        ("title", &info.title),
+        ("exe", &info.exe),
+        ("app", &info.app),
+    ] {
         if s.len() > MAX_STRING_LEN {
             return Err(ProtoError::FieldTooLong {
                 field,
@@ -405,6 +412,7 @@ mod tests {
             kind: WindowKind::Normal,
             title: "x".repeat(MAX_STRING_LEN + 1),
             exe: String::new(),
+            app: String::new(),
             rect: Rect::default(),
             state: WindowState::Normal,
         });

@@ -6,13 +6,14 @@
 //! the caller. A protocol error ends the connection.
 
 use lsw_proto::{
-    Envelope, ErrorCode, FrameDecoder, Message, PROTOCOL_VERSION, ProtoError, ShareSpec, encode,
-    negotiate,
+    AppEntry, Envelope, ErrorCode, FrameDecoder, Message, PROTOCOL_VERSION, ProtoError, ShareSpec,
+    encode, negotiate,
 };
 use std::path::Path;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
+use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ChannelError {
@@ -219,6 +220,21 @@ impl ControlSession {
     }
 }
 
+/// Requests the supervisor sends through the control channel.
+#[derive(Debug)]
+pub enum ControlCommand {
+    /// List installed Windows apps.
+    ListApps(AppsReply),
+    /// Start an app by its shell id.
+    Launch(String, oneshot::Sender<Result<(), String>>),
+}
+
+/// Where an app listing is delivered.
+pub type AppsReply = oneshot::Sender<Result<Vec<AppEntry>, String>>;
+
+/// Most app entries accepted in one listing (the guest is untrusted).
+const MAX_APPS: usize = 2048;
+
 /// Ping interval once the agent is accepted.
 pub const KEEPALIVE: Duration = Duration::from_secs(5);
 
@@ -231,9 +247,12 @@ pub const KEEPALIVE: Duration = Duration::from_secs(5);
 pub async fn serve_control<S: AsyncRead + AsyncWrite + Unpin>(
     channel: &mut Channel<S>,
     session: &mut ControlSession,
-    port_open: &mut tokio::sync::mpsc::UnboundedReceiver<bool>,
+    port_open: &mut mpsc::UnboundedReceiver<bool>,
+    commands: &mut mpsc::UnboundedReceiver<ControlCommand>,
     mut on_event: impl FnMut(AgentEvent),
 ) -> Result<(), ChannelError> {
+    // A listing in progress: the requester and the entries so far.
+    let mut listing: Option<(AppsReply, Vec<AppEntry>)> = None;
     let attach = Message::Attach {
         protocol: PROTOCOL_VERSION,
     };
@@ -257,7 +276,45 @@ pub async fn serve_control<S: AsyncRead + AsyncWrite + Unpin>(
                 channel.send(Message::Ping { nonce }).await?;
                 continue;
             }
+            cmd = commands.recv() => {
+                match cmd {
+                    Some(ControlCommand::ListApps(reply)) if session.accepted() => {
+                        channel.send(Message::ListApps).await?;
+                        listing = Some((reply, Vec::new()));
+                    }
+                    Some(ControlCommand::Launch(id, reply)) if session.accepted() => {
+                        channel.send(Message::Launch { launch: id }).await?;
+                        let _ = reply.send(Ok(()));
+                    }
+                    Some(ControlCommand::ListApps(reply)) => {
+                        let _ = reply.send(Err("the guest agent is not connected".into()));
+                    }
+                    Some(ControlCommand::Launch(_, reply)) => {
+                        let _ = reply.send(Err("the guest agent is not connected".into()));
+                    }
+                    None => {}
+                }
+                continue;
+            }
         };
+        // App listings are collected here, not in the session state machine.
+        match &env.msg {
+            Message::App(app) if session.accepted() => {
+                if let Some((_, apps)) = listing.as_mut()
+                    && apps.len() < MAX_APPS
+                {
+                    apps.push(app.clone());
+                }
+                continue;
+            }
+            Message::AppsDone if session.accepted() => {
+                if let Some((reply, apps)) = listing.take() {
+                    let _ = reply.send(Ok(apps));
+                }
+                continue;
+            }
+            _ => {}
+        }
         let (replies, event) = session.handle(&env);
         for (reply_to, msg) in replies {
             match reply_to {
@@ -400,7 +457,11 @@ mod tests {
         let mut session = ControlSession::new(shares());
         let mut events = Vec::new();
         let (_open_tx, mut open_rx) = tokio::sync::mpsc::unbounded_channel();
-        let r = serve_control(&mut host, &mut session, &mut open_rx, |e| events.push(e)).await;
+        let (_cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let r = serve_control(&mut host, &mut session, &mut open_rx, &mut cmd_rx, |e| {
+            events.push(e)
+        })
+        .await;
         agent.await.unwrap();
         assert!(matches!(
             r,

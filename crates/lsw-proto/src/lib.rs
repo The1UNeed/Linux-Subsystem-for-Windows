@@ -70,6 +70,9 @@ pub const MAX_LIST_LEN: usize = 32;
 /// Longest share tag (virtiofs tags are at most 36 bytes).
 pub const MAX_TAG_LEN: usize = 36;
 
+/// Largest app icon (PNG) in an [`Message::App`] entry.
+pub const MAX_ICON_LEN: usize = 64 * 1024;
+
 /// Length of the frame header in bytes.
 pub const HEADER_LEN: usize = 4;
 
@@ -141,6 +144,29 @@ pub enum Message {
     /// Host → guest, first frame after a host endpoint connects: the guest
     /// answers with [`Message::Hello`].
     Attach { protocol: u16 },
+    /// Host → guest: list the installed apps (answered with one
+    /// [`Message::App`] per app, then [`Message::AppsDone`]).
+    ListApps,
+    /// Guest → host: one installed app.
+    App(AppEntry),
+    /// Guest → host: end of the app list.
+    AppsDone,
+    /// Host → guest: start an app by its [`AppEntry::launch`] id.
+    Launch { launch: String },
+}
+
+/// An installed Windows app, as listed in Start.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AppEntry {
+    /// Shell id used to start it (`shell:AppsFolder\<launch>`).
+    pub launch: String,
+    /// Display name.
+    pub name: String,
+    /// Identity shared with its windows ([`coherence::WindowInfo::app`]):
+    /// the AppUserModelID, else the executable file name.
+    pub app: String,
+    /// 64×64 PNG icon (may be empty).
+    pub icon_png: Vec<u8>,
 }
 
 /// Clipboard formats carried between the hosts.
@@ -304,6 +330,21 @@ impl Envelope {
                     Err(ProtoError::BadRange)
                 }
             }
+            Message::App(app) => {
+                bounded("launch", &app.launch)?;
+                bounded("name", &app.name)?;
+                bounded("app", &app.app)?;
+                if app.icon_png.len() > MAX_ICON_LEN {
+                    return Err(ProtoError::FieldTooLong {
+                        field: "icon_png",
+                        len: app.icon_png.len(),
+                        limit: MAX_ICON_LEN,
+                    });
+                }
+                Ok(())
+            }
+            Message::Launch { launch } => bounded("launch", launch),
+            Message::ListApps | Message::AppsDone => Ok(()),
             Message::Welcome { .. }
             | Message::Ping { .. }
             | Message::Pong { .. }
@@ -311,6 +352,33 @@ impl Envelope {
             | Message::ClipboardRequest { .. }
             | Message::Attach { .. } => Ok(()),
         }
+    }
+}
+
+/// The Linux identity of a Windows app: `lsw.<slug>` where the slug keeps
+/// `[a-z0-9]` and turns everything else into `-`. Used as the Wayland
+/// `app_id` of its windows and the `StartupWMClass` of its launcher, so
+/// docks group them.
+pub fn linux_app_id(app: &str) -> String {
+    let slug: String = app
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let slug = slug.trim_matches('-');
+    let slug: String = slug.chars().take(64).collect();
+    format!("lsw.{}", if slug.is_empty() { "windows" } else { &slug })
+}
+
+/// App identity from an AppUserModelID or an executable path.
+pub fn app_identity(aumid: Option<&str>, exe: &str) -> String {
+    match aumid.map(str::trim).filter(|a| !a.is_empty()) {
+        Some(a) => a.to_owned(),
+        None => exe
+            .rsplit(['\\', '/'])
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase(),
     }
 }
 
@@ -821,6 +889,40 @@ mod tests {
         assert_eq!(a, agent_build_id("0.0.1-alpha", b"MZ one"));
         assert_ne!(a, agent_build_id("0.0.1-alpha", b"MZ two"));
         assert!(a.starts_with("0.0.1-alpha+") && a.len() == "0.0.1-alpha+".len() + 16);
+    }
+
+    #[test]
+    fn app_identities_match_between_windows_and_launchers() {
+        let calc = app_identity(
+            Some("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"),
+            "C:\\x\\ApplicationFrameHost.exe",
+        );
+        assert_eq!(
+            linux_app_id(&calc),
+            "lsw.microsoft-windowscalculator-8wekyb3d8bbwe-app"
+        );
+        let notepad = app_identity(None, "C:\\Windows\\System32\\NOTEPAD.EXE");
+        assert_eq!(notepad, "notepad.exe");
+        assert_eq!(linux_app_id(&notepad), "lsw.notepad-exe");
+        assert_eq!(linux_app_id(""), "lsw.windows");
+        assert_eq!(app_identity(Some("  "), "a.exe"), "a.exe");
+    }
+
+    #[test]
+    fn app_entries_are_bounded() {
+        let app = |icon: usize| {
+            Message::App(AppEntry {
+                launch: "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App".into(),
+                name: "Calculator".into(),
+                app: "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App".into(),
+                icon_png: vec![0; icon],
+            })
+        };
+        assert!(roundtrip(app(1000)).is_ok());
+        assert!(matches!(
+            roundtrip(app(MAX_ICON_LEN + 1)),
+            Err(ProtoError::FieldTooLong { .. })
+        ));
     }
 
     #[test]

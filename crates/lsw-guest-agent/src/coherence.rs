@@ -283,6 +283,7 @@ fn describe(hwnd: HWND) -> Option<WindowInfo> {
     if !iconic && (w < 2 || h < 2) {
         return None;
     }
+    let exe = exe_path(hwnd);
     // Popups without an owner (menus) belong to the foreground window's
     // root owner.
     let owner_id = owner
@@ -299,7 +300,8 @@ fn describe(hwnd: HWND) -> Option<WindowInfo> {
         owner: owner_id,
         kind,
         title: title(hwnd),
-        exe: exe_path(hwnd),
+        app: crate::apps::window_app(hwnd, &exe),
+        exe,
         rect: Rect {
             x: r.left,
             y: r.top,

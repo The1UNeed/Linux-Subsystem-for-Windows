@@ -81,6 +81,14 @@ impl VmPaths {
     pub fn session_socket(&self) -> PathBuf {
         self.run.join("session.sock")
     }
+    /// Held (flock) by the running Coherence client.
+    pub fn coherence_lock(&self) -> PathBuf {
+        self.run.join("coherence.lock")
+    }
+    /// The supervisor's API socket.
+    pub fn api_socket(&self) -> PathBuf {
+        self.run.join("lsw.sock")
+    }
     /// virtio-serial Coherence channel (window list and frames).
     pub fn coherence_socket(&self) -> PathBuf {
         self.run.join("coherence.sock")
@@ -123,6 +131,7 @@ impl VmPaths {
             self.agent_socket(),
             self.session_socket(),
             self.coherence_socket(),
+            self.api_socket(),
             self.ui_qmp_socket(),
             self.tpm_socket(),
             self.passt_socket(),

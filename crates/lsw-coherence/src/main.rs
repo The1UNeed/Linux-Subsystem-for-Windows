@@ -59,30 +59,6 @@ fn qemu_button(linux: u32) -> Option<u32> {
     })
 }
 
-/// `lsw.<exe stem>`: one Linux app per Windows app (matches the generated
-/// `.desktop` files).
-fn app_id(exe: &str) -> String {
-    let stem = exe
-        .rsplit(['\\', '/'])
-        .next()
-        .unwrap_or("windows")
-        .trim_end_matches(".exe")
-        .trim_end_matches(".EXE")
-        .to_ascii_lowercase();
-    let clean: String = stem
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    format!(
-        "lsw.{}",
-        if clean.is_empty() {
-            "windows".into()
-        } else {
-            clean
-        }
-    )
-}
-
 enum Shell {
     Toplevel(Window),
     Popup(Popup),
@@ -164,7 +140,7 @@ impl App {
             info.id,
             info.kind,
             info.title,
-            app_id(&info.exe),
+            lsw_proto::linux_app_id(&info.app),
             info.rect.width,
             info.rect.height
         );
@@ -208,7 +184,7 @@ impl App {
                     .xdg
                     .create_window(surface, WindowDecorations::RequestClient, &self.qh);
                 w.set_title(&info.title);
-                w.set_app_id(app_id(&info.exe));
+                w.set_app_id(lsw_proto::linux_app_id(&info.app));
                 w.set_min_size(Some((64, 32)));
                 if let (WindowKind::Dialog, Some(parent)) = (info.kind, owner)
                     && let Shell::Toplevel(pw) = &parent.shell
@@ -400,6 +376,17 @@ fn main() -> anyhow::Result<()> {
         .nth(1)
         .unwrap_or_else(|| "windows".into());
     let paths = lsw_daemon::paths::VmPaths::resolve(&name)?;
+    paths.create()?;
+    // One Coherence client per VM: launchers check this lock.
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(paths.coherence_lock())?;
+    if lock.try_lock().is_err() {
+        tracing::info!("Coherence is already running for {name}");
+        return Ok(());
+    }
 
     let conn = Connection::connect_to_env()?;
     let (globals, queue) = registry_queue_init(&conn)?;
@@ -584,15 +571,15 @@ impl SeatHandler for App {
         _: wl_seat::WlSeat,
         cap: Capability,
     ) {
-        if cap == Capability::Pointer {
-            if let Some(p) = self.pointer.take() {
-                p.release();
-            }
+        if cap == Capability::Pointer
+            && let Some(p) = self.pointer.take()
+        {
+            p.release();
         }
-        if cap == Capability::Keyboard {
-            if let Some(k) = self.keyboard.take() {
-                k.release();
-            }
+        if cap == Capability::Keyboard
+            && let Some(k) = self.keyboard.take()
+        {
+            k.release();
         }
     }
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
@@ -806,14 +793,6 @@ delegate_registry!(App);
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn app_ids_are_stable_and_safe() {
-        assert_eq!(app_id("C:\\Windows\\System32\\notepad.exe"), "lsw.notepad");
-        assert_eq!(app_id("C:\\Program Files\\Foo Bar\\FOO.EXE"), "lsw.foo");
-        assert_eq!(app_id("C:\\x\\my app (x86).exe"), "lsw.my-app--x86-");
-        assert_eq!(app_id(""), "lsw.windows");
-    }
 
     #[test]
     fn buttons_map() {
