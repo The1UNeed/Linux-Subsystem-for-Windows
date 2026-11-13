@@ -589,9 +589,12 @@ impl Windows {
 
 impl Windows {
     fn change_display(&self, width: u32, height: u32, scale_percent: u16) -> Result<(), String> {
-        if !display_modes().contains(&(width, height)) {
-            // The host normally resizes the display itself (virtio-gpu
-            // display info); this path only switches between listed modes.
+        // The host first announces the size through virtio-gpu (new EDID
+        // and display-info event); viogpudo then lists it as a mode. Give
+        // the driver a moment to pick it up, then switch to it.
+        if !wait_until(Duration::from_secs(3), || {
+            display_modes().contains(&(width, height))
+        }) {
             return Err(format!("{width}x{height} is not a mode of this display"));
         }
         let mode = DEVMODEW {

@@ -1,6 +1,15 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# lsw-app needs GTK 4 and libadwaita development files; build it explicitly
+# (`cargo build --workspace`, as CI does) on Linux.
+default-members = [
+    "crates/lsw-proto",
+    "crates/lsw-daemon",
+    "crates/lsw-installer",
+    "crates/lsw-cli",
+    "crates/lsw-guest-agent",
+]
 
 [workspace.package]
 version = "0.0.1-alpha"
@@ -30,6 +39,11 @@ sha2 = "0.11.1"
 hex = "0.4.3"
 hadris-iso = { version = "2.5", features = ["joliet"] }
 png = "0.18"
+async-channel = "2.5"
+zbus = { version = "5.19", default-features = false, features = ["tokio", "p2p"] }
+gtk = { package = "gtk4", version = "0.11" }
+adw = { package = "libadwaita", version = "0.9" }
+rustix = { version = "1.1", default-features = false, features = ["std", "net"] }
 windows = "0.62"
 tempfile = "3.27.0"
 

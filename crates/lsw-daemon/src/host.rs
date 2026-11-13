@@ -58,6 +58,8 @@ pub struct HostReport {
     pub iommu_groups: usize,
     /// A PipeWire server is reachable for the user (guest audio).
     pub pipewire: bool,
+    /// QEMU has the D-Bus display module (needed by the LSW app).
+    pub qemu_dbus_display: bool,
     pub gpus: Vec<Gpu>,
     /// Usable GPU tiers, in [`GpuTier`] order (A first, D last; D is always present).
     pub tiers: Vec<GpuTier>,
@@ -76,6 +78,11 @@ impl HostReport {
     pub fn probe() -> Self {
         let mut report = Self::probe_root(Path::new("/"), &search_path());
         report.pipewire = pipewire_socket().is_some_and(|s| s.exists());
+        report.qemu_dbus_display = report
+            .binaries
+            .qemu
+            .as_deref()
+            .is_some_and(qemu_has_dbus_display);
         report
     }
 
@@ -98,6 +105,7 @@ impl HostReport {
             mem_total_mib: parse_meminfo_total_mib(&meminfo),
             iommu_groups,
             pipewire: false,
+            qemu_dbus_display: false,
             gpus,
             tiers: Vec::new(),
             binaries: find_binaries(path),
@@ -213,6 +221,13 @@ impl HostReport {
                 fix: "Install virtiofsd and uidmap (Ubuntu) or virtiofsd and shadow (Arch)".into(),
             });
         }
+        if self.binaries.qemu.is_some() && !self.qemu_dbus_display {
+            out.push(Problem {
+                what: "QEMU lacks the D-Bus display: the LSW window cannot show Windows".into(),
+                fix: "Install qemu-ui-dbus (Arch) or qemu-system-modules-opengl (Debian/Ubuntu)"
+                    .into(),
+            });
+        }
         if self.binaries.passt.is_none() {
             out.push(Problem {
                 what: "passt not found: using QEMU's slower built-in networking".into(),
@@ -221,6 +236,19 @@ impl HostReport {
         }
         out
     }
+}
+
+/// Whether `qemu -display help` lists the D-Bus display (a loadable module
+/// some distributions package separately, e.g. Arch's `qemu-ui-dbus`).
+fn qemu_has_dbus_display(qemu: &Path) -> bool {
+    std::process::Command::new(qemu)
+        .args(["-display", "help"])
+        .output()
+        .is_ok_and(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(|l| l.trim() == "dbus")
+        })
 }
 
 /// The user's PipeWire socket (`$PIPEWIRE_RUNTIME_DIR` or

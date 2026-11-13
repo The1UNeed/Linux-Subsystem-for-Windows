@@ -5,6 +5,7 @@
 
 pub mod channel;
 pub mod config;
+pub mod display;
 pub mod firmware;
 pub mod host;
 pub mod paths;

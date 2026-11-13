@@ -369,7 +369,7 @@ pub fn build_args(cfg: &VmConfig, paths: &VmPaths, opts: &LaunchOptions) -> Vec<
     push(&[
         "-device",
         &format!(
-            "virtio-vga,id=video0,xres=1280,yres=800,bus=pcie.0,addr={}",
+            "virtio-vga,id=video0,xres=1280,yres=800,edid=on,bus=pcie.0,addr={}",
             slot::VGA
         ),
     ]);

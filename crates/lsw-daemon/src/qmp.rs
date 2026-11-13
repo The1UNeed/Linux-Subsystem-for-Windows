@@ -101,6 +101,26 @@ impl Qmp {
         command: &str,
         arguments: Option<Value>,
     ) -> Result<Value, QmpError> {
+        self.execute_inner(command, arguments, None).await
+    }
+
+    /// Run a command with a file descriptor attached (`SCM_RIGHTS`), as
+    /// `getfd` and `add-fd` require.
+    pub async fn execute_with_fd(
+        &mut self,
+        command: &str,
+        arguments: Option<Value>,
+        fd: std::os::fd::BorrowedFd<'_>,
+    ) -> Result<Value, QmpError> {
+        self.execute_inner(command, arguments, Some(fd)).await
+    }
+
+    async fn execute_inner(
+        &mut self,
+        command: &str,
+        arguments: Option<Value>,
+        fd: Option<std::os::fd::BorrowedFd<'_>>,
+    ) -> Result<Value, QmpError> {
         let id = self.next_id;
         self.next_id += 1;
         let mut req = json!({ "execute": command, "id": id });
@@ -109,7 +129,10 @@ impl Qmp {
         }
         let mut line = serde_json::to_vec(&req)?;
         line.push(b'\n');
-        self.writer.write_all(&line).await?;
+        match fd {
+            None => self.writer.write_all(&line).await?,
+            Some(fd) => self.send_with_fd(&line, fd).await?,
+        }
         loop {
             let msg = self.read_message().await?;
             if let Some(event) = as_event(&msg) {
@@ -138,6 +161,36 @@ impl Qmp {
                     .to_owned(),
             });
         }
+    }
+
+    /// Write `line` with `fd` as ancillary data. The fd travels with the
+    /// first byte; the rest of the line follows normally.
+    async fn send_with_fd(
+        &mut self,
+        line: &[u8],
+        fd: std::os::fd::BorrowedFd<'_>,
+    ) -> std::io::Result<()> {
+        // Rust ignores SIGPIPE process-wide, so no MSG_NOSIGNAL is needed.
+        use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags, sendmsg};
+        use std::os::fd::AsFd;
+        let stream: &tokio::net::UnixStream = self.writer.as_ref();
+        let sent = loop {
+            stream.writable().await?;
+            let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+            let mut control = SendAncillaryBuffer::new(&mut space);
+            let fds = [fd];
+            control.push(SendAncillaryMessage::ScmRights(&fds));
+            let iov = [std::io::IoSlice::new(line)];
+            match stream.try_io(tokio::io::Interest::WRITABLE, || {
+                sendmsg(stream.as_fd(), &iov, &mut control, SendFlags::empty())
+                    .map_err(std::io::Error::from)
+            }) {
+                Ok(n) => break n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Err(e),
+            }
+        };
+        self.writer.write_all(&line[sent..]).await
     }
 
     /// Next asynchronous event (queued or freshly read). Cancel-safe.

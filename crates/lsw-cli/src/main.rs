@@ -128,6 +128,9 @@ struct LaunchArgs {
     /// No sound device, even when PipeWire is running.
     #[arg(long)]
     no_audio: bool,
+    /// No display for the LSW app (screenshots through `lsw ctl` still work).
+    #[arg(long)]
+    headless: bool,
 }
 
 #[derive(Subcommand)]
@@ -218,6 +221,7 @@ fn doctor(json: bool) -> anyhow::Result<()> {
         );
         println!("IOMMU groups: {}", report.iommu_groups);
         println!("PipeWire:     {}", yes(report.pipewire));
+        println!("D-Bus display: {}", yes(report.qemu_dbus_display));
         for g in &report.gpus {
             println!(
                 "GPU:          {} {:04x}:{:04x} driver={} boot_vga={} vfs={} render={}",
@@ -595,7 +599,9 @@ fn launch_options(host: &HostReport, l: &LaunchArgs) -> LaunchOptions {
     LaunchOptions {
         display: match &l.vnc {
             Some(p) => lsw_daemon::qemu::Display::VncUnix(p.clone()),
-            None => lsw_daemon::qemu::Display::Headless,
+            None if l.headless || !host.qemu_dbus_display => lsw_daemon::qemu::Display::Headless,
+            // The LSW app attaches to this peer-to-peer D-Bus display.
+            None => lsw_daemon::qemu::Display::DbusP2p,
         },
         disk_io: if l.disk_threads {
             DiskIo::Threads
