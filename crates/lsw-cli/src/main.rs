@@ -9,18 +9,22 @@
 //! * `lsw run` – boot the installed VM in the foreground.
 //! * `lsw ctl` – talk to a running VM (status, pause, resume, screenshot…).
 
+mod guest;
+
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand, ValueEnum};
+use lsw_daemon::channel::{AgentEvent, Channel, ControlSession, serve_control};
 use lsw_daemon::config::{
     Firmware, GpuTier, InstallMedia, Network, Profile, Share, VmConfig, parse_user_dirs,
 };
 use lsw_daemon::firmware;
 use lsw_daemon::host::HostReport;
 use lsw_daemon::paths::VmPaths;
-use lsw_daemon::qemu::{Audio, DiskIo, LaunchOptions};
+use lsw_daemon::qemu::{Audio, CONTROL_PORT_ID, DiskIo, LaunchOptions};
 use lsw_daemon::qmp::Qmp;
 use lsw_daemon::vm::{self, Vm};
 use lsw_installer::{download, media, unattend};
+use lsw_proto::ShareSpec;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -132,6 +136,14 @@ enum CtlAction {
     Powerdown,
     /// Stop QEMU immediately.
     Quit,
+    /// Type ASCII text into the guest (US layout; `\n` presses Enter).
+    Type {
+        text: String,
+    },
+    /// Press a key combination, e.g. `meta_l+r` (QKeyCode names).
+    Key {
+        combo: String,
+    },
 }
 
 #[tokio::main]
@@ -161,11 +173,12 @@ async fn main() -> anyhow::Result<()> {
 fn doctor(json: bool) -> anyhow::Result<()> {
     let report = HostReport::probe();
     let problems = report.problems();
+    let warnings = report.warnings();
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(
-                &serde_json::json!({ "host": report, "problems": problems })
+                &serde_json::json!({ "host": report, "problems": problems, "warnings": warnings })
             )?
         );
     } else {
@@ -202,12 +215,19 @@ fn doctor(json: bool) -> anyhow::Result<()> {
             ("swtpm", &b.swtpm),
             ("passt", &b.passt),
             ("virtiofsd", &b.virtiofsd),
+            ("newuidmap", &b.newuidmap),
         ] {
             println!(
                 "{name:<13} {}",
                 p.as_ref()
                     .map_or("not found".into(), |p| p.display().to_string())
             );
+        }
+        if !warnings.is_empty() {
+            println!("\nWarnings:");
+            for p in &warnings {
+                println!("  - {}\n    fix: {}", p.what, p.fix);
+            }
         }
         if problems.is_empty() {
             println!("\nThis host can run LSW.");
@@ -272,13 +292,7 @@ async fn create(name: &str, paths: &VmPaths, a: CreateArgs) -> anyhow::Result<()
     }
     let host = HostReport::probe();
     paths.create()?;
-    let cache = paths
-        .data
-        .parent()
-        .and_then(Path::parent)
-        .context("data dir layout")?
-        .join("cache");
-    std::fs::create_dir_all(&cache)?;
+    let cache = guest::cache_dir(paths)?;
 
     let profile = match a.profile {
         ProfileArg::Productivity => Profile::Productivity,
@@ -384,12 +398,17 @@ async fn create(name: &str, paths: &VmPaths, a: CreateArgs) -> anyhow::Result<()
         image_index,
         product_key: None,
     })?;
+    let payload = guest::Payload::load(&cache).await?;
+    match &payload {
+        Some(p) => eprintln!("Including LSW agent {} in the setup medium.", p.build_id),
+        None => eprintln!("note: no lsw-agent.exe found; Windows will install without the agent"),
+    }
     let setup_iso = paths.data.join("setup.iso");
     media::build_setup_media(
         &setup_iso,
         &xml,
         &media::FirstBootConfig { test_signing },
-        None,
+        payload.as_ref().map(guest::Payload::as_guest),
     )?;
     restrict_file(&setup_iso)?;
 
@@ -566,6 +585,7 @@ fn launch_options(host: &HostReport, l: &LaunchArgs) -> LaunchOptions {
         } else {
             Audio::None
         },
+        tools_iso: None,
         sandbox: !l.no_sandbox,
     }
 }
@@ -644,20 +664,94 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
         bail!("Windows is not installed yet; run `lsw install` first");
     }
     let host = HostReport::probe();
-    let opts = launch_options(&host, l);
+    let mut opts = launch_options(&host, l);
+    opts.tools_iso = match guest::prepare_tools(paths).await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("warning: LSW Tools CD not built: {e:#}");
+            None
+        }
+    };
     let mut running = Vm::new(cfg, paths.clone())
         .start(&host.binaries, &opts)
         .await?;
-    println!("VM running. Control it with `lsw ctl …`; Ctrl+C shuts Windows down.");
-    tokio::select! {
-        status = running.wait() => println!("QEMU exited: {}", status?),
-        _ = tokio::signal::ctrl_c() => {
-            println!("Shutting Windows down…");
-            let status = running.shutdown(Duration::from_secs(120)).await?;
-            println!("VM powered off ({status}).");
+    let shares: Vec<ShareSpec> = running
+        .shares
+        .iter()
+        .map(|s| ShareSpec {
+            tag: s.tag.clone(),
+            folder: s.folder,
+        })
+        .collect();
+    println!(
+        "VM running ({} shared folder(s)). Control it with `lsw ctl …`; Ctrl+C shuts Windows down.",
+        shares.len()
+    );
+    let (port_tx, port_rx) = tokio::sync::mpsc::unbounded_channel();
+    let agent = tokio::spawn(supervise_agent(paths.agent_socket(), shares, port_rx));
+    let result = loop {
+        tokio::select! {
+            activity = running.next_activity() => match activity {
+                vm::Activity::Exited(status) => {
+                    println!("QEMU exited: {}", status?);
+                    break Ok(());
+                }
+                vm::Activity::Event(event) => {
+                    let event = event?;
+                    if event.name == "VSERPORT_CHANGE"
+                        && event.data.get("id").and_then(|v| v.as_str()) == Some(CONTROL_PORT_ID)
+                    {
+                        let open = event.data.get("open").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let _ = port_tx.send(open);
+                    }
+                }
+            },
+            _ = tokio::signal::ctrl_c() => {
+                println!("Shutting Windows down…");
+                let status = running.shutdown(Duration::from_secs(120)).await?;
+                println!("VM powered off ({status}).");
+                break Ok(());
+            }
         }
+    };
+    agent.abort();
+    result
+}
+
+/// Keep the control channel to the guest agent up for the VM's lifetime.
+async fn supervise_agent(
+    socket: PathBuf,
+    shares: Vec<ShareSpec>,
+    mut port_open: tokio::sync::mpsc::UnboundedReceiver<bool>,
+) {
+    loop {
+        let mut channel = match Channel::connect(&socket, Duration::from_secs(30)).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("agent channel: {e}");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+        let mut session = ControlSession::new(shares.clone());
+        let r = serve_control(&mut channel, &mut session, &mut port_open, |event| match event {
+            AgentEvent::Connected {
+                agent_version,
+                os_build,
+                protocol,
+            } => println!("Agent connected: lsw-agent {agent_version}, Windows {os_build}, protocol {protocol}"),
+            AgentEvent::Share { tag, ok, detail } => {
+                if ok {
+                    println!("Shared folder {tag} mounted at {detail}");
+                } else {
+                    println!("Shared folder {tag} failed: {detail}");
+                }
+            }
+        })
+        .await;
+        tracing::info!("agent channel ended: {r:?}");
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    Ok(())
 }
 
 async fn ctl(paths: &VmPaths, action: CtlAction) -> anyhow::Result<()> {
@@ -686,6 +780,17 @@ async fn ctl(paths: &VmPaths, action: CtlAction) -> anyhow::Result<()> {
         CtlAction::Quit => {
             let _ = qmp.execute("quit", None).await;
             println!("quit");
+        }
+        CtlAction::Type { text } => {
+            let text = text.replace("\\n", "\n");
+            let skipped = qmp.type_text(&text).await?;
+            if !skipped.is_empty() {
+                eprintln!("skipped characters without a US-layout key: {skipped:?}");
+            }
+        }
+        CtlAction::Key { combo } => {
+            let keys: Vec<&str> = combo.split('+').collect();
+            qmp.send_combo(&keys).await?;
         }
     }
     Ok(())

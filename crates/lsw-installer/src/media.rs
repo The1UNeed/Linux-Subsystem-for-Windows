@@ -22,6 +22,36 @@ pub const VOLUME_LABEL: &str = "LSWSETUP";
 /// The first-boot script, embedded at build time.
 pub const FIRSTBOOT_PS1: &str = include_str!("../assets/firstboot.ps1");
 
+/// The LSW Tools installer (agent + WinFsp), embedded at build time.
+pub const INSTALL_AGENT_PS1: &str = include_str!("../assets/install-agent.ps1");
+
+/// Volume label of the LSW Tools CD.
+pub const TOOLS_LABEL: &str = "LSWTOOLS";
+
+/// Guest software shipped on the setup and tools media.
+#[derive(Debug, Clone, Copy)]
+pub struct GuestPayload<'a> {
+    pub agent_exe: &'a [u8],
+    /// Build identity written to `lsw\version.txt`; the agent compares it
+    /// with its own to decide whether to update itself.
+    pub build_id: &'a str,
+    pub winfsp_msi: Option<&'a [u8]>,
+}
+
+impl GuestPayload<'_> {
+    fn files(&self) -> Vec<MediaFile<'_>> {
+        let mut files: Vec<MediaFile<'_>> = vec![
+            ("lsw/install-agent.ps1", INSTALL_AGENT_PS1.as_bytes()),
+            ("lsw/agent/lsw-agent.exe", self.agent_exe),
+            ("lsw/version.txt", self.build_id.as_bytes()),
+        ];
+        if let Some(msi) = self.winfsp_msi {
+            files.push(("lsw/winfsp.msi", msi));
+        }
+        files
+    }
+}
+
 /// Settings read by `firstboot.ps1` from `lsw\config.json`.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct FirstBootConfig {
@@ -66,6 +96,10 @@ fn insert(tree: &mut Vec<IsoFile>, path: &[&str], contents: &[u8]) -> anyhow::Re
 
 /// Build the ISO image at `path` (replacing any previous one atomically).
 pub fn build_image(path: &Path, files: &[MediaFile<'_>]) -> anyhow::Result<()> {
+    build_labeled_image(path, VOLUME_LABEL, files)
+}
+
+fn build_labeled_image(path: &Path, label: &str, files: &[MediaFile<'_>]) -> anyhow::Result<()> {
     let mut tree = Vec::new();
     for (name, data) in files {
         let parts: Vec<&str> = name.split('/').collect();
@@ -80,7 +114,7 @@ pub fn build_image(path: &Path, files: &[MediaFile<'_>]) -> anyhow::Result<()> {
     }
 
     let options = IsoFormatOptions {
-        volume_name: VOLUME_LABEL.to_owned(),
+        volume_name: label.to_owned(),
         sector_size: 2048,
         path_separator: PathSeparator::ForwardSlash,
         features: CreationFeatures {
@@ -124,20 +158,30 @@ pub fn build_setup_media(
     path: &Path,
     autounattend_xml: &str,
     config: &FirstBootConfig,
-    agent_exe: Option<&[u8]>,
+    guest: Option<GuestPayload<'_>>,
 ) -> anyhow::Result<()> {
     let config_json = serde_json::to_vec_pretty(config)?;
-    // Windows PowerShell 5.1 reads BOM-less scripts as ANSI; keep it ASCII.
+    // Windows PowerShell 5.1 reads BOM-less scripts as ANSI; keep them ASCII.
     anyhow::ensure!(FIRSTBOOT_PS1.is_ascii(), "firstboot.ps1 must be ASCII");
+    anyhow::ensure!(
+        INSTALL_AGENT_PS1.is_ascii(),
+        "install-agent.ps1 must be ASCII"
+    );
     let mut files: Vec<MediaFile<'_>> = vec![
         ("autounattend.xml", autounattend_xml.as_bytes()),
         ("lsw/firstboot.ps1", FIRSTBOOT_PS1.as_bytes()),
         ("lsw/config.json", &config_json),
     ];
-    if let Some(exe) = agent_exe {
-        files.push(("lsw/agent/lsw-agent.exe", exe));
+    if let Some(g) = &guest {
+        files.extend(g.files());
     }
     build_image(path, &files)
+}
+
+/// Build the LSW Tools CD (attached to every boot): agent, WinFsp and the
+/// installer the agent runs to update itself.
+pub fn build_tools_media(path: &Path, guest: GuestPayload<'_>) -> anyhow::Result<()> {
+    build_labeled_image(path, TOOLS_LABEL, &guest.files())
 }
 
 #[cfg(test)]
@@ -178,9 +222,22 @@ mod tests {
             &iso,
             "<unattend/>",
             &FirstBootConfig { test_signing: true },
-            Some(b"MZ"),
+            Some(GuestPayload {
+                agent_exe: b"MZ",
+                build_id: "0.0.1-alpha+abc",
+                winfsp_msi: Some(b"MSI"),
+            }),
         )
         .unwrap();
+        assert_eq!(
+            read_back(&iso, "lsw/version.txt").unwrap(),
+            b"0.0.1-alpha+abc"
+        );
+        assert_eq!(read_back(&iso, "lsw/winfsp.msi").unwrap(), b"MSI");
+        assert_eq!(
+            read_back(&iso, "lsw/install-agent.ps1").unwrap(),
+            INSTALL_AGENT_PS1.as_bytes()
+        );
         assert_eq!(read_back(&iso, "autounattend.xml").unwrap(), b"<unattend/>");
         assert_eq!(
             read_back(&iso, "lsw/firstboot.ps1").unwrap(),
@@ -205,8 +262,28 @@ mod tests {
     }
 
     #[test]
+    fn tools_media_has_agent_and_installer() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("tools.iso");
+        build_tools_media(
+            &iso,
+            GuestPayload {
+                agent_exe: b"MZ2",
+                build_id: "b",
+                winfsp_msi: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(read_back(&iso, "lsw/agent/lsw-agent.exe").unwrap(), b"MZ2");
+        assert!(read_back(&iso, "lsw/winfsp.msi").is_none());
+        assert!(read_back(&iso, "autounattend.xml").is_none());
+    }
+
+    #[test]
     fn firstboot_reports_completion_marker() {
         assert!(FIRSTBOOT_PS1.contains(crate::unattend::INSTALL_DONE_MARKER));
         assert!(FIRSTBOOT_PS1.is_ascii());
+        assert!(INSTALL_AGENT_PS1.is_ascii());
+        assert!(FIRSTBOOT_PS1.contains("install-agent.ps1"));
     }
 }

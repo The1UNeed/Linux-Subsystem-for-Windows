@@ -40,6 +40,10 @@ pub enum Display {
     DbusP2p,
 }
 
+/// QEMU device ids of the agent ports, as reported in `VSERPORT_CHANGE`.
+pub const CONTROL_PORT_ID: &str = "lswctl";
+pub const SESSION_PORT_ID: &str = "lswsession";
+
 /// Where guest audio goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Audio {
@@ -65,6 +69,8 @@ pub struct LaunchOptions {
     pub display: Display,
     pub disk_io: DiskIo,
     pub audio: Audio,
+    /// LSW Tools CD to attach (agent install and auto-update).
+    pub tools_iso: Option<PathBuf>,
     /// Enable QEMU's seccomp sandbox.
     pub sandbox: bool,
 }
@@ -75,6 +81,7 @@ impl Default for LaunchOptions {
             display: Display::Headless,
             disk_io: DiskIo::IoUring,
             audio: Audio::None,
+            tools_iso: None,
             sandbox: true,
         }
     }
@@ -212,6 +219,18 @@ pub fn build_args(cfg: &VmConfig, paths: &VmPaths, opts: &LaunchOptions) -> Vec<
         push(&["-device", "ide-cd,drive=cdsetup,bus=ide.2"]);
     }
 
+    // LSW Tools CD, present on every boot.
+    if let Some(tools) = &opts.tools_iso {
+        push(&[
+            "-drive",
+            &format!(
+                "file={},if=none,id=cdtools,media=cdrom,readonly=on",
+                p(tools)
+            ),
+        ]);
+        push(&["-device", "ide-cd,drive=cdtools,bus=ide.3"]);
+    }
+
     // Network.
     match cfg.network {
         Network::Passt => {
@@ -256,7 +275,9 @@ pub fn build_args(cfg: &VmConfig, paths: &VmPaths, opts: &LaunchOptions) -> Vec<
     ]);
     push(&[
         "-device",
-        &format!("virtserialport,bus=vser0.0,chardev=agent,name={CONTROL_PORT_NAME}"),
+        &format!(
+            "virtserialport,bus=vser0.0,chardev=agent,id={CONTROL_PORT_ID},name={CONTROL_PORT_NAME}"
+        ),
     ]);
     push(&[
         "-chardev",
@@ -267,7 +288,9 @@ pub fn build_args(cfg: &VmConfig, paths: &VmPaths, opts: &LaunchOptions) -> Vec<
     ]);
     push(&[
         "-device",
-        &format!("virtserialport,bus=vser0.0,chardev=session,name={SESSION_PORT_NAME}"),
+        &format!(
+            "virtserialport,bus=vser0.0,chardev=session,id={SESSION_PORT_ID},name={SESSION_PORT_NAME}"
+        ),
     ]);
 
     // Shared folders: one vhost-user-fs device per virtiofsd.
@@ -367,6 +390,23 @@ pub fn swtpm_args(cfg: &VmConfig, paths: &VmPaths) -> Vec<String> {
     ]
 }
 
+/// Arguments for one virtiofsd: unprivileged, in its own user namespace
+/// with an identity mapping for the user, so files the guest creates belong
+/// to the Linux user.
+pub fn virtiofsd_args(shared_dir: &Path, socket: &Path, uid: u32, gid: u32) -> Vec<String> {
+    vec![
+        format!("--socket-path={}", socket.display()),
+        format!("--shared-dir={}", shared_dir.display()),
+        "--sandbox=namespace".into(),
+        format!("--uid-map=:{uid}:{uid}:1:"),
+        format!("--gid-map=:{gid}:{gid}:1:"),
+        "--cache=auto".into(),
+        "--inode-file-handles=never".into(),
+        "--announce-submounts".into(),
+        "--log-level=warn".into(),
+    ]
+}
+
 /// Arguments for passt serving `paths.passt_socket()` in the foreground.
 pub fn passt_args(paths: &VmPaths) -> Vec<String> {
     vec![
@@ -431,8 +471,12 @@ mod tests {
         assert!(
             s.contains("socket,id=agent,path=/run/user/1000/lsw/win/agent.sock,server=on,wait=off")
         );
-        assert!(s.contains("virtserialport,bus=vser0.0,chardev=agent,name=org.lsw.control.0"));
-        assert!(s.contains("virtserialport,bus=vser0.0,chardev=session,name=org.lsw.session.0"));
+        assert!(
+            s.contains("virtserialport,bus=vser0.0,chardev=agent,id=lswctl,name=org.lsw.control.0")
+        );
+        assert!(s.contains(
+            "virtserialport,bus=vser0.0,chardev=session,id=lswsession,name=org.lsw.session.0"
+        ));
         assert!(
             s.contains("socket,id=qmpui,path=/run/user/1000/lsw/win/ui.sock,server=on,wait=off")
         );
@@ -498,6 +542,7 @@ mod tests {
         c.network = Network::None;
         let opts = LaunchOptions {
             audio: Audio::None,
+            tools_iso: Some("/d/tools.iso".into()),
             sandbox: false,
             disk_io: DiskIo::Threads,
             display: Display::VncUnix("/r/vnc.sock".into()),
@@ -507,6 +552,8 @@ mod tests {
         assert!(!s.contains("-sandbox"));
         assert!(s.contains("cache=writeback,aio=threads"));
         assert!(s.contains("-vnc unix:/r/vnc.sock"));
+        assert!(s.contains("file=/d/tools.iso,if=none,id=cdtools,media=cdrom,readonly=on"));
+        assert!(s.contains("ide-cd,drive=cdtools,bus=ide.3"));
     }
 
     #[test]
@@ -546,6 +593,19 @@ mod tests {
         c.microphone = true;
         let s = joined(&build_args(&c, &paths, &opts));
         assert!(s.contains("hda-duplex,bus=hda0.0,audiodev=snd0"));
+    }
+
+    #[test]
+    fn virtiofsd_is_sandboxed_with_identity_mapping() {
+        let a = joined(&virtiofsd_args(
+            Path::new("/home/u/Documents"),
+            Path::new("/home/u/.cache/lsw/sock/win/fs0.sock"),
+            1000,
+            1001,
+        ));
+        assert!(a.contains("--shared-dir=/home/u/Documents"));
+        assert!(a.contains("--sandbox=namespace"));
+        assert!(a.contains("--uid-map=:1000:1000:1: --gid-map=:1001:1001:1:"));
     }
 
     #[test]

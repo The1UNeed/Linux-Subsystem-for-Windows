@@ -137,6 +137,11 @@ impl ControlSession {
         self.accepted
     }
 
+    /// The guest closed its end of the port (agent stopped).
+    pub fn reset(&mut self) {
+        self.accepted = false;
+    }
+
     /// React to one guest message: the replies to send (`(reply_to, msg)`)
     /// and any event for the supervisor.
     pub fn handle(&mut self, env: &Envelope) -> (Vec<(Option<u64>, Message)>, Option<AgentEvent>) {
@@ -214,35 +219,42 @@ impl ControlSession {
     }
 }
 
-/// How often the host re-sends `Attach` until the agent answers (the agent
-/// may start long after the VM) and pings it afterwards.
+/// Ping interval once the agent is accepted.
 pub const KEEPALIVE: Duration = Duration::from_secs(5);
 
 /// Serve the control channel until it closes, reporting events.
+///
+/// `port_open` carries QEMU's `VSERPORT_CHANGE` state for the guest end of
+/// the port: the host sends `Attach` once on connect and again whenever the
+/// guest (re)opens the port, never periodically (frames written while the
+/// guest has the port closed queue up and would all arrive at once).
 pub async fn serve_control<S: AsyncRead + AsyncWrite + Unpin>(
     channel: &mut Channel<S>,
     session: &mut ControlSession,
+    port_open: &mut tokio::sync::mpsc::UnboundedReceiver<bool>,
     mut on_event: impl FnMut(AgentEvent),
 ) -> Result<(), ChannelError> {
-    channel
-        .send(Message::Attach {
-            protocol: PROTOCOL_VERSION,
-        })
-        .await?;
+    let attach = Message::Attach {
+        protocol: PROTOCOL_VERSION,
+    };
+    channel.send(attach.clone()).await?;
     let mut tick = tokio::time::interval(KEEPALIVE);
     tick.tick().await;
     let mut nonce = 0u64;
     loop {
         let env = tokio::select! {
             env = channel.recv() => env?,
-            _ = tick.tick() => {
+            open = port_open.recv() => {
+                match open {
+                    Some(true) => channel.send(attach.clone()).await.map(|_| ())?,
+                    Some(false) => session.reset(),
+                    None => {}
+                }
+                continue;
+            }
+            _ = tick.tick(), if session.accepted() => {
                 nonce += 1;
-                let msg = if session.accepted() {
-                    Message::Ping { nonce }
-                } else {
-                    Message::Attach { protocol: PROTOCOL_VERSION }
-                };
-                channel.send(msg).await?;
+                channel.send(Message::Ping { nonce }).await?;
                 continue;
             }
         };
@@ -387,7 +399,8 @@ mod tests {
         });
         let mut session = ControlSession::new(shares());
         let mut events = Vec::new();
-        let r = serve_control(&mut host, &mut session, |e| events.push(e)).await;
+        let (_open_tx, mut open_rx) = tokio::sync::mpsc::unbounded_channel();
+        let r = serve_control(&mut host, &mut session, &mut open_rx, |e| events.push(e)).await;
         agent.await.unwrap();
         assert!(matches!(
             r,

@@ -13,6 +13,14 @@ use lsw_proto::{
 /// Agent version reported in [`Message::Hello`].
 pub const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Whether to run the LSW Tools installer: the CD carries another build
+/// than ours, and we have not already tried to install exactly that build
+/// (so a failing installer cannot loop).
+pub fn should_update(own_build: &str, cd_build: &str, last_attempt: Option<&str>) -> bool {
+    let cd_build = cd_build.trim();
+    !cd_build.is_empty() && cd_build != own_build && last_attempt.map(str::trim) != Some(cd_build)
+}
+
 /// The two virtio-serial ports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortId {
@@ -358,6 +366,18 @@ mod tests {
         assert!(matches!(out[0].msg, Message::Hello { .. }));
         assert_eq!(out[0].reply_to, Some(1));
         agent.on_message(port, env(2, Message::Welcome { protocol: 1 }));
+    }
+
+    #[test]
+    fn update_decision() {
+        assert!(should_update("v+a", "v+b\r\n", None));
+        assert!(!should_update("v+a", "v+a", None), "same build");
+        assert!(!should_update("v+a", "v+b", Some("v+b\n")), "already tried");
+        assert!(
+            should_update("v+a", "v+c", Some("v+b")),
+            "newer than the failed one"
+        );
+        assert!(!should_update("v+a", "  ", None), "empty file");
     }
 
     #[test]

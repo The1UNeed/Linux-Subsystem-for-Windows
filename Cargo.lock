@@ -1063,6 +1063,7 @@ dependencies = [
  "clap",
  "lsw-daemon",
  "lsw-installer",
+ "lsw-proto",
  "serde_json",
  "tokio",
  "tracing",
@@ -1119,6 +1120,7 @@ version = "0.0.1-alpha"
 dependencies = [
  "postcard",
  "serde",
+ "sha2",
  "thiserror",
 ]
 

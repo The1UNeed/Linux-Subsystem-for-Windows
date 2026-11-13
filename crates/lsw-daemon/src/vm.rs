@@ -1,7 +1,7 @@
 //! VM supervisor: prepares the disk, launches swtpm / passt / QEMU, connects
 //! QMP and tears everything down again.
 
-use crate::config::{Network, VmConfig};
+use crate::config::{Network, Share, VmConfig};
 use crate::host::Binaries;
 use crate::paths::VmPaths;
 use crate::qemu::{self, LaunchOptions};
@@ -42,8 +42,31 @@ pub struct Running {
     qemu: Child,
     swtpm: Child,
     passt: Option<Child>,
+    virtiofsd: Vec<Child>,
     pub qemu_log: PathBuf,
+    /// Shares whose virtiofsd started (announced to the guest agent).
+    pub shares: Vec<Share>,
 }
+
+/// Effective uid and gid of this process, from `/proc/self/status` (the
+/// workspace forbids `unsafe`, so no `geteuid()`).
+pub fn current_ids() -> Option<(u32, u32)> {
+    parse_effective_ids(&std::fs::read_to_string("/proc/self/status").ok()?)
+}
+
+/// `Uid:`/`Gid:` lines list real, effective, saved and filesystem ids.
+fn parse_effective_ids(status: &str) -> Option<(u32, u32)> {
+    let field = |name: &str| -> Option<u32> {
+        let line = status.lines().find(|l| l.starts_with(name))?;
+        line.split_whitespace().nth(2)?.parse().ok()
+    };
+    Some((field("Uid:")?, field("Gid:")?))
+}
+
+/// How long a helper must stay alive after creating its socket to count as
+/// started (virtiofsd creates the socket before it sets up its sandbox and
+/// exits if that fails).
+const HELPER_SETTLE: Duration = Duration::from_millis(300);
 
 impl Vm {
     pub fn new(cfg: VmConfig, paths: VmPaths) -> Self {
@@ -94,7 +117,11 @@ impl Vm {
             _ => None,
         };
 
-        let args = qemu::build_args(&self.cfg, &self.paths, opts);
+        let (virtiofsd, shares) = self.start_virtiofsd(bins).await;
+        let mut cfg = self.cfg.clone();
+        cfg.shares = shares.clone();
+
+        let args = qemu::build_args(&cfg, &self.paths, opts);
         tracing::info!(target: "lsw::qemu", "launching {} {}", qemu_bin.display(), args.join(" "));
         let qemu_log = self.paths.qemu_log();
         let mut qemu = spawn_logged(qemu_bin, &args, &qemu_log)?;
@@ -121,12 +148,96 @@ impl Vm {
             qemu,
             swtpm,
             passt,
+            virtiofsd,
             qemu_log,
+            shares,
         })
+    }
+
+    /// Start one virtiofsd per configured share. A share whose daemon does
+    /// not come up is left out (logged) instead of failing the whole VM.
+    async fn start_virtiofsd(&self, bins: &Binaries) -> (Vec<Child>, Vec<Share>) {
+        let mut children = Vec::new();
+        let mut active = Vec::new();
+        if self.cfg.shares.is_empty() {
+            return (children, active);
+        }
+        let (Some(bin), Some(_), Some((uid, gid))) =
+            (&bins.virtiofsd, &bins.newuidmap, current_ids())
+        else {
+            tracing::warn!("virtiofsd or newuidmap missing: shared folders are off");
+            return (children, active);
+        };
+        for share in &self.cfg.shares {
+            // Index in the *active* list: it names the socket and the device.
+            let socket = self.paths.virtiofs_socket(active.len());
+            let _ = std::fs::remove_file(&socket);
+            if !share.host_path.is_dir() {
+                tracing::warn!(
+                    "share {}: {} is not a directory",
+                    share.tag,
+                    share.host_path.display()
+                );
+                continue;
+            }
+            let args = qemu::virtiofsd_args(&share.host_path, &socket, uid, gid);
+            let log = self.paths.data.join(format!("virtiofsd-{}.log", share.tag));
+            let child = match spawn_logged(bin, &args, &log) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("share {}: {e:#}", share.tag);
+                    continue;
+                }
+            };
+            let mut child = child;
+            let started = match wait_for_socket(&socket, HELPER_SOCKET_TIMEOUT).await {
+                Ok(()) => {
+                    tokio::time::sleep(HELPER_SETTLE).await;
+                    match child.try_wait() {
+                        Ok(None) => Ok(()),
+                        Ok(Some(status)) => Err(format!("exited with {status}")),
+                        Err(e) => Err(e.to_string()),
+                    }
+                }
+                Err(e) => Err(e.to_string()),
+            };
+            match started {
+                Ok(()) => {
+                    children.push(child);
+                    active.push(share.clone());
+                }
+                Err(e) => {
+                    let _ = child.start_kill();
+                    let _ = std::fs::remove_file(&socket);
+                    tracing::warn!(
+                        "share {}: virtiofsd did not start ({e}): {}",
+                        share.tag,
+                        tail(&log, 3)
+                    );
+                }
+            }
+        }
+        (children, active)
     }
 }
 
+/// Something happened to a running VM.
+pub enum Activity {
+    /// QEMU exited.
+    Exited(std::io::Result<ExitStatus>),
+    /// A QMP event arrived.
+    Event(Result<crate::qmp::Event, QmpError>),
+}
+
 impl Running {
+    /// Wait for QEMU to exit or for the next QMP event. Cancel-safe.
+    pub async fn next_activity(&mut self) -> Activity {
+        tokio::select! {
+            status = self.qemu.wait() => Activity::Exited(status),
+            event = self.qmp.next_event() => Activity::Event(event),
+        }
+    }
+
     /// Freeze all vCPUs (0 % host CPU).
     pub async fn pause(&mut self) -> Result<(), QmpError> {
         self.qmp.execute("stop", None).await.map(|_| ())
@@ -202,6 +313,15 @@ impl Running {
         if let Some(p) = &mut self.passt {
             let _ = p.start_kill();
             let _ = p.wait().await;
+        }
+        // virtiofsd exits when QEMU disconnects; make sure.
+        for v in &mut self.virtiofsd {
+            if tokio::time::timeout(Duration::from_secs(2), v.wait())
+                .await
+                .is_err()
+            {
+                let _ = v.start_kill();
+            }
         }
     }
 }
@@ -372,6 +492,13 @@ mod tests {
             "BdsDxe: boot"
         );
         assert_eq!(sanitize_console_line(&"x".repeat(2000)).len(), 512);
+    }
+
+    #[test]
+    fn effective_ids_are_parsed() {
+        let status = "Name:\tlsw\nUid:\t1000\t1001\t1000\t1001\nGid:\t1000\t994\t1000\t994\n";
+        assert_eq!(parse_effective_ids(status), Some((1001, 994)));
+        assert_eq!(parse_effective_ids("Name: x\n"), None);
     }
 
     #[test]

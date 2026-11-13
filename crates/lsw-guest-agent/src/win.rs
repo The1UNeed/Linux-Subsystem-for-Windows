@@ -701,6 +701,54 @@ impl Platform for Windows {
     }
 }
 
+// ------------------------------------------------------------ self-update
+
+/// If the LSW Tools CD carries another agent build, start its installer
+/// (which stops this process and replaces it) and return true.
+fn self_update() -> bool {
+    let Ok(exe_path) = std::env::current_exe() else {
+        return false;
+    };
+    let Ok(exe) = std::fs::read(&exe_path) else {
+        return false;
+    };
+    let own = lsw_proto::agent_build_id(crate::core::AGENT_VERSION, &exe);
+    let Some(drive) = ('D'..='Z').find(|c| {
+        Path::new(&format!("{c}:\\lsw\\install-agent.ps1")).exists()
+            && Path::new(&format!("{c}:\\lsw\\version.txt")).exists()
+    }) else {
+        return false;
+    };
+    let media = format!("{drive}:");
+    let cd = std::fs::read_to_string(format!("{media}\\lsw\\version.txt")).unwrap_or_default();
+    let marker = log_path().with_file_name("update-attempt.txt");
+    let last = std::fs::read_to_string(&marker).ok();
+    if !crate::core::should_update(&own, &cd, last.as_deref()) {
+        return false;
+    }
+    log(format!(
+        "updating agent {own} -> {} from {media}",
+        cd.trim()
+    ));
+    let _ = std::fs::write(&marker, cd.trim());
+    let script = format!("{media}\\lsw\\install-agent.ps1");
+    Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-WindowStyle",
+            "Hidden",
+            "-File",
+            &script,
+            "-Media",
+            &media,
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .is_ok()
+}
+
 // -------------------------------------------------------------------- run
 
 pub fn run() -> i32 {
@@ -716,6 +764,9 @@ pub fn run() -> i32 {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
     log(format!("lsw-agent {} starting", crate::core::AGENT_VERSION));
+    if self_update() {
+        return 0;
+    }
 
     let (tx, rx) = channel();
     let owner = HWND(clipboard_thread(tx.clone()) as *mut _);

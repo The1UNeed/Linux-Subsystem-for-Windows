@@ -94,6 +94,10 @@ impl VmPaths {
     pub fn qemu_log(&self) -> PathBuf {
         self.data.join("qemu.log")
     }
+    /// The LSW Tools CD, rebuilt at every start.
+    pub fn tools_iso(&self) -> PathBuf {
+        self.data.join("tools.iso")
+    }
     pub fn state_file(&self) -> PathBuf {
         self.data.join("saved-state.bin")
     }

@@ -43,6 +43,8 @@ pub struct Binaries {
     pub swtpm: Option<PathBuf>,
     pub passt: Option<PathBuf>,
     pub virtiofsd: Option<PathBuf>,
+    /// Needed by virtiofsd's unprivileged namespace sandbox.
+    pub newuidmap: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -201,9 +203,26 @@ impl HostReport {
         }
         out
     }
+
+    /// Non-blocking issues: LSW runs, with a feature missing.
+    pub fn warnings(&self) -> Vec<Problem> {
+        let mut out = Vec::new();
+        if self.binaries.virtiofsd.is_none() || self.binaries.newuidmap.is_none() {
+            out.push(Problem {
+                what: "virtiofsd or newuidmap not found: shared folders are off".into(),
+                fix: "Install virtiofsd and uidmap (Ubuntu) or virtiofsd and shadow (Arch)".into(),
+            });
+        }
+        if self.binaries.passt.is_none() {
+            out.push(Problem {
+                what: "passt not found: using QEMU's slower built-in networking".into(),
+                fix: "Install passt".into(),
+            });
+        }
+        out
+    }
 }
 
-/// Binary search path: LSW's bundled tools first, then `$PATH`.
 /// The user's PipeWire socket (`$PIPEWIRE_RUNTIME_DIR` or
 /// `$XDG_RUNTIME_DIR`, then `pipewire-0`).
 pub fn pipewire_socket() -> Option<PathBuf> {
@@ -213,6 +232,7 @@ pub fn pipewire_socket() -> Option<PathBuf> {
     Some(PathBuf::from(dir).join(name))
 }
 
+/// Binary search path: LSW's bundled tools first, then `$PATH`.
 pub fn search_path() -> Vec<PathBuf> {
     let mut dirs = vec![PathBuf::from("/usr/lib/lsw/bin")];
     if let Some(path) = std::env::var_os("PATH") {
@@ -231,6 +251,7 @@ fn find_binaries(path: &[PathBuf]) -> Binaries {
         swtpm: find("swtpm"),
         passt: find("passt"),
         virtiofsd: find("virtiofsd"),
+        newuidmap: find("newuidmap"),
     }
 }
 

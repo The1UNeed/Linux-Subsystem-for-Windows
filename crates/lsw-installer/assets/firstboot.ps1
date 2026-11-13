@@ -32,7 +32,7 @@ if (Test-Path $configPath) {
     $config = Get-Content -Raw $configPath | ConvertFrom-Json
 }
 
-# 1. virtio-win drivers and services (storage, network, balloon, vsock, fs, input, gpu).
+# 1. virtio-win drivers and services (storage, network, balloon, serial, fs, input, gpu).
 $msi = $null
 foreach ($d in [char[]]'DEFGHIJK') {
     $candidate = "${d}:\virtio-win-gt-x64.msi"
@@ -70,14 +70,12 @@ if ($config.test_signing) {
     bcdedit.exe /set testsigning on | Out-File -Append $log
 }
 
-# 6. LSW guest agent (present from M1 on).
-$agent = Join-Path $Media 'lsw\agent\lsw-agent.exe'
-if (Test-Path $agent) {
+# 6. LSW guest agent and WinFsp (LSW Tools).
+$installer = Join-Path $Media 'lsw\install-agent.ps1'
+if (Test-Path $installer) {
     Stage 'agent'
-    $dest = Join-Path $env:ProgramFiles 'LSW'
-    New-Item -ItemType Directory -Force -Path $dest | Out-Null
-    Copy-Item -Force $agent $dest
-    & (Join-Path $dest 'lsw-agent.exe') install | Out-File -Append $log
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer -Media $Media
+    Stage "agent-exit-$LASTEXITCODE"
 }
 
 # 7. The answer file contained the account password; remove every copy.

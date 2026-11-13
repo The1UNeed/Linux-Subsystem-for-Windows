@@ -29,6 +29,14 @@ const EVAL_PAGE: &str = "https://www.microsoft.com/en-us/evalcenter/download-win
 const PROFILE: &str = "606624d44113";
 const MAX_PAGE: usize = 2 << 20;
 
+/// Pinned WinFsp release (GPLv3 with FLOSS exception), installed in the
+/// guest for virtio-fs shared folders. Downloaded from upstream, never
+/// bundled.
+pub const WINFSP_VERSION: &str = "2.1.25156";
+pub const WINFSP_URL: &str =
+    "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi";
+pub const WINFSP_SHA256: &str = "073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a";
+
 /// Pinned virtio-win release (Fedora, BSD-3-Clause drivers).
 pub const VIRTIO_WIN_VERSION: &str = "0.1.302";
 pub const VIRTIO_WIN_URL: &str = "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/virtio-win-0.1.302-1/virtio-win-0.1.302.iso";
@@ -85,7 +93,7 @@ pub fn client() -> Result<Client, DownloadError> {
         .build()?)
 }
 
-/// Only HTTPS URLs on Microsoft or Fedora hosts are accepted.
+/// Only HTTPS URLs on Microsoft, Fedora or GitHub release hosts are accepted.
 fn is_microsoft(url: &str) -> bool {
     reqwest::Url::parse(url).is_ok_and(|u| {
         u.host_str()
@@ -99,7 +107,9 @@ pub fn check_trusted(url: &str) -> Result<(), DownloadError> {
     let trusted = parsed.scheme() == "https"
         && (host == "microsoft.com"
             || host.ends_with(".microsoft.com")
-            || host == "fedorapeople.org");
+            || host == "fedorapeople.org"
+            || host == "github.com"
+            || host == "release-assets.githubusercontent.com");
     if trusted {
         Ok(())
     } else {
@@ -135,6 +145,8 @@ async fn get_text(
 fn url_label(url: &str) -> &'static str {
     if url.contains("fedorapeople.org") {
         "virtio-win download"
+    } else if url.contains("github") {
+        "WinFsp download"
     } else if url.contains("evalcenter") {
         "Evaluation Center"
     } else if url.contains("software-download-connector") {
@@ -458,6 +470,9 @@ mod tests {
     fn only_trusted_hosts() {
         assert!(check_trusted("https://software.download.prss.microsoft.com/x.iso").is_ok());
         assert!(check_trusted(VIRTIO_WIN_URL).is_ok());
+        assert!(check_trusted(WINFSP_URL).is_ok());
+        assert!(check_trusted("https://github.com.evil.example/x.msi").is_err());
+        assert!(check_trusted("https://evil.githubusercontent.com/x.msi").is_err());
         assert!(check_trusted("http://software.download.prss.microsoft.com/x.iso").is_err());
         assert!(check_trusted("https://microsoft.com.evil.example/x.iso").is_err());
         assert!(is_microsoft(

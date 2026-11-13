@@ -420,6 +420,17 @@ impl FrameDecoder {
     }
 }
 
+/// Identity of a guest agent build: `<version>+<first 16 hex digits of the
+/// executable's SHA-256>`. Written to the LSW Tools CD by the host and
+/// computed by the agent over its own executable; a mismatch triggers the
+/// agent's self-update.
+pub fn agent_build_id(version: &str, exe: &[u8]) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(exe);
+    let hex: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+    format!("{version}+{hex}")
+}
+
 /// Split clipboard content into [`Message::ClipboardData`] frames.
 pub fn clipboard_chunks(
     serial: u64,
@@ -755,6 +766,14 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn build_id_is_stable_and_content_addressed() {
+        let a = agent_build_id("0.0.1-alpha", b"MZ one");
+        assert_eq!(a, agent_build_id("0.0.1-alpha", b"MZ one"));
+        assert_ne!(a, agent_build_id("0.0.1-alpha", b"MZ two"));
+        assert!(a.starts_with("0.0.1-alpha+") && a.len() == "0.0.1-alpha+".len() + 16);
     }
 
     #[test]

@@ -46,6 +46,9 @@ pub struct Event {
 
 pub struct Qmp {
     reader: BufReader<OwnedReadHalf>,
+    /// Bytes of a line read so far; kept here so a cancelled read (e.g. a
+    /// `select!` branch losing) never loses data.
+    partial: Vec<u8>,
     writer: OwnedWriteHalf,
     next_id: u64,
     events: VecDeque<Event>,
@@ -74,6 +77,7 @@ impl Qmp {
         let (r, w) = stream.into_split();
         let mut qmp = Self {
             reader: BufReader::new(r),
+            partial: Vec::new(),
             writer: w,
             next_id: 1,
             events: VecDeque::new(),
@@ -136,7 +140,7 @@ impl Qmp {
         }
     }
 
-    /// Next asynchronous event (queued or freshly read).
+    /// Next asynchronous event (queued or freshly read). Cancel-safe.
     pub async fn next_event(&mut self) -> Result<Event, QmpError> {
         if let Some(e) = self.events.pop_front() {
             return Ok(e);
@@ -183,6 +187,36 @@ impl Qmp {
         .map(|_| ())
     }
 
+    /// Press several keys together, e.g. `["meta_l", "r"]` for Win+R.
+    pub async fn send_combo(&mut self, qcodes: &[&str]) -> Result<(), QmpError> {
+        let keys: Vec<Value> = qcodes
+            .iter()
+            .map(|q| json!({ "type": "qcode", "data": q }))
+            .collect();
+        self.execute("send-key", Some(json!({ "keys": keys, "hold-time": 50 })))
+            .await
+            .map(|_| ())
+    }
+
+    /// Type ASCII text on a US keyboard layout (tests and bootstrapping).
+    /// Characters without a mapping are skipped and returned.
+    pub async fn type_text(&mut self, text: &str) -> Result<Vec<char>, QmpError> {
+        let mut skipped = Vec::new();
+        for c in text.chars() {
+            match qcodes_for_char(c) {
+                Some(keys) => {
+                    self.send_combo(&keys).await?;
+                    // `send-key` returns at once and QEMU replays the press
+                    // and release with the hold time; pace to that, or
+                    // QEMU's input queue overflows and drops keys.
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                }
+                None => skipped.push(c),
+            }
+        }
+        Ok(skipped)
+    }
+
     /// Save a PNG screenshot of the primary display.
     pub async fn screendump_png(&mut self, path: &Path) -> Result<(), QmpError> {
         self.execute(
@@ -193,10 +227,11 @@ impl Qmp {
         .map(|_| ())
     }
 
-    /// Read one non-empty JSON line, bounded by [`MAX_LINE`].
+    /// Read one non-empty JSON line, bounded by [`MAX_LINE`]. Cancel-safe:
+    /// bytes are moved from the reader into `self.partial` before the next
+    /// await point.
     async fn read_message(&mut self) -> Result<Value, QmpError> {
         loop {
-            let mut line = Vec::new();
             loop {
                 let buf = self.reader.fill_buf().await?;
                 if buf.is_empty() {
@@ -206,21 +241,74 @@ impl Qmp {
                     Some(i) => (&buf[..=i], true),
                     None => (buf, false),
                 };
-                if line.len() + chunk.len() > MAX_LINE {
+                if self.partial.len() + chunk.len() > MAX_LINE {
                     return Err(QmpError::LineTooLong);
                 }
-                line.extend_from_slice(chunk);
+                self.partial.extend_from_slice(chunk);
                 let n = chunk.len();
                 self.reader.consume(n);
                 if done {
                     break;
                 }
             }
+            let line = std::mem::take(&mut self.partial);
             let trimmed = line.trim_ascii();
             if !trimmed.is_empty() {
                 return Ok(serde_json::from_slice(trimmed)?);
             }
         }
+    }
+}
+
+/// QKeyCodes that produce `c` on a US layout (with shift when needed).
+pub fn qcodes_for_char(c: char) -> Option<Vec<&'static str>> {
+    const LETTERS: [&str; 26] = [
+        "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r",
+        "s", "t", "u", "v", "w", "x", "y", "z",
+    ];
+    const DIGITS: [&str; 10] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
+    let plain = |k| Some(vec![k]);
+    let shifted = |k| Some(vec!["shift", k]);
+    match c {
+        'a'..='z' => plain(LETTERS[(c as u8 - b'a') as usize]),
+        'A'..='Z' => shifted(LETTERS[(c as u8 - b'A') as usize]),
+        '0'..='9' => plain(DIGITS[(c as u8 - b'0') as usize]),
+        ' ' => plain("spc"),
+        '\n' => plain("ret"),
+        '\t' => plain("tab"),
+        '-' => plain("minus"),
+        '=' => plain("equal"),
+        '[' => plain("bracket_left"),
+        ']' => plain("bracket_right"),
+        '\\' => plain("backslash"),
+        ';' => plain("semicolon"),
+        '\'' => plain("apostrophe"),
+        '`' => plain("grave_accent"),
+        ',' => plain("comma"),
+        '.' => plain("dot"),
+        '/' => plain("slash"),
+        '_' => shifted("minus"),
+        '+' => shifted("equal"),
+        '{' => shifted("bracket_left"),
+        '}' => shifted("bracket_right"),
+        '|' => shifted("backslash"),
+        ':' => shifted("semicolon"),
+        '"' => shifted("apostrophe"),
+        '~' => shifted("grave_accent"),
+        '<' => shifted("comma"),
+        '>' => shifted("dot"),
+        '?' => shifted("slash"),
+        '!' => shifted("1"),
+        '@' => shifted("2"),
+        '#' => shifted("3"),
+        '$' => shifted("4"),
+        '%' => shifted("5"),
+        '^' => shifted("6"),
+        '&' => shifted("7"),
+        '*' => shifted("8"),
+        '(' => shifted("9"),
+        ')' => shifted("0"),
+        _ => None,
     }
 }
 
@@ -306,6 +394,18 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         server.await.unwrap();
+    }
+
+    #[test]
+    fn us_layout_qcodes() {
+        assert_eq!(qcodes_for_char('a'), Some(vec!["a"]));
+        assert_eq!(qcodes_for_char('Q'), Some(vec!["shift", "q"]));
+        assert_eq!(qcodes_for_char(':'), Some(vec!["shift", "semicolon"]));
+        assert_eq!(qcodes_for_char('\\'), Some(vec!["backslash"]));
+        assert_eq!(qcodes_for_char('\n'), Some(vec!["ret"]));
+        assert_eq!(qcodes_for_char('é'), None);
+        // Every printable ASCII character is covered.
+        assert!((' '..='~').all(|c| qcodes_for_char(c).is_some()));
     }
 
     #[tokio::test]
