@@ -80,7 +80,7 @@ pub fn dib_to_png(dib: &[u8]) -> Option<Vec<u8>> {
     let pixels = dib.get(offset..offset.checked_add(stride.checked_mul(h as usize)?)?)?;
     // 32 bpp: use alpha only if the image actually has some (many apps
     // leave it zero), otherwise treat the image as opaque.
-    let has_alpha = bpp == 32 && pixels.chunks_exact(4).any(|p| p[3] != 0);
+    let has_alpha = bpp == 32 && pixels.as_chunks::<4>().0.iter().any(|p| p[3] != 0);
     let mut rgba = Vec::with_capacity((w * h * 4) as usize);
     for row in 0..h as usize {
         let src_row = if height > 0 {

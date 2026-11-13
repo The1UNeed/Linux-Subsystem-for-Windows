@@ -10,4 +10,5 @@ pub mod host;
 pub mod paths;
 pub mod qemu;
 pub mod qmp;
+pub mod session;
 pub mod vm;

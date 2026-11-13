@@ -79,6 +79,9 @@ pub struct InstallMedia {
     pub setup_iso: PathBuf,
 }
 
+/// Most shared folders per VM (each takes a fixed PCI slot).
+pub const MAX_SHARES: usize = 14;
+
 /// A Linux folder shared into Windows over virtiofs, backing one Windows
 /// known folder.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -202,8 +205,8 @@ impl VmConfig {
         anyhow::ensure!(self.vcpus >= 2, "Windows 11 needs at least 2 vCPUs");
         anyhow::ensure!(self.disk_size_gib >= 64, "Windows 11 needs at least 64 GiB");
         anyhow::ensure!(
-            self.shares.len() <= lsw_proto::MAX_LIST_LEN,
-            "too many shared folders"
+            self.shares.len() <= MAX_SHARES,
+            "at most {MAX_SHARES} shared folders"
         );
         let mut seen = std::collections::HashSet::new();
         for share in &self.shares {

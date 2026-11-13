@@ -18,12 +18,12 @@ use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_IO_PENDING, GetLastError, HANDLE, HGLOBAL, HWND,
-    LPARAM, LRESULT, WAIT_OBJECT_0, WPARAM,
+    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_IO_PENDING, ERROR_NO_SYSTEM_RESOURCES, GetLastError,
+    HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, WAIT_OBJECT_0, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     CDS_UPDATEREGISTRY, ChangeDisplaySettingsExW, DEVMODEW, DISP_CHANGE_SUCCESSFUL, DM_PELSHEIGHT,
-    DM_PELSWIDTH,
+    DM_PELSWIDTH, ENUM_DISPLAY_SETTINGS_MODE, EnumDisplaySettingsW,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_NONE,
@@ -235,6 +235,14 @@ fn port_thread(id: PortId, name: &'static str, slot: PortSlot, tx: Sender<Event>
                         continue;
                     }
                     Ok(n) => n,
+                    // vioserial fails reads with ERROR_NO_SYSTEM_RESOURCES
+                    // while no host end is connected: wait quietly.
+                    Err(e)
+                        if e.raw_os_error() == Some(ERROR_NO_SYSTEM_RESOURCES.to_hresult().0) =>
+                    {
+                        std::thread::sleep(Duration::from_millis(500));
+                        continue;
+                    }
                     Err(e) => break Err(e.to_string()),
                 };
                 if let Err(e) = decoder.push(&buf[..n]) {
@@ -579,6 +587,63 @@ impl Windows {
     }
 }
 
+impl Windows {
+    fn change_display(&self, width: u32, height: u32, scale_percent: u16) -> Result<(), String> {
+        if !display_modes().contains(&(width, height)) {
+            // The host normally resizes the display itself (virtio-gpu
+            // display info); this path only switches between listed modes.
+            return Err(format!("{width}x{height} is not a mode of this display"));
+        }
+        let mode = DEVMODEW {
+            dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+            dmFields: DM_PELSWIDTH | DM_PELSHEIGHT,
+            dmPelsWidth: width,
+            dmPelsHeight: height,
+            ..Default::default()
+        };
+        // SAFETY: `mode` is a fully initialized DEVMODEW for the primary display.
+        let r = unsafe {
+            ChangeDisplaySettingsExW(PCWSTR::null(), Some(&mode), None, CDS_UPDATEREGISTRY, None)
+        };
+        if scale_percent != 100 {
+            log(format!(
+                "display scale {scale_percent}% requested; not applied in this version"
+            ));
+        }
+        if r == DISP_CHANGE_SUCCESSFUL {
+            Ok(())
+        } else {
+            Err(format!(
+                "ChangeDisplaySettingsEx({width}x{height}) returned {}",
+                r.0
+            ))
+        }
+    }
+}
+
+/// Resolutions the primary display offers.
+fn display_modes() -> Vec<(u32, u32)> {
+    let mut modes = Vec::new();
+    for i in 0..1024 {
+        let mut mode = DEVMODEW {
+            dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+            ..Default::default()
+        };
+        // SAFETY: `mode` is a valid DEVMODEW with dmSize set.
+        if !unsafe {
+            EnumDisplaySettingsW(PCWSTR::null(), ENUM_DISPLAY_SETTINGS_MODE(i), &mut mode)
+        }
+        .as_bool()
+        {
+            break;
+        }
+        modes.push((mode.dmPelsWidth, mode.dmPelsHeight));
+    }
+    modes.sort_unstable();
+    modes.dedup();
+    modes
+}
+
 impl Platform for Windows {
     fn os_build(&self) -> String {
         let key = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
@@ -608,30 +673,9 @@ impl Platform for Windows {
     }
 
     fn set_display(&mut self, width: u32, height: u32, scale_percent: u16) -> Result<(), String> {
-        let mode = DEVMODEW {
-            dmSize: std::mem::size_of::<DEVMODEW>() as u16,
-            dmFields: DM_PELSWIDTH | DM_PELSHEIGHT,
-            dmPelsWidth: width,
-            dmPelsHeight: height,
-            ..Default::default()
-        };
-        // SAFETY: `mode` is a fully initialized DEVMODEW for the primary display.
-        let r = unsafe {
-            ChangeDisplaySettingsExW(PCWSTR::null(), Some(&mode), None, CDS_UPDATEREGISTRY, None)
-        };
-        if scale_percent != 100 {
-            log(format!(
-                "display scale {scale_percent}% requested; not applied in this version"
-            ));
-        }
-        if r == DISP_CHANGE_SUCCESSFUL {
-            Ok(())
-        } else {
-            Err(format!(
-                "ChangeDisplaySettingsEx({width}x{height}) returned {}",
-                r.0
-            ))
-        }
+        let r = self.change_display(width, height, scale_percent);
+        log(format!("display {width}x{height} @{scale_percent}%: {r:?}"));
+        r
     }
 
     fn clipboard_formats(&mut self) -> Vec<ClipFormat> {

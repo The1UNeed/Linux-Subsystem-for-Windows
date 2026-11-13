@@ -40,6 +40,23 @@ pub enum Display {
     DbusP2p,
 }
 
+/// Fixed PCI slots on the q35 root complex. Windows identifies devices by
+/// location: a device that moves gets reinstalled as a "new" device (stale
+/// duplicates in Device Manager, "Network 2", lost settings). Every device
+/// therefore has a fixed address that never changes as features are added.
+pub mod slot {
+    pub const VGA: &str = "0x01";
+    pub const DISK: &str = "0x02";
+    pub const NET: &str = "0x03";
+    pub const BALLOON: &str = "0x04";
+    pub const SERIAL: &str = "0x05";
+    pub const USB: &str = "0x06";
+    pub const SOUND: &str = "0x07";
+    /// Shared folders take consecutive slots from here (up to
+    /// [`crate::config::MAX_SHARES`]).
+    pub const FIRST_SHARE: u8 = 0x10;
+}
+
 /// QEMU device ids of the agent ports, as reported in `VSERPORT_CHANGE`.
 pub const CONTROL_PORT_ID: &str = "lswctl";
 pub const SESSION_PORT_ID: &str = "lswsession";
@@ -182,11 +199,17 @@ pub fn build_args(cfg: &VmConfig, paths: &VmPaths, opts: &LaunchOptions) -> Vec<
     let queues = cpus.clamp(1, 8);
     push(&[
         "-device",
-        &format!("virtio-blk-pci,drive=disk0,iothread=io0,num-queues={queues},bootindex=1"),
+        &format!(
+            "virtio-blk-pci,drive=disk0,iothread=io0,num-queues={queues},bootindex=1,bus=pcie.0,addr={}",
+            slot::DISK
+        ),
     ]);
 
     // USB: xHCI with an absolute pointer (needed until the guest agent owns input).
-    push(&["-device", "qemu-xhci,id=xhci,p2=8,p3=8"]);
+    push(&[
+        "-device",
+        &format!("qemu-xhci,id=xhci,p2=8,p3=8,bus=pcie.0,addr={}", slot::USB),
+    ]);
     push(&["-device", "usb-tablet,bus=xhci.0"]);
 
     // Installation media.
@@ -243,14 +266,22 @@ pub fn build_args(cfg: &VmConfig, paths: &VmPaths, opts: &LaunchOptions) -> Vec<
             ]);
             push(&[
                 "-device",
-                &format!("virtio-net-pci,netdev=net0,mac={}", mac_for(&cfg.name)),
+                &format!(
+                    "virtio-net-pci,netdev=net0,mac={},bus=pcie.0,addr={}",
+                    mac_for(&cfg.name),
+                    slot::NET
+                ),
             ]);
         }
         Network::User => {
             push(&["-netdev", "user,id=net0"]);
             push(&[
                 "-device",
-                &format!("virtio-net-pci,netdev=net0,mac={}", mac_for(&cfg.name)),
+                &format!(
+                    "virtio-net-pci,netdev=net0,mac={},bus=pcie.0,addr={}",
+                    mac_for(&cfg.name),
+                    slot::NET
+                ),
             ]);
         }
         Network::None => {}
@@ -259,13 +290,22 @@ pub fn build_args(cfg: &VmConfig, paths: &VmPaths, opts: &LaunchOptions) -> Vec<
     // Memory returned to the host continuously.
     push(&[
         "-device",
-        "virtio-balloon-pci,id=balloon0,free-page-reporting=on",
+        &format!(
+            "virtio-balloon-pci,id=balloon0,free-page-reporting=on,bus=pcie.0,addr={}",
+            slot::BALLOON
+        ),
     ]);
 
     // Guest agent control channel: a virtio-serial port. Windows opens it
     // as a plain device (`\\.\Global\<name>`) through the signed vioserial
     // driver, the same transport QEMU's own guest agent uses.
-    push(&["-device", "virtio-serial-pci,id=vser0"]);
+    push(&[
+        "-device",
+        &format!(
+            "virtio-serial-pci,id=vser0,bus=pcie.0,addr={}",
+            slot::SERIAL
+        ),
+    ]);
     push(&[
         "-chardev",
         &format!(
@@ -302,8 +342,9 @@ pub fn build_args(cfg: &VmConfig, paths: &VmPaths, opts: &LaunchOptions) -> Vec<
         push(&[
             "-device",
             &format!(
-                "vhost-user-fs-pci,chardev=fs{i},tag={},queue-size=1024",
-                share.tag
+                "vhost-user-fs-pci,chardev=fs{i},tag={},queue-size=1024,bus=pcie.0,addr={:#04x}",
+                share.tag,
+                slot::FIRST_SHARE + i as u8
             ),
         ]);
     }
@@ -312,7 +353,10 @@ pub fn build_args(cfg: &VmConfig, paths: &VmPaths, opts: &LaunchOptions) -> Vec<
     // only unless the user enabled the microphone.
     if opts.audio == Audio::PipeWire {
         push(&["-audiodev", "pipewire,id=snd0"]);
-        push(&["-device", "ich9-intel-hda,id=hda0"]);
+        push(&[
+            "-device",
+            &format!("ich9-intel-hda,id=hda0,bus=pcie.0,addr={}", slot::SOUND),
+        ]);
         let codec = if cfg.microphone {
             "hda-duplex"
         } else {
@@ -322,7 +366,13 @@ pub fn build_args(cfg: &VmConfig, paths: &VmPaths, opts: &LaunchOptions) -> Vec<
     }
 
     // Display (tier D baseline; higher tiers add their devices in M3).
-    push(&["-device", "virtio-vga,id=video0,xres=1280,yres=800"]);
+    push(&[
+        "-device",
+        &format!(
+            "virtio-vga,id=video0,xres=1280,yres=800,bus=pcie.0,addr={}",
+            slot::VGA
+        ),
+    ]);
     match &opts.display {
         Display::Headless => push(&["-display", "none"]),
         Display::VncUnix(sock) => push(&["-display", "none", "-vnc", &format!("unix:{}", p(sock))]),
@@ -586,7 +636,9 @@ mod tests {
         };
         let s = joined(&build_args(&c, &paths, &opts));
         assert!(s.contains("socket,id=fs0,path=/home/u/.cache/lsw/sock/win/fs0.sock"));
-        assert!(s.contains("vhost-user-fs-pci,chardev=fs1,tag=lsw-music,queue-size=1024"));
+        assert!(s.contains(
+            "vhost-user-fs-pci,chardev=fs1,tag=lsw-music,queue-size=1024,bus=pcie.0,addr=0x11"
+        ));
         assert!(s.contains("-audiodev pipewire,id=snd0"));
         assert!(s.contains("hda-output,bus=hda0.0,audiodev=snd0"));
         assert!(s.contains("-display dbus,p2p=yes,gl=off"));
@@ -606,6 +658,41 @@ mod tests {
         assert!(a.contains("--shared-dir=/home/u/Documents"));
         assert!(a.contains("--sandbox=namespace"));
         assert!(a.contains("--uid-map=:1000:1000:1: --gid-map=:1001:1001:1:"));
+    }
+
+    #[test]
+    fn every_pci_device_has_a_fixed_unique_slot() {
+        let paths = VmPaths::with_bases(
+            Path::new("/d"),
+            Path::new("/r"),
+            Path::new("/home/u/.cache/lsw/sock"),
+            "win",
+        );
+        let opts = LaunchOptions {
+            audio: Audio::PipeWire,
+            ..LaunchOptions::default()
+        };
+        let args = build_args(&cfg(Path::new("/d")), &paths, &opts);
+        let mut slots = Vec::new();
+        for pair in args.windows(2).filter(|w| w[0] == "-device") {
+            let dev = &pair[1];
+            let is_pci = ["-pci,", "virtio-vga", "qemu-xhci", "ich9-intel-hda"]
+                .iter()
+                .any(|k| dev.contains(k));
+            if is_pci {
+                let addr = dev
+                    .split(',')
+                    .find_map(|kv| kv.strip_prefix("addr="))
+                    .unwrap_or_else(|| panic!("{dev} has no fixed address"));
+                assert!(dev.contains("bus=pcie.0"), "{dev}");
+                slots.push(addr.to_owned());
+            }
+        }
+        let n = slots.len();
+        slots.sort();
+        slots.dedup();
+        assert_eq!(slots.len(), n, "duplicate slots");
+        assert!(n >= 7);
     }
 
     #[test]

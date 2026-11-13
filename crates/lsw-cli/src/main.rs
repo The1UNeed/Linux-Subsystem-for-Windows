@@ -105,6 +105,13 @@ enum Cmd {
         #[command(subcommand)]
         action: CtlAction,
     },
+    /// Read or set the Windows clipboard (through the guest agent).
+    Clip {
+        #[command(subcommand)]
+        action: ClipAction,
+    },
+    /// Resize the Windows display (through the guest agent).
+    Display { width: u32, height: u32 },
 }
 
 #[derive(clap::Args, Clone)]
@@ -121,6 +128,14 @@ struct LaunchArgs {
     /// No sound device, even when PipeWire is running.
     #[arg(long)]
     no_audio: bool,
+}
+
+#[derive(Subcommand)]
+enum ClipAction {
+    /// Print the Windows clipboard text.
+    Get,
+    /// Put text on the Windows clipboard.
+    Set { text: String },
 }
 
 #[derive(Subcommand)]
@@ -167,6 +182,13 @@ async fn main() -> anyhow::Result<()> {
         } => install(&paths, timeout_min, screenshot, &launch).await,
         Cmd::Run { launch } => run(&paths, &launch).await,
         Cmd::Ctl { action } => ctl(&paths, action).await,
+        Cmd::Clip { action } => clip(&paths, action).await,
+        Cmd::Display { width, height } => {
+            let mut s = attach_session(&paths).await?;
+            s.display_hint(width, height, 100).await?;
+            println!("asked Windows for {width}x{height}");
+            Ok(())
+        }
     }
 }
 
@@ -752,6 +774,73 @@ async fn supervise_agent(
         tracing::info!("agent channel ended: {r:?}");
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
+}
+
+/// Connect to the session channel and wait for the agent to attach.
+async fn attach_session(
+    paths: &VmPaths,
+) -> anyhow::Result<lsw_daemon::session::SessionClient<tokio::net::UnixStream>> {
+    use lsw_daemon::session::{SessionEvent, connect};
+    let mut s = connect(&paths.session_socket())
+        .await
+        .context("VM is not running (no session socket), or another LSW window owns it")?;
+    let attached = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let SessionEvent::Attached { .. } = s.next_event().await? {
+                return anyhow::Ok(());
+            }
+        }
+    })
+    .await;
+    match attached {
+        Ok(r) => r.map(|()| s),
+        Err(_) => bail!("the guest agent did not answer (is it running in Windows?)"),
+    }
+}
+
+async fn clip(paths: &VmPaths, action: ClipAction) -> anyhow::Result<()> {
+    use lsw_daemon::session::SessionEvent;
+    use lsw_proto::ClipFormat;
+    let mut s = attach_session(paths).await?;
+    match action {
+        ClipAction::Get => {
+            // The agent offers its clipboard right after attaching.
+            let got = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match s.next_event().await? {
+                        SessionEvent::GuestClipboard { serial, formats }
+                            if formats.contains(&ClipFormat::Text) =>
+                        {
+                            s.fetch(serial, ClipFormat::Text).await?;
+                        }
+                        SessionEvent::GuestClipboardData {
+                            format: ClipFormat::Text,
+                            data,
+                            ..
+                        } => return anyhow::Ok(String::from_utf8_lossy(&data).into_owned()),
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .context("Windows did not offer any clipboard text")??;
+            println!("{got}");
+        }
+        ClipAction::Set { text } => {
+            s.offer(vec![(ClipFormat::Text, text.into_bytes())]).await?;
+            // Serve the agent's request, then give it a moment to apply.
+            let _ = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    s.next_event().await?;
+                }
+                #[allow(unreachable_code)]
+                anyhow::Ok(())
+            })
+            .await;
+            println!("clipboard offered to Windows");
+        }
+    }
+    Ok(())
 }
 
 async fn ctl(paths: &VmPaths, action: CtlAction) -> anyhow::Result<()> {
