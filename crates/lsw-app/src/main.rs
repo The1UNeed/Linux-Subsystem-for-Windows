@@ -582,6 +582,8 @@ fn spawn_lsw_program(program: &str, args: &[&str], unit: &str) -> std::io::Resul
         .unwrap_or_else(|| PathBuf::from(program));
     let systemd = std::process::Command::new("systemd-run")
         .args(["--user", "--collect", "--quiet", "--unit", unit])
+        // The VM supervisor shuts Windows down on SIGTERM (up to 120 s).
+        .args(["--property", "TimeoutStopSec=150"])
         .arg(&exe)
         .args(args)
         .status();

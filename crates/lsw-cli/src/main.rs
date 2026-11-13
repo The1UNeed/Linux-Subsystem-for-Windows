@@ -859,6 +859,9 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
             tracing::warn!("API socket: {e}");
         }
     });
+    // SIGTERM (systemctl stop, logout, host shutdown) shuts Windows down
+    // like Ctrl+C does, instead of killing it.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let result = loop {
         tokio::select! {
             activity = running.next_activity() => match activity {
@@ -888,7 +891,12 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
                     }
                 }
             },
-            _ = tokio::signal::ctrl_c() => {
+            _ = async {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            } => {
                 println!("Shutting Windows down…");
                 let status = running.shutdown(Duration::from_secs(120)).await?;
                 println!("VM powered off ({status}).");
