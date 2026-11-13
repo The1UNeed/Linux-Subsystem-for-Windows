@@ -5,8 +5,6 @@ use std::time::{Duration, Instant};
 
 /// Pause after this long with nothing visible.
 pub const IDLE_AFTER: Duration = Duration::from_secs(60);
-/// Never pause this soon after boot (setup, updates, agent start).
-pub const BOOT_GRACE: Duration = Duration::from_secs(180);
 
 /// What the supervisor observes every few seconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -18,6 +16,10 @@ pub struct Observation {
     pub coherence_view: bool,
     /// Windows mirrored by Coherence (as it last reported).
     pub coherence_windows: u32,
+    /// The guest agent is connected. Until it is, Windows is booting,
+    /// installing updates or rebooting, and is never paused: a frozen
+    /// update or logon would never finish.
+    pub agent: bool,
 }
 
 impl Observation {
@@ -35,20 +37,15 @@ pub enum Action {
     Resume,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct IdlePolicy {
-    booted: Instant,
     idle_since: Option<Instant>,
     paused: bool,
 }
 
 impl IdlePolicy {
-    pub fn new(now: Instant) -> Self {
-        Self {
-            booted: now,
-            idle_since: None,
-            paused: false,
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn paused(&self) -> bool {
@@ -71,7 +68,11 @@ impl IdlePolicy {
         if obs.visible() {
             return self.wake(now);
         }
-        if now.duration_since(self.booted) < BOOT_GRACE || self.paused {
+        if self.paused {
+            return Action::None;
+        }
+        if !obs.agent {
+            self.idle_since = None;
             return Action::None;
         }
         let since = *self.idle_since.get_or_insert(now);
@@ -100,10 +101,11 @@ mod tests {
     #[test]
     fn pauses_after_a_minute_of_nothing_visible_and_resumes_on_demand() {
         let t0 = Instant::now();
-        let mut p = IdlePolicy::new(t0);
-        let none = Observation::default();
-        // Boot grace: nothing happens in the first three minutes.
-        assert_eq!(p.observe(none, at(t0, 100)), Action::None);
+        let mut p = IdlePolicy::new();
+        let none = Observation {
+            agent: true,
+            ..Default::default()
+        };
         assert_eq!(p.observe(none, at(t0, 200)), Action::None);
         assert_eq!(p.observe(none, at(t0, 259)), Action::None);
         assert_eq!(p.observe(none, at(t0, 260)), Action::Pause);
@@ -120,10 +122,11 @@ mod tests {
     #[test]
     fn coherence_with_windows_keeps_running_and_without_them_idles() {
         let t0 = Instant::now();
-        let mut p = IdlePolicy::new(t0);
+        let mut p = IdlePolicy::new();
         let busy = Observation {
             coherence_view: true,
             coherence_windows: 2,
+            agent: true,
             ..Default::default()
         };
         let empty = Observation {
@@ -138,6 +141,29 @@ mod tests {
         // A launcher wakes it.
         assert_eq!(p.wake(at(t0, 620)), Action::Resume);
         assert_eq!(p.wake(at(t0, 621)), Action::None);
+    }
+
+    #[test]
+    fn never_pauses_while_windows_boots_or_updates() {
+        let t0 = Instant::now();
+        let mut p = IdlePolicy::new();
+        let booting = Observation::default();
+        // A long update: no agent for 20 minutes, nothing on screen.
+        for s in (0..1200).step_by(2) {
+            assert_eq!(p.observe(booting, at(t0, s)), Action::None);
+        }
+        // The agent connects: the idle minute starts only now.
+        let ready = Observation {
+            agent: true,
+            ..booting
+        };
+        assert_eq!(p.observe(ready, at(t0, 1200)), Action::None);
+        assert_eq!(p.observe(ready, at(t0, 1259)), Action::None);
+        // An in-guest reboot drops the agent: the timer starts again.
+        assert_eq!(p.observe(booting, at(t0, 1250)), Action::None);
+        assert_eq!(p.observe(ready, at(t0, 1300)), Action::None);
+        assert_eq!(p.observe(ready, at(t0, 1359)), Action::None);
+        assert_eq!(p.observe(ready, at(t0, 1360)), Action::Pause);
     }
 
     #[test]

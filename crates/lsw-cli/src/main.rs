@@ -22,7 +22,7 @@ use lsw_daemon::firmware;
 use lsw_daemon::host::HostReport;
 use lsw_daemon::paths::VmPaths;
 use lsw_daemon::qemu::{Audio, CONTROL_PORT_ID, DiskIo, LaunchOptions};
-use lsw_daemon::qmp::Qmp;
+use lsw_daemon::qmp::{Qmp, QmpError};
 use lsw_daemon::vm::{self, Vm};
 use lsw_installer::{download, media, unattend};
 use lsw_proto::ShareSpec;
@@ -850,7 +850,7 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
         },
     ));
     let (call_tx, mut call_rx) = tokio::sync::mpsc::unbounded_channel::<api::Call>();
-    let mut idle = lsw_daemon::idle::IdlePolicy::new(std::time::Instant::now());
+    let mut idle = lsw_daemon::idle::IdlePolicy::new();
     let mut idle_tick = tokio::time::interval(Duration::from_secs(2));
     let mut coherence_windows = 0u32;
     let api_path = paths.api_socket();
@@ -865,6 +865,18 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
                 vm::Activity::Exited(status) => {
                     println!("QEMU exited: {}", status?);
                     break Ok(());
+                }
+                vm::Activity::Event(Err(QmpError::Closed)) => {
+                    // QEMU closes QMP as it exits (Windows shut itself
+                    // down, or QEMU died): report how it ended.
+                    match tokio::time::timeout(Duration::from_secs(10), running.wait()).await {
+                        Ok(status) => {
+                            println!("QEMU exited: {}", status?);
+                            break Ok(());
+                        }
+                        // QEMU is killed when `running` is dropped.
+                        Err(_) => break Err(anyhow::anyhow!("QEMU closed its QMP monitor but kept running")),
+                    }
                 }
                 vm::Activity::Event(event) => {
                     let event = event?;
@@ -917,7 +929,8 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
                 handle_api_call(call, &connected, &cmd_tx, paths);
             }
             _ = idle_tick.tick() => {
-                let obs = observe_views(&mut running, coherence_windows).await;
+                let mut obs = observe_views(&mut running, coherence_windows).await;
+                obs.agent = connected.load(Ordering::Acquire);
                 if !obs.coherence_view {
                     coherence_windows = 0;
                 }

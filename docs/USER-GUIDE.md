@@ -69,7 +69,9 @@ or run it in a terminal with `lsw run` (Ctrl+C shuts Windows down cleanly).
   `lsw usb detach …` gives it back. Your user needs access to the device
   node; the error message says how.
 * **Idle**: when no Windows window has been visible for a minute, Windows
-  pauses and uses no CPU. Opening an app resumes it instantly.
+  pauses and uses no CPU. Opening an app resumes it instantly. It never
+  pauses while Windows starts, restarts or installs updates (until the LSW
+  agent is running).
 * **Status**: `lsw ctl status`, screenshots with `lsw ctl screenshot FILE`,
   ACPI shutdown with `lsw ctl powerdown`.
 
