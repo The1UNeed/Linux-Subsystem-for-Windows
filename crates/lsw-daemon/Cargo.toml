@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+lsw-proto.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true

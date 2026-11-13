@@ -11,11 +11,13 @@
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use lsw_daemon::config::{Firmware, GpuTier, InstallMedia, Network, Profile, VmConfig};
+use lsw_daemon::config::{
+    Firmware, GpuTier, InstallMedia, Network, Profile, Share, VmConfig, parse_user_dirs,
+};
 use lsw_daemon::firmware;
 use lsw_daemon::host::HostReport;
 use lsw_daemon::paths::VmPaths;
-use lsw_daemon::qemu::{DiskIo, LaunchOptions};
+use lsw_daemon::qemu::{Audio, DiskIo, LaunchOptions};
 use lsw_daemon::qmp::Qmp;
 use lsw_daemon::vm::{self, Vm};
 use lsw_installer::{download, media, unattend};
@@ -75,35 +77,8 @@ enum Cmd {
     },
     /// Prepare a new Windows VM (downloads media, writes the answer file).
     Create {
-        #[arg(long, value_enum, default_value_t = ProfileArg::Productivity)]
-        profile: ProfileArg,
-        #[arg(long, value_enum, default_value_t = Source::Consumer)]
-        source: Source,
-        /// Path to a Windows 11 ISO (with `--source iso`).
-        #[arg(long)]
-        iso: Option<PathBuf>,
-        /// Image name in the ISO for `--source iso` (default "Windows 11 Pro").
-        #[arg(long, default_value = "Windows 11 Pro")]
-        edition: String,
-        /// Download language as named by Microsoft (`English`, `English International`, …).
-        #[arg(long, default_value = "English")]
-        language: String,
-        /// Windows account name (default: your Linux user name).
-        #[arg(long)]
-        user: Option<String>,
-        #[arg(long, value_enum, default_value_t = TierArg::Auto)]
-        tier: TierArg,
-        #[arg(long, value_enum, default_value_t = NetArg::Auto)]
-        network: NetArg,
-        /// Override memory in MiB.
-        #[arg(long)]
-        memory: Option<u32>,
-        /// Override vCPU count.
-        #[arg(long)]
-        cpus: Option<u16>,
-        /// Override disk size in GiB.
-        #[arg(long)]
-        disk: Option<u64>,
+        #[command(flatten)]
+        args: CreateArgs,
     },
     /// Run the unattended installation and wait for it to finish.
     Install {
@@ -139,6 +114,9 @@ struct LaunchArgs {
     /// Expose VNC on this Unix socket (debugging).
     #[arg(long)]
     vnc: Option<PathBuf>,
+    /// No sound device, even when PipeWire is running.
+    #[arg(long)]
+    no_audio: bool,
 }
 
 #[derive(Subcommand)]
@@ -169,38 +147,7 @@ async fn main() -> anyhow::Result<()> {
     let paths = VmPaths::resolve(&cli.name)?;
     match cli.cmd {
         Cmd::Doctor { json } => doctor(json),
-        Cmd::Create {
-            profile,
-            source,
-            iso,
-            edition,
-            language,
-            user,
-            tier,
-            network,
-            memory,
-            cpus,
-            disk,
-        } => {
-            create(
-                &cli.name,
-                &paths,
-                CreateArgs {
-                    profile,
-                    source,
-                    iso,
-                    edition,
-                    language,
-                    user,
-                    tier,
-                    network,
-                    memory,
-                    cpus,
-                    disk,
-                },
-            )
-            .await
-        }
+        Cmd::Create { args } => create(&cli.name, &paths, args).await,
         Cmd::Install {
             timeout_min,
             screenshot,
@@ -235,7 +182,7 @@ fn doctor(json: bool) -> anyhow::Result<()> {
             yes(report.kvm_accessible)
         );
         println!("IOMMU groups: {}", report.iommu_groups);
-        println!("vhost-vsock:  {}", yes(report.vhost_vsock));
+        println!("PipeWire:     {}", yes(report.pipewire));
         for g in &report.gpus {
             println!(
                 "GPU:          {} {:04x}:{:04x} driver={} boot_vga={} vfs={} render={}",
@@ -282,18 +229,41 @@ fn yes(b: bool) -> &'static str {
     if b { "yes" } else { "no" }
 }
 
+#[derive(clap::Args)]
 struct CreateArgs {
+    #[arg(long, value_enum, default_value_t = ProfileArg::Productivity)]
     profile: ProfileArg,
+    #[arg(long, value_enum, default_value_t = Source::Consumer)]
     source: Source,
+    /// Path to a Windows 11 ISO (with `--source iso`).
+    #[arg(long)]
     iso: Option<PathBuf>,
+    /// Image name in the ISO for `--source iso` (default "Windows 11 Pro").
+    #[arg(long, default_value = "Windows 11 Pro")]
     edition: String,
+    /// Download language as named by Microsoft (`English`, `English International`, …).
+    #[arg(long, default_value = "English")]
     language: String,
+    /// Windows account name (default: your Linux user name).
+    #[arg(long)]
     user: Option<String>,
+    #[arg(long, value_enum, default_value_t = TierArg::Auto)]
     tier: TierArg,
+    #[arg(long, value_enum, default_value_t = NetArg::Auto)]
     network: NetArg,
+    /// Override memory in MiB.
+    #[arg(long)]
     memory: Option<u32>,
+    /// Override vCPU count.
+    #[arg(long)]
     cpus: Option<u16>,
+    /// Override disk size in GiB.
+    #[arg(long)]
     disk: Option<u64>,
+    /// Do not pair the Linux Desktop/Documents/Downloads/Pictures/Music/Videos
+    /// folders with Windows.
+    #[arg(long)]
+    no_shared_folders: bool,
 }
 
 async fn create(name: &str, paths: &VmPaths, a: CreateArgs) -> anyhow::Result<()> {
@@ -437,7 +407,12 @@ async fn create(name: &str, paths: &VmPaths, a: CreateArgs) -> anyhow::Result<()
         tpm_state_dir: paths.data.join("tpm"),
         network,
         gpu_tier: tier,
-        vsock_cid: host.vhost_vsock.then_some(3),
+        shares: if a.no_shared_folders {
+            Vec::new()
+        } else {
+            default_shares()
+        },
+        microphone: false,
         install: Some(InstallMedia {
             windows_iso,
             virtio_win_iso: virtio_iso,
@@ -560,7 +535,22 @@ fn restrict_file(_: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn launch_options(cfg: &VmConfig, host: &HostReport, l: &LaunchArgs) -> LaunchOptions {
+/// Linux XDG user folders paired with Windows known folders.
+fn default_shares() -> Vec<Share> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return Vec::new();
+    };
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    let text = std::fs::read_to_string(config_home.join("user-dirs.dirs")).unwrap_or_default();
+    let dirs = parse_user_dirs(&text, &home);
+    Share::defaults(&home, |key| {
+        dirs.iter().find(|(k, _)| k == key).map(|(_, p)| p.clone())
+    })
+}
+
+fn launch_options(host: &HostReport, l: &LaunchArgs) -> LaunchOptions {
     LaunchOptions {
         display: match &l.vnc {
             Some(p) => lsw_daemon::qemu::Display::VncUnix(p.clone()),
@@ -571,7 +561,11 @@ fn launch_options(cfg: &VmConfig, host: &HostReport, l: &LaunchArgs) -> LaunchOp
         } else {
             DiskIo::IoUring
         },
-        vsock: host.vhost_vsock && cfg.vsock_cid.is_some(),
+        audio: if host.pipewire && !l.no_audio {
+            Audio::PipeWire
+        } else {
+            Audio::None
+        },
         sandbox: !l.no_sandbox,
     }
 }
@@ -588,7 +582,7 @@ async fn install(
         .clone()
         .context("this VM is already installed")?;
     let host = HostReport::probe();
-    let opts = launch_options(&cfg, &host, l);
+    let opts = launch_options(&host, l);
     let _ = std::fs::remove_file(paths.serial_log());
     let started = std::time::Instant::now();
     let mut running = Vm::new(cfg.clone(), paths.clone())
@@ -650,7 +644,7 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
         bail!("Windows is not installed yet; run `lsw install` first");
     }
     let host = HostReport::probe();
-    let opts = launch_options(&cfg, &host, l);
+    let opts = launch_options(&host, l);
     let mut running = Vm::new(cfg, paths.clone())
         .start(&host.binaries, &opts)
         .await?;

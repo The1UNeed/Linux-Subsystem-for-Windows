@@ -2,8 +2,9 @@
 //!
 //! * Persistent data: `$XDG_DATA_HOME/lsw/vms/<name>/` (config, disk, NVRAM,
 //!   TPM state, logs).
-//! * QEMU runtime files: `$XDG_RUNTIME_DIR/lsw/<name>/` (QMP sockets, pid).
-//! * Helper sockets: `$HOME/.cache/lsw/sock/<name>/` (swtpm, passt). Ubuntu
+//! * QEMU runtime files: `$XDG_RUNTIME_DIR/lsw/<name>/` (QMP sockets, guest
+//!   agent channel, pid).
+//! * Helper sockets: `$HOME/.cache/lsw/sock/<name>/` (swtpm, passt, virtiofsd). Ubuntu
 //!   confines `/usr/bin/swtpm` and `/usr/bin/passt` with AppArmor profiles
 //!   that may only create sockets under `/tmp` or `@{HOME}`; `/run/user` is
 //!   denied. The directory is derived from `$HOME` itself, not an XDG
@@ -67,6 +68,23 @@ impl VmPaths {
     pub fn passt_socket(&self) -> PathBuf {
         self.helper_run.join("passt.sock")
     }
+    /// vhost-user socket of the virtiofsd serving the `index`-th share
+    /// (named by index, not tag, to stay within the socket path limit).
+    pub fn virtiofs_socket(&self, index: usize) -> PathBuf {
+        self.helper_run.join(format!("fs{index}.sock"))
+    }
+    /// virtio-serial control channel to the guest agent (QEMU listens).
+    pub fn agent_socket(&self) -> PathBuf {
+        self.run.join("agent.sock")
+    }
+    /// virtio-serial session channel to the guest agent, used by the UI.
+    pub fn session_socket(&self) -> PathBuf {
+        self.run.join("session.sock")
+    }
+    /// QMP monitor reserved for the UI (display connection, input).
+    pub fn ui_qmp_socket(&self) -> PathBuf {
+        self.run.join("ui.sock")
+    }
     pub fn qemu_pidfile(&self) -> PathBuf {
         self.run.join("qemu.pid")
     }
@@ -89,8 +107,12 @@ impl VmPaths {
         for sock in [
             self.qmp_socket(),
             self.ctl_socket(),
+            self.agent_socket(),
+            self.session_socket(),
+            self.ui_qmp_socket(),
             self.tpm_socket(),
             self.passt_socket(),
+            self.virtiofs_socket(lsw_proto::MAX_LIST_LEN),
         ] {
             anyhow::ensure!(
                 sock.as_os_str().len() <= MAX_SOCKET_PATH,

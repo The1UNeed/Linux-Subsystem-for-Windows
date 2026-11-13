@@ -54,7 +54,8 @@ pub struct HostReport {
     pub logical_cpus: u16,
     pub mem_total_mib: u64,
     pub iommu_groups: usize,
-    pub vhost_vsock: bool,
+    /// A PipeWire server is reachable for the user (guest audio).
+    pub pipewire: bool,
     pub gpus: Vec<Gpu>,
     /// Usable GPU tiers, in [`GpuTier`] order (A first, D last; D is always present).
     pub tiers: Vec<GpuTier>,
@@ -71,7 +72,9 @@ pub struct Problem {
 impl HostReport {
     /// Probe the real host.
     pub fn probe() -> Self {
-        Self::probe_root(Path::new("/"), &search_path())
+        let mut report = Self::probe_root(Path::new("/"), &search_path());
+        report.pipewire = pipewire_socket().is_some_and(|s| s.exists());
+        report
     }
 
     /// Probe a (possibly fake) root. `path` is the binary search path.
@@ -92,7 +95,7 @@ impl HostReport {
             logical_cpus,
             mem_total_mib: parse_meminfo_total_mib(&meminfo),
             iommu_groups,
-            vhost_vsock: root.join("dev/vhost-vsock").exists(),
+            pipewire: false,
             gpus,
             tiers: Vec::new(),
             binaries: find_binaries(path),
@@ -201,6 +204,15 @@ impl HostReport {
 }
 
 /// Binary search path: LSW's bundled tools first, then `$PATH`.
+/// The user's PipeWire socket (`$PIPEWIRE_RUNTIME_DIR` or
+/// `$XDG_RUNTIME_DIR`, then `pipewire-0`).
+pub fn pipewire_socket() -> Option<PathBuf> {
+    let dir =
+        std::env::var_os("PIPEWIRE_RUNTIME_DIR").or_else(|| std::env::var_os("XDG_RUNTIME_DIR"))?;
+    let name = std::env::var_os("PIPEWIRE_REMOTE").unwrap_or_else(|| "pipewire-0".into());
+    Some(PathBuf::from(dir).join(name))
+}
+
 pub fn search_path() -> Vec<PathBuf> {
     let mut dirs = vec![PathBuf::from("/usr/lib/lsw/bin")];
     if let Some(path) = std::env::var_os("PATH") {

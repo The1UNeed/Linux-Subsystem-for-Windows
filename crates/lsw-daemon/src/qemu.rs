@@ -6,6 +6,7 @@
 
 use crate::config::{Network, VmConfig};
 use crate::paths::VmPaths;
+use lsw_proto::{CONTROL_PORT_NAME, SESSION_PORT_NAME};
 use std::path::{Path, PathBuf};
 
 /// Hyper-V enlightenments for Windows guests. These are the set QEMU's
@@ -34,6 +35,18 @@ pub enum Display {
     Headless,
     /// VNC on a Unix socket (debugging).
     VncUnix(PathBuf),
+    /// QEMU's D-Bus display in peer-to-peer mode: no bus, the LSW app
+    /// connects through QMP `add_client` (Window and Full Screen views).
+    DbusP2p,
+}
+
+/// Where guest audio goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Audio {
+    /// No sound device (headless tests).
+    None,
+    /// ICH9 HD Audio → PipeWire.
+    PipeWire,
 }
 
 /// Block I/O backend for the system disk.
@@ -51,8 +64,7 @@ pub enum DiskIo {
 pub struct LaunchOptions {
     pub display: Display,
     pub disk_io: DiskIo,
-    /// Attach the vhost-vsock device (requires `/dev/vhost-vsock`).
-    pub vsock: bool,
+    pub audio: Audio,
     /// Enable QEMU's seccomp sandbox.
     pub sandbox: bool,
 }
@@ -62,7 +74,7 @@ impl Default for LaunchOptions {
         Self {
             display: Display::Headless,
             disk_io: DiskIo::IoUring,
-            vsock: true,
+            audio: Audio::None,
             sandbox: true,
         }
     }
@@ -231,21 +243,67 @@ pub fn build_args(cfg: &VmConfig, paths: &VmPaths, opts: &LaunchOptions) -> Vec<
         "virtio-balloon-pci,id=balloon0,free-page-reporting=on",
     ]);
 
-    // Guest agent channel.
-    if opts.vsock
-        && let Some(cid) = cfg.vsock_cid
-    {
+    // Guest agent control channel: a virtio-serial port. Windows opens it
+    // as a plain device (`\\.\Global\<name>`) through the signed vioserial
+    // driver, the same transport QEMU's own guest agent uses.
+    push(&["-device", "virtio-serial-pci,id=vser0"]);
+    push(&[
+        "-chardev",
+        &format!(
+            "socket,id=agent,path={},server=on,wait=off",
+            p(&paths.agent_socket())
+        ),
+    ]);
+    push(&[
+        "-device",
+        &format!("virtserialport,bus=vser0.0,chardev=agent,name={CONTROL_PORT_NAME}"),
+    ]);
+    push(&[
+        "-chardev",
+        &format!(
+            "socket,id=session,path={},server=on,wait=off",
+            p(&paths.session_socket())
+        ),
+    ]);
+    push(&[
+        "-device",
+        &format!("virtserialport,bus=vser0.0,chardev=session,name={SESSION_PORT_NAME}"),
+    ]);
+
+    // Shared folders: one vhost-user-fs device per virtiofsd.
+    for (i, share) in cfg.shares.iter().enumerate() {
+        push(&[
+            "-chardev",
+            &format!("socket,id=fs{i},path={}", p(&paths.virtiofs_socket(i))),
+        ]);
         push(&[
             "-device",
-            &format!("vhost-vsock-pci,id=vsock0,guest-cid={cid}"),
+            &format!(
+                "vhost-user-fs-pci,chardev=fs{i},tag={},queue-size=1024",
+                share.tag
+            ),
         ]);
     }
 
+    // Sound: HD Audio, which Windows drives with its inbox driver. Output
+    // only unless the user enabled the microphone.
+    if opts.audio == Audio::PipeWire {
+        push(&["-audiodev", "pipewire,id=snd0"]);
+        push(&["-device", "ich9-intel-hda,id=hda0"]);
+        let codec = if cfg.microphone {
+            "hda-duplex"
+        } else {
+            "hda-output"
+        };
+        push(&["-device", &format!("{codec},bus=hda0.0,audiodev=snd0")]);
+    }
+
     // Display (tier D baseline; higher tiers add their devices in M3).
-    push(&["-device", "virtio-vga,id=video0"]);
+    push(&["-device", "virtio-vga,id=video0,xres=1280,yres=800"]);
     match &opts.display {
         Display::Headless => push(&["-display", "none"]),
         Display::VncUnix(sock) => push(&["-display", "none", "-vnc", &format!("unix:{}", p(sock))]),
+        Display::DbusP2p => push(&["-display", "dbus,p2p=yes,gl=off"]),
     }
 
     // Serial console: first-boot scripts report progress on COM1.
@@ -273,6 +331,15 @@ pub fn build_args(cfg: &VmConfig, paths: &VmPaths, opts: &LaunchOptions) -> Vec<
         ),
     ]);
     push(&["-mon", "chardev=qmpctl,mode=control"]);
+    // Third monitor for the UI (passes the display socket with `add_client`).
+    push(&[
+        "-chardev",
+        &format!(
+            "socket,id=qmpui,path={},server=on,wait=off",
+            p(&paths.ui_qmp_socket())
+        ),
+    ]);
+    push(&["-mon", "chardev=qmpui,mode=control"]);
     push(&["-pidfile", &p(&paths.qemu_pidfile())]);
     push(&["-boot", "menu=off,strict=on"]);
 
@@ -330,7 +397,8 @@ mod tests {
             tpm_state_dir: dir.join("tpm"),
             network: Network::Passt,
             gpu_tier: GpuTier::D,
-            vsock_cid: Some(42),
+            shares: vec![],
+            microphone: false,
             install: None,
         }
     }
@@ -359,7 +427,18 @@ mod tests {
         assert!(s.contains("-device tpm-crb,tpmdev=tpm0"));
         assert!(s.contains("virtio-blk-pci,drive=disk0,iothread=io0,num-queues=4,bootindex=1"));
         assert!(s.contains("cache=none,aio=io_uring"));
-        assert!(s.contains("vhost-vsock-pci,id=vsock0,guest-cid=42"));
+        assert!(s.contains("-device virtio-serial-pci,id=vser0"));
+        assert!(
+            s.contains("socket,id=agent,path=/run/user/1000/lsw/win/agent.sock,server=on,wait=off")
+        );
+        assert!(s.contains("virtserialport,bus=vser0.0,chardev=agent,name=org.lsw.control.0"));
+        assert!(s.contains("virtserialport,bus=vser0.0,chardev=session,name=org.lsw.session.0"));
+        assert!(
+            s.contains("socket,id=qmpui,path=/run/user/1000/lsw/win/ui.sock,server=on,wait=off")
+        );
+        assert!(!s.contains("vsock"));
+        assert!(!s.contains("vhost-user-fs"));
+        assert!(!s.contains("-audiodev"));
         assert!(s.contains("virtio-balloon-pci,id=balloon0,free-page-reporting=on"));
         assert!(s.contains("path=/run/user/1000/lsw/win/qmp.sock,server=on,wait=off"));
         assert!(s.contains("addr.path=/home/u/.cache/lsw/sock/win/passt.sock"));
@@ -418,17 +497,55 @@ mod tests {
         let mut c = cfg(Path::new("/d"));
         c.network = Network::None;
         let opts = LaunchOptions {
-            vsock: false,
+            audio: Audio::None,
             sandbox: false,
             disk_io: DiskIo::Threads,
             display: Display::VncUnix("/r/vnc.sock".into()),
         };
         let s = joined(&build_args(&c, &paths, &opts));
         assert!(!s.contains("virtio-net"));
-        assert!(!s.contains("vhost-vsock"));
         assert!(!s.contains("-sandbox"));
         assert!(s.contains("cache=writeback,aio=threads"));
         assert!(s.contains("-vnc unix:/r/vnc.sock"));
+    }
+
+    #[test]
+    fn shares_audio_and_dbus_display() {
+        use crate::config::Share;
+        use lsw_proto::KnownFolder;
+        let paths = VmPaths::with_bases(
+            Path::new("/d"),
+            Path::new("/r"),
+            Path::new("/home/u/.cache/lsw/sock"),
+            "win",
+        );
+        let mut c = cfg(Path::new("/d"));
+        c.shares = vec![
+            Share {
+                tag: "lsw-documents".into(),
+                host_path: "/home/u/Documents".into(),
+                folder: KnownFolder::Documents,
+            },
+            Share {
+                tag: "lsw-music".into(),
+                host_path: "/home/u/Music".into(),
+                folder: KnownFolder::Music,
+            },
+        ];
+        let opts = LaunchOptions {
+            audio: Audio::PipeWire,
+            display: Display::DbusP2p,
+            ..LaunchOptions::default()
+        };
+        let s = joined(&build_args(&c, &paths, &opts));
+        assert!(s.contains("socket,id=fs0,path=/home/u/.cache/lsw/sock/win/fs0.sock"));
+        assert!(s.contains("vhost-user-fs-pci,chardev=fs1,tag=lsw-music,queue-size=1024"));
+        assert!(s.contains("-audiodev pipewire,id=snd0"));
+        assert!(s.contains("hda-output,bus=hda0.0,audiodev=snd0"));
+        assert!(s.contains("-display dbus,p2p=yes,gl=off"));
+        c.microphone = true;
+        let s = joined(&build_args(&c, &paths, &opts));
+        assert!(s.contains("hda-duplex,bus=hda0.0,audiodev=snd0"));
     }
 
     #[test]

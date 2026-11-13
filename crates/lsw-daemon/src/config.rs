@@ -1,5 +1,6 @@
 //! Persistent VM configuration (`vm.json` in the VM directory).
 
+use lsw_proto::KnownFolder;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -78,6 +79,70 @@ pub struct InstallMedia {
     pub setup_iso: PathBuf,
 }
 
+/// A Linux folder shared into Windows over virtiofs, backing one Windows
+/// known folder.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Share {
+    /// virtiofs tag, `[a-z0-9-]{1,36}` (checked by [`VmConfig::validate`]).
+    pub tag: String,
+    /// Absolute host directory exported to the guest.
+    pub host_path: PathBuf,
+    /// Windows known folder redirected to the share.
+    pub folder: KnownFolder,
+}
+
+impl Share {
+    /// The default pairing: Linux XDG user folders ↔ Windows known folders.
+    /// Folders that do not exist on the host are skipped; the home directory
+    /// itself is never shared.
+    pub fn defaults(home: &Path, xdg: impl Fn(&str) -> Option<PathBuf>) -> Vec<Share> {
+        [
+            ("DESKTOP", "Desktop", KnownFolder::Desktop),
+            ("DOCUMENTS", "Documents", KnownFolder::Documents),
+            ("DOWNLOAD", "Downloads", KnownFolder::Downloads),
+            ("PICTURES", "Pictures", KnownFolder::Pictures),
+            ("MUSIC", "Music", KnownFolder::Music),
+            ("VIDEOS", "Videos", KnownFolder::Videos),
+        ]
+        .into_iter()
+        .filter_map(|(key, fallback, folder)| {
+            let dir = xdg(key).unwrap_or_else(|| home.join(fallback));
+            (dir.is_dir() && dir.is_absolute() && dir != home).then(|| Share {
+                tag: format!("lsw-{}", fallback.to_ascii_lowercase()),
+                host_path: dir,
+                folder,
+            })
+        })
+        .collect()
+    }
+}
+
+/// Parse `user-dirs.dirs` (`XDG_DOCUMENTS_DIR="$HOME/Dokumente"`) into
+/// `("DOCUMENTS", path)` pairs. Only `$HOME/…` and absolute values are
+/// accepted, as the xdg-user-dirs format specifies.
+pub fn parse_user_dirs(text: &str, home: &Path) -> Vec<(String, PathBuf)> {
+    text.lines()
+        .filter_map(|line| {
+            let (key, value) = line.trim().split_once('=')?;
+            let name = key.strip_prefix("XDG_")?.strip_suffix("_DIR")?;
+            let value = value.trim().strip_prefix('"')?.strip_suffix('"')?;
+            let path = if let Some(rest) = value.strip_prefix("$HOME") {
+                let rest = rest.trim_start_matches('/');
+                if rest.is_empty() {
+                    home.to_path_buf()
+                } else {
+                    home.join(rest)
+                }
+            } else if value.starts_with('/') {
+                PathBuf::from(value)
+            } else {
+                return None;
+            };
+            Some((name.to_owned(), path))
+        })
+        .collect()
+}
+
 /// Persistent configuration of the single Windows VM.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct VmConfig {
@@ -90,8 +155,12 @@ pub struct VmConfig {
     pub tpm_state_dir: PathBuf,
     pub network: Network,
     pub gpu_tier: GpuTier,
-    /// vsock context id for the guest agent channel (≥ 3).
-    pub vsock_cid: Option<u32>,
+    /// Shared folders (virtiofs).
+    #[serde(default)]
+    pub shares: Vec<Share>,
+    /// Give Windows a microphone (off by default, as in Parallels).
+    #[serde(default)]
+    pub microphone: bool,
     /// Present until the unattended installation finished.
     pub install: Option<InstallMedia>,
 }
@@ -132,8 +201,27 @@ impl VmConfig {
         );
         anyhow::ensure!(self.vcpus >= 2, "Windows 11 needs at least 2 vCPUs");
         anyhow::ensure!(self.disk_size_gib >= 64, "Windows 11 needs at least 64 GiB");
-        if let Some(cid) = self.vsock_cid {
-            anyhow::ensure!(cid >= 3 && cid != u32::MAX, "vsock CID must be >= 3");
+        anyhow::ensure!(
+            self.shares.len() <= lsw_proto::MAX_LIST_LEN,
+            "too many shared folders"
+        );
+        let mut seen = std::collections::HashSet::new();
+        for share in &self.shares {
+            anyhow::ensure!(
+                lsw_proto::is_valid_tag(&share.tag),
+                "invalid share tag {:?}",
+                share.tag
+            );
+            anyhow::ensure!(
+                seen.insert(&share.tag),
+                "duplicate share tag {:?}",
+                share.tag
+            );
+            anyhow::ensure!(
+                share.host_path.is_absolute(),
+                "share path must be absolute: {}",
+                share.host_path.display()
+            );
         }
         Ok(())
     }
@@ -158,7 +246,8 @@ mod tests {
             tpm_state_dir: dir.join("tpm"),
             network: Network::Passt,
             gpu_tier: GpuTier::D,
-            vsock_cid: Some(3),
+            shares: vec![],
+            microphone: false,
             install: None,
         }
     }
@@ -180,9 +269,53 @@ mod tests {
         let mut cfg = sample(dir.path());
         cfg.memory_mib = 2048;
         assert!(cfg.validate().is_err());
-        let mut cfg = sample(dir.path());
-        cfg.vsock_cid = Some(2);
-        assert!(cfg.validate().is_err());
+        let share = |tag: &str, path: &str| Share {
+            tag: tag.into(),
+            host_path: path.into(),
+            folder: KnownFolder::Documents,
+        };
+        for bad in [
+            vec![share("Bad Tag", "/home/u/Documents")],
+            vec![share("lsw-docs", "relative/path")],
+            vec![share("a", "/x"), share("a", "/y")],
+        ] {
+            let mut cfg = sample(dir.path());
+            cfg.shares = bad;
+            assert!(cfg.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn default_shares_pair_existing_xdg_folders_only() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        std::fs::create_dir(h.join("Documents")).unwrap();
+        std::fs::create_dir(h.join("Bilder")).unwrap();
+        // XDG_PICTURES_DIR points at a localized folder; Music is missing;
+        // a folder configured as the home directory itself is never shared.
+        let shares = Share::defaults(h, |key| match key {
+            "PICTURES" => Some(h.join("Bilder")),
+            "DESKTOP" => Some(h.to_path_buf()),
+            _ => None,
+        });
+        let tags: Vec<_> = shares.iter().map(|s| s.tag.as_str()).collect();
+        assert_eq!(tags, ["lsw-documents", "lsw-pictures"]);
+        assert_eq!(shares[1].host_path, h.join("Bilder"));
+        assert_eq!(shares[1].folder, KnownFolder::Pictures);
+    }
+
+    #[test]
+    fn user_dirs_file_is_parsed() {
+        let text = "# comment\nXDG_DESKTOP_DIR=\"$HOME/Schreibtisch\"\nXDG_DOWNLOAD_DIR=\"/data/dl\"\nXDG_MUSIC_DIR=\"$HOME/\"\nXDG_VIDEOS_DIR=relative\nXDG_BAD=\"/x\"\n";
+        let home = Path::new("/home/u");
+        assert_eq!(
+            parse_user_dirs(text, home),
+            vec![
+                ("DESKTOP".to_owned(), PathBuf::from("/home/u/Schreibtisch")),
+                ("DOWNLOAD".to_owned(), PathBuf::from("/data/dl")),
+                ("MUSIC".to_owned(), PathBuf::from("/home/u")),
+            ]
+        );
     }
 
     #[test]

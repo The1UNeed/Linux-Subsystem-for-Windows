@@ -16,6 +16,14 @@
 //! * poisons itself after the first error so a confused peer cannot resync
 //!   into a half-parsed stream; the caller must drop the connection.
 //!
+//! # Handshake
+//!
+//! The host speaks first: whenever a host endpoint (re)connects to a port it
+//! sends [`Message::Attach`]. The guest answers with [`Message::Hello`] and
+//! the host accepts with [`Message::Welcome`]. Until it has seen `Attach`
+//! the guest never writes to a port, so it cannot block on a port nobody is
+//! reading.
+//!
 //! # Compatibility
 //!
 //! Variants are only ever appended to [`Message`], never reordered or removed.
@@ -37,8 +45,28 @@ pub const MAX_FRAME_LEN: u32 = 1 << 20;
 /// Largest accepted string field.
 pub const MAX_STRING_LEN: usize = 4096;
 
-/// vsock port the guest agent listens on for the control channel.
-pub const CONTROL_PORT: u32 = 5700;
+/// virtio-serial port of the control channel (host side: the VM
+/// supervisor). The guest opens it as `\\.\Global\org.lsw.control.0`.
+/// Carries lifecycle and shared-folder messages.
+pub const CONTROL_PORT_NAME: &str = "org.lsw.control.0";
+
+/// virtio-serial port of the session channel (host side: whichever LSW UI
+/// is showing Windows). Carries clipboard and display messages: on Wayland
+/// only a focused client may own the clipboard, so the UI process speaks
+/// for the host desktop directly instead of through the supervisor.
+pub const SESSION_PORT_NAME: &str = "org.lsw.session.0";
+
+/// Largest data chunk in one [`Message::ClipboardData`] frame.
+pub const MAX_CLIPBOARD_CHUNK: usize = 512 * 1024;
+
+/// Largest clipboard payload either side accepts (sum of all chunks).
+pub const MAX_CLIPBOARD_TOTAL: u64 = 32 << 20;
+
+/// Most entries in a list field (clipboard formats, shares).
+pub const MAX_LIST_LEN: usize = 32;
+
+/// Longest share tag (virtiofs tags are at most 36 bytes).
+pub const MAX_TAG_LEN: usize = 36;
 
 /// Length of the frame header in bytes.
 pub const HEADER_LEN: usize = 4;
@@ -75,6 +103,71 @@ pub enum Message {
     Error { code: ErrorCode, detail: String },
     /// Host → guest, shut down or reboot Windows cleanly.
     Shutdown { reboot: bool },
+    /// Either direction: the sender's clipboard changed and now holds these
+    /// formats. Nothing is transferred until the peer asks.
+    ClipboardOffer {
+        serial: u64,
+        formats: Vec<ClipFormat>,
+    },
+    /// Either direction: send the clipboard content `serial` in `format`.
+    ClipboardRequest { serial: u64, format: ClipFormat },
+    /// Answer to [`Message::ClipboardRequest`], split into chunks of at most
+    /// [`MAX_CLIPBOARD_CHUNK`] bytes sent in order; `total` is the full size.
+    ClipboardData {
+        serial: u64,
+        format: ClipFormat,
+        total: u64,
+        offset: u64,
+        chunk: Vec<u8>,
+    },
+    /// Host → guest: the host view is this size; resize the Windows display.
+    DisplayHint {
+        width: u32,
+        height: u32,
+        /// Windows scale factor in percent (100, 125, 150, …).
+        scale_percent: u16,
+    },
+    /// Host → guest: mount these virtiofs shares and point the matching
+    /// Windows known folders at them. Replaces any earlier list.
+    ShareFolders { shares: Vec<ShareSpec> },
+    /// Guest → host: result for one share from [`Message::ShareFolders`].
+    ShareStatus {
+        tag: String,
+        ok: bool,
+        detail: String,
+    },
+    /// Host → guest, first frame after a host endpoint connects: the guest
+    /// answers with [`Message::Hello`].
+    Attach { protocol: u16 },
+}
+
+/// Clipboard formats carried between the hosts.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ClipFormat {
+    /// UTF-8 text.
+    Text,
+    /// An HTML fragment (UTF-8).
+    Html,
+    /// A PNG image.
+    Png,
+}
+
+/// Windows known folders that can be paired with a Linux folder.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KnownFolder {
+    Desktop,
+    Documents,
+    Downloads,
+    Pictures,
+    Music,
+    Videos,
+}
+
+/// One shared folder: the virtiofs `tag` and the known folder it backs.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ShareSpec {
+    pub tag: String,
+    pub folder: KnownFolder,
 }
 
 /// Error codes carried by [`Message::Error`].
@@ -102,6 +195,10 @@ pub enum ProtoError {
     },
     #[error("decoder is poisoned by an earlier error; drop the connection")]
     Poisoned,
+    #[error("numeric field out of range")]
+    BadRange,
+    #[error("invalid share tag")]
+    BadTag,
 }
 
 impl Envelope {
@@ -136,6 +233,23 @@ impl Envelope {
             }
             Ok(())
         }
+        fn list(field: &'static str, len: usize) -> Result<(), ProtoError> {
+            if len > MAX_LIST_LEN {
+                return Err(ProtoError::FieldTooLong {
+                    field,
+                    len,
+                    limit: MAX_LIST_LEN,
+                });
+            }
+            Ok(())
+        }
+        fn tag(t: &str) -> Result<(), ProtoError> {
+            if is_valid_tag(t) {
+                Ok(())
+            } else {
+                Err(ProtoError::BadTag)
+            }
+        }
         match &self.msg {
             Message::Hello {
                 agent_version,
@@ -146,12 +260,66 @@ impl Envelope {
                 bounded("os_build", os_build)
             }
             Message::Error { detail, .. } => bounded("detail", detail),
+            Message::ClipboardOffer { formats, .. } => list("formats", formats.len()),
+            Message::ClipboardData {
+                total,
+                offset,
+                chunk,
+                ..
+            } => {
+                if chunk.len() > MAX_CLIPBOARD_CHUNK {
+                    return Err(ProtoError::FieldTooLong {
+                        field: "chunk",
+                        len: chunk.len(),
+                        limit: MAX_CLIPBOARD_CHUNK,
+                    });
+                }
+                let end = offset.checked_add(chunk.len() as u64);
+                if *total > MAX_CLIPBOARD_TOTAL || end.is_none_or(|e| e > *total) {
+                    return Err(ProtoError::BadRange);
+                }
+                Ok(())
+            }
+            Message::ShareFolders { shares } => {
+                list("shares", shares.len())?;
+                shares.iter().try_for_each(|s| tag(&s.tag))
+            }
+            Message::ShareStatus { tag: t, detail, .. } => {
+                tag(t)?;
+                bounded("detail", detail)
+            }
+            Message::DisplayHint {
+                width,
+                height,
+                scale_percent,
+            } => {
+                let ok = (320..=16384).contains(width)
+                    && (200..=16384).contains(height)
+                    && (100..=500).contains(scale_percent);
+                if ok {
+                    Ok(())
+                } else {
+                    Err(ProtoError::BadRange)
+                }
+            }
             Message::Welcome { .. }
             | Message::Ping { .. }
             | Message::Pong { .. }
-            | Message::Shutdown { .. } => Ok(()),
+            | Message::Shutdown { .. }
+            | Message::ClipboardRequest { .. }
+            | Message::Attach { .. } => Ok(()),
         }
     }
+}
+
+/// Whether `tag` is a valid share tag: 1–[`MAX_TAG_LEN`] bytes of
+/// `[a-z0-9-]`, so it is safe in QEMU options, file names and Windows paths.
+pub fn is_valid_tag(tag: &str) -> bool {
+    !tag.is_empty()
+        && tag.len() <= MAX_TAG_LEN
+        && tag
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// Encode one envelope into a complete frame (header + payload).
@@ -249,6 +417,78 @@ impl FrameDecoder {
 
     fn peek_len(&self) -> u32 {
         u32::from_le_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]])
+    }
+}
+
+/// Split clipboard content into [`Message::ClipboardData`] frames.
+pub fn clipboard_chunks(
+    serial: u64,
+    format: ClipFormat,
+    data: &[u8],
+) -> Result<Vec<Message>, ProtoError> {
+    let total = data.len() as u64;
+    if total > MAX_CLIPBOARD_TOTAL {
+        return Err(ProtoError::BadRange);
+    }
+    if data.is_empty() {
+        return Ok(vec![Message::ClipboardData {
+            serial,
+            format,
+            total: 0,
+            offset: 0,
+            chunk: Vec::new(),
+        }]);
+    }
+    Ok(data
+        .chunks(MAX_CLIPBOARD_CHUNK)
+        .enumerate()
+        .map(|(i, c)| Message::ClipboardData {
+            serial,
+            format,
+            total,
+            offset: (i * MAX_CLIPBOARD_CHUNK) as u64,
+            chunk: c.to_vec(),
+        })
+        .collect())
+}
+
+/// Reassembles one clipboard transfer from [`Message::ClipboardData`]
+/// chunks. Chunks must arrive in order and agree on serial, format and
+/// total; anything else is an error and the transfer is dropped.
+#[derive(Debug, Default)]
+pub struct ClipboardAssembler {
+    current: Option<(u64, ClipFormat, u64, Vec<u8>)>,
+}
+
+impl ClipboardAssembler {
+    /// Feed one chunk. Returns the complete content once the last chunk
+    /// arrived. The chunk itself was already validated by the decoder.
+    pub fn push(
+        &mut self,
+        serial: u64,
+        format: ClipFormat,
+        total: u64,
+        offset: u64,
+        chunk: &[u8],
+    ) -> Result<Option<(u64, ClipFormat, Vec<u8>)>, ProtoError> {
+        if offset == 0 {
+            // A new transfer replaces any unfinished one. `total` is bounded
+            // by the decoder, so this allocation is too.
+            self.current = Some((serial, format, total, Vec::with_capacity(total as usize)));
+        }
+        let Some((s, f, t, buf)) = self.current.as_mut() else {
+            return Err(ProtoError::BadRange);
+        };
+        if *s != serial || *f != format || *t != total || buf.len() as u64 != offset {
+            self.current = None;
+            return Err(ProtoError::BadRange);
+        }
+        buf.extend_from_slice(chunk);
+        if buf.len() as u64 == *t {
+            let (s, f, _, buf) = self.current.take().expect("present");
+            return Ok(Some((s, f, buf)));
+        }
+        Ok(None)
     }
 }
 
@@ -350,6 +590,171 @@ mod tests {
             d.next_envelope(),
             Err(ProtoError::FieldTooLong { .. })
         ));
+    }
+
+    fn roundtrip(msg: Message) -> Result<Envelope, ProtoError> {
+        let frame = encode(&Envelope::new(1, msg))?;
+        decode_payload(&frame[HEADER_LEN..])
+    }
+
+    #[test]
+    fn m1_messages_roundtrip() {
+        let msgs = [
+            Message::ClipboardOffer {
+                serial: 3,
+                formats: vec![ClipFormat::Text, ClipFormat::Png],
+            },
+            Message::ClipboardRequest {
+                serial: 3,
+                format: ClipFormat::Html,
+            },
+            Message::ClipboardData {
+                serial: 3,
+                format: ClipFormat::Text,
+                total: 10,
+                offset: 5,
+                chunk: b"world".to_vec(),
+            },
+            Message::DisplayHint {
+                width: 2560,
+                height: 1440,
+                scale_percent: 150,
+            },
+            Message::ShareFolders {
+                shares: vec![ShareSpec {
+                    tag: "lsw-documents".into(),
+                    folder: KnownFolder::Documents,
+                }],
+            },
+            Message::ShareStatus {
+                tag: "lsw-documents".into(),
+                ok: true,
+                detail: String::new(),
+            },
+        ];
+        for m in msgs {
+            assert_eq!(roundtrip(m.clone()).unwrap().msg, m);
+        }
+    }
+
+    #[test]
+    fn clipboard_ranges_are_checked() {
+        let data = |total, offset, len| Message::ClipboardData {
+            serial: 1,
+            format: ClipFormat::Png,
+            total,
+            offset,
+            chunk: vec![0; len],
+        };
+        assert_eq!(roundtrip(data(4, 3, 2)), Err(ProtoError::BadRange));
+        assert_eq!(
+            roundtrip(data(u64::MAX, u64::MAX, 1)),
+            Err(ProtoError::BadRange)
+        );
+        assert_eq!(
+            roundtrip(data(MAX_CLIPBOARD_TOTAL + 1, 0, 1)),
+            Err(ProtoError::BadRange)
+        );
+        assert!(matches!(
+            roundtrip(data(1 << 20, 0, MAX_CLIPBOARD_CHUNK + 1)),
+            Err(ProtoError::FieldTooLong { .. })
+        ));
+        // A full-size chunk still fits in one frame.
+        assert!(roundtrip(data(1 << 20, 0, MAX_CLIPBOARD_CHUNK)).is_ok());
+    }
+
+    #[test]
+    fn share_tags_and_display_hints_are_checked() {
+        let share = |tag: &str| Message::ShareFolders {
+            shares: vec![ShareSpec {
+                tag: tag.into(),
+                folder: KnownFolder::Music,
+            }],
+        };
+        assert!(roundtrip(share("lsw-music")).is_ok());
+        for bad in ["", "Upper", "a/b", "..", &"x".repeat(37)] {
+            assert_eq!(roundtrip(share(bad)), Err(ProtoError::BadTag), "{bad:?}");
+        }
+        let hint = |w, h, s| Message::DisplayHint {
+            width: w,
+            height: h,
+            scale_percent: s,
+        };
+        assert!(roundtrip(hint(1920, 1080, 100)).is_ok());
+        assert_eq!(roundtrip(hint(0, 1080, 100)), Err(ProtoError::BadRange));
+        assert_eq!(roundtrip(hint(1920, 1080, 50)), Err(ProtoError::BadRange));
+        let many = Message::ClipboardOffer {
+            serial: 1,
+            formats: vec![ClipFormat::Text; MAX_LIST_LEN + 1],
+        };
+        assert!(matches!(
+            roundtrip(many),
+            Err(ProtoError::FieldTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn clipboard_chunks_reassemble() {
+        let data: Vec<u8> = (0..(MAX_CLIPBOARD_CHUNK * 2 + 17))
+            .map(|i| i as u8)
+            .collect();
+        let frames = clipboard_chunks(7, ClipFormat::Png, &data).unwrap();
+        assert_eq!(frames.len(), 3);
+        let mut asm = ClipboardAssembler::default();
+        let mut done = None;
+        for f in frames {
+            // Every chunk survives the wire.
+            let Message::ClipboardData {
+                serial,
+                format,
+                total,
+                offset,
+                chunk,
+            } = roundtrip(f).unwrap().msg
+            else {
+                panic!()
+            };
+            done = asm.push(serial, format, total, offset, &chunk).unwrap();
+        }
+        assert_eq!(done, Some((7, ClipFormat::Png, data)));
+        // Empty content is one empty chunk.
+        let empty = clipboard_chunks(8, ClipFormat::Text, &[]).unwrap();
+        assert_eq!(empty.len(), 1);
+        assert_eq!(
+            asm.push(8, ClipFormat::Text, 0, 0, &[]).unwrap(),
+            Some((8, ClipFormat::Text, vec![]))
+        );
+    }
+
+    #[test]
+    fn clipboard_assembler_rejects_gaps_and_mixups() {
+        let mut asm = ClipboardAssembler::default();
+        assert!(
+            asm.push(1, ClipFormat::Text, 10, 5, b"x").is_err(),
+            "no start"
+        );
+        assert_eq!(
+            asm.push(1, ClipFormat::Text, 10, 0, b"hello").unwrap(),
+            None
+        );
+        assert!(asm.push(1, ClipFormat::Text, 10, 6, b"x").is_err(), "gap");
+        // After an error the transfer is gone.
+        assert!(asm.push(1, ClipFormat::Text, 10, 5, b"world").is_err());
+        asm.push(2, ClipFormat::Text, 4, 0, b"ab").unwrap();
+        assert!(
+            asm.push(2, ClipFormat::Html, 4, 2, b"cd").is_err(),
+            "format"
+        );
+        asm.push(3, ClipFormat::Text, 4, 0, b"ab").unwrap();
+        assert!(asm.push(3, ClipFormat::Text, 5, 2, b"cd").is_err(), "total");
+        assert!(
+            clipboard_chunks(
+                1,
+                ClipFormat::Png,
+                &vec![0; MAX_CLIPBOARD_TOTAL as usize + 1]
+            )
+            .is_err()
+        );
     }
 
     #[test]
