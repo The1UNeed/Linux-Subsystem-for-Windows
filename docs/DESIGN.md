@@ -241,6 +241,10 @@ from running it.
 | One virtual display, sized to the first monitor. | Multi-monitor needs one virtio-gpu head per monitor in Coherence and the views; planned. |
 | Full Screen is toggled with **Ctrl+Super+F** (not released with Ctrl+Alt). | Ctrl+Alt is a common Windows chord (AltGr on many layouts); Ctrl+Super is free on both systems. |
 | Alpha Coherence frames go over a third virtio-serial port (LZ4, damaged regions only). | virtio-win 0.1.302 ships no IVSHMEM driver and the only other build (2021 "prewhql") cannot be relied on to load on current Windows 11. The transport is behind an interface; ivshmem (or tier A blob memory) replaces it when a signed driver is available. |
+| The supervisor stops Windows with an ACPI shutdown on Ctrl+C **and** SIGTERM; QEMU and its helpers run in their own process group, and the units use `KillMode=mixed`. | QEMU quits on SIGINT. A terminal's Ctrl+C reaches the whole process group and systemd's stop signal the whole cgroup, which cut Windows off instead of shutting it down. |
+| Windows is never idle-paused until the agent is connected (no fixed boot grace). | A Windows that installs updates while shutting down boots, finishes them and powers off by itself; a 3-minute grace paused it mid-update. A reboot closes the agent's port, so the agent counts as gone until it says hello again. |
+| Coherence keeps its socket when the guest's Coherence port closes or reopens; it clears its windows and sends a new `Start`. | Dropping the socket looked like a host departure to the guest, which reopened its port: a reconnect loop. |
+| A shared folder counts as mounted only when WinFsp's mount point (a reparse point) is there and readable; a previous agent's mount is kept. | A plain folder of the same name passed a readability check, so the share silently wrote to the local disk. Remounting made the folder vanish briefly, which Explorer reports as an error. |
 
 ## 4. Delivery
 
@@ -274,7 +278,11 @@ Evaluation, with screenshots or recordings as evidence.
   in the normal test suite.
 - Windows boot and integration tests are run on x86-64 KVM hosts (boat.dev
   sandboxes) with the Windows 11 Enterprise Evaluation image, driven by
-  scripts and `lsw ctl`; they are not yet automated in CI.
+  scripts and `lsw ctl`; they are not yet automated in CI. The release check
+  covers: agent auto-update from the Tools CD; a shared-folder round trip
+  (Linux → Windows → Linux) after boot, after an agent restart and after a
+  Windows reboot; Coherence across the same three events (under headless
+  sway); a clean shutdown on Ctrl+C and on `systemctl --user stop`.
 - GPU tiers and latency on hardware with GPUs; a frame-timestamp latency rig
   (planned).
 

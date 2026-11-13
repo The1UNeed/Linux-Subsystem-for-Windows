@@ -521,6 +521,20 @@ fn is_live_mount(dir: &Path) -> bool {
 /// were written while the share was missing) instead of hiding or deleting
 /// them.
 fn clear_mount_dir(dir: &Path) {
+    let name = dir
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    // Earlier copies that turned out to hold only shell metadata.
+    if let Some(parent) = dir.parent()
+        && let Ok(entries) = std::fs::read_dir(parent)
+    {
+        let prefix = format!("{name} (local copy ");
+        for e in entries.flatten() {
+            if e.file_name().to_string_lossy().starts_with(&prefix) {
+                remove_if_only_metadata(&e.path());
+            }
+        }
+    }
     if !dir.exists() && !is_mount_point(dir) {
         return;
     }
@@ -528,29 +542,12 @@ fn clear_mount_dir(dir: &Path) {
         let _ = std::fs::remove_dir(dir);
         return;
     }
-    let names: Vec<_> = std::fs::read_dir(dir)
-        .map(|r| r.flatten().map(|e| e.path()).collect())
-        .unwrap_or_default();
-    if names.iter().all(|p| crate::core::is_shell_metadata(p)) {
-        for p in &names {
-            if let Ok(meta) = std::fs::metadata(p) {
-                let mut perms = meta.permissions();
-                #[allow(clippy::permissions_set_readonly_false)]
-                perms.set_readonly(false);
-                let _ = std::fs::set_permissions(p, perms);
-            }
-            let _ = std::fs::remove_file(p);
-        }
-        if std::fs::remove_dir(dir).is_ok() {
-            return;
-        }
+    if remove_if_only_metadata(dir) {
+        return;
     }
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let name = dir
-        .file_name()
-        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
     let aside = dir.with_file_name(format!("{name} (local copy {stamp})"));
     match std::fs::rename(dir, &aside) {
         Ok(()) => log(format!(
@@ -563,6 +560,40 @@ fn clear_mount_dir(dir: &Path) {
             dir.display()
         )),
     }
+}
+
+/// Remove `dir` if it holds nothing but shell metadata. Explorer may hold
+/// the folder open for a moment; if it cannot be removed, it is moved out of
+/// the way into %TEMP%. Returns whether `dir` is gone.
+fn remove_if_only_metadata(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let names: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+    if !names.iter().all(|p| crate::core::is_shell_metadata(p)) {
+        return false;
+    }
+    for p in &names {
+        if let Ok(meta) = std::fs::metadata(p) {
+            let mut perms = meta.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            let _ = std::fs::set_permissions(p, perms);
+        }
+        let _ = std::fs::remove_file(p);
+    }
+    if wait_until(Duration::from_secs(2), || std::fs::remove_dir(dir).is_ok()) {
+        return true;
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let trash = std::env::temp_dir().join(format!("lsw-empty-folder-{stamp}"));
+    if std::fs::rename(dir, &trash).is_ok() {
+        let _ = std::fs::remove_dir(&trash);
+        return true;
+    }
+    false
 }
 
 pub(crate) fn wait_until(timeout: Duration, mut ready: impl FnMut() -> bool) -> bool {
