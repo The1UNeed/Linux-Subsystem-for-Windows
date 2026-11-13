@@ -253,8 +253,7 @@ async fn session_loop(
     // The session channel is optional: without the agent, display and input
     // still work.
     let mut session = session::connect(&paths.session_socket()).await.ok();
-    let mut guest_clip: Vec<(ClipFormat, Vec<u8>)> = Vec::new();
-    let mut guest_pending: Vec<ClipFormat> = Vec::new();
+    let mut guest_clip = session::GuestClipboard::default();
     let mut last_size = (0u32, 0u32);
     // The session channel is optional and may come and go (agent restart,
     // update): retry it independently of the display.
@@ -333,17 +332,13 @@ async fn session_loop(
                         }
                     }
                     Ok(SessionEvent::GuestClipboard { serial, formats }) => {
-                        guest_clip.clear();
-                        guest_pending = formats.clone();
-                        for f in formats {
+                        for f in guest_clip.offer(serial, &formats) {
                             if let Some(s) = session.as_mut() { s.fetch(serial, f).await?; }
                         }
                     }
-                    Ok(SessionEvent::GuestClipboardData { format, data, .. }) => {
-                        guest_pending.retain(|f| *f != format);
-                        if !data.is_empty() { guest_clip.push((format, data)); }
-                        if guest_pending.is_empty() && !guest_clip.is_empty() {
-                            ui.send(UiMsg::GuestClipboard(std::mem::take(&mut guest_clip))).await.ok();
+                    Ok(SessionEvent::GuestClipboardData { serial, format, data }) => {
+                        if let Some(items) = guest_clip.data(serial, format, data) {
+                            ui.send(UiMsg::GuestClipboard(items)).await.ok();
                         }
                     }
                     Ok(SessionEvent::AgentError { detail }) => tracing::info!("agent: {detail}"),

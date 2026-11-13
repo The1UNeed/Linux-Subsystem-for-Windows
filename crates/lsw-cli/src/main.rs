@@ -249,6 +249,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Display { width, height } => {
             let mut s = attach_session(&paths).await?;
             s.display_hint(width, height, 100).await?;
+            s.flush(Duration::from_secs(5)).await?;
             println!("asked Windows for {width}x{height}");
             Ok(())
         }
@@ -1205,6 +1206,8 @@ async fn clip(paths: &VmPaths, action: ClipAction) -> anyhow::Result<()> {
                 anyhow::Ok(())
             })
             .await;
+            // The last reply may still be queued.
+            s.flush(Duration::from_secs(5)).await?;
             println!("clipboard offered to Windows");
         }
     }

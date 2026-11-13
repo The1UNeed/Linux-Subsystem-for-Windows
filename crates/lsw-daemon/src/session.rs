@@ -39,6 +39,64 @@ pub enum SessionEvent {
     AgentError { detail: String },
 }
 
+/// Collects the formats of one guest clipboard offer. Only the current
+/// offer's serial is accepted, each requested format once; unsolicited,
+/// duplicate and stale results are dropped, and everything kept together
+/// stays within [`lsw_proto::MAX_CLIPBOARD_TOTAL`].
+#[derive(Debug, Default)]
+pub struct GuestClipboard {
+    serial: Option<u64>,
+    pending: Vec<ClipFormat>,
+    items: Vec<(ClipFormat, Vec<u8>)>,
+    bytes: usize,
+}
+
+impl GuestClipboard {
+    /// A new offer replaces the previous one. Returns the formats to fetch
+    /// (each once).
+    pub fn offer(&mut self, serial: u64, formats: &[ClipFormat]) -> Vec<ClipFormat> {
+        let mut pending = Vec::new();
+        for f in formats {
+            if !pending.contains(f) {
+                pending.push(*f);
+            }
+        }
+        *self = Self {
+            serial: Some(serial),
+            pending: pending.clone(),
+            ..Self::default()
+        };
+        pending
+    }
+
+    /// One transfer completed. Returns the whole clipboard once every
+    /// requested format has arrived (None while waiting, or if empty).
+    pub fn data(
+        &mut self,
+        serial: u64,
+        format: ClipFormat,
+        data: Vec<u8>,
+    ) -> Option<Vec<(ClipFormat, Vec<u8>)>> {
+        if self.serial != Some(serial) {
+            return None; // stale or unsolicited
+        }
+        let i = self.pending.iter().position(|f| *f == format)?; // not asked, or a duplicate
+        self.pending.swap_remove(i);
+        let total = lsw_proto::MAX_CLIPBOARD_TOTAL as usize;
+        if !data.is_empty() && self.bytes + data.len() <= total {
+            self.bytes += data.len();
+            self.items.push((format, data));
+        }
+        if !self.pending.is_empty() {
+            return None;
+        }
+        self.serial = None;
+        self.bytes = 0;
+        let items = std::mem::take(&mut self.items);
+        (!items.is_empty()).then_some(items)
+    }
+}
+
 /// The UI end of the session channel.
 ///
 /// Cancel-safe: [`Self::next_event`] may be dropped mid-way (it runs in a
@@ -155,6 +213,26 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> SessionClient<S> {
     /// [`SessionEvent::GuestClipboardData`].
     pub async fn fetch(&mut self, serial: u64, format: ClipFormat) -> Result<(), ChannelError> {
         self.queue(None, Message::ClipboardRequest { serial, format })
+    }
+
+    /// Wait until everything queued has been written to the guest, up to
+    /// `timeout`. For short-lived callers (a command that sends one request
+    /// and exits): dropping the client stops its writer at once.
+    pub async fn flush(&self, timeout: Duration) -> Result<(), ChannelError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while self.queued.load(Ordering::Acquire) > 0 {
+            if self.writer_task.is_finished() {
+                return Err(ChannelError::Closed);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ChannelError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "the guest did not take the request in time",
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(())
     }
 
     /// Resize the Windows display.
@@ -494,6 +572,92 @@ mod tests {
         let (_, err) = tokio::join!(flood, host_side);
         assert!(matches!(err, ChannelError::Overloaded), "{err:?}");
         assert!(s.queued.load(Ordering::Acquire) <= MAX_QUEUED_BYTES);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_flushed_request_arrives_even_if_the_client_exits_right_after() {
+        let (host, guest) = tokio::io::duplex(64 * 1024);
+        let mut s = SessionClient::new(host).await.unwrap();
+        s.display_hint(1600, 900, 100).await.unwrap();
+        s.flush(Duration::from_secs(5)).await.unwrap();
+        drop(s);
+        let mut g = Channel::new(guest);
+        assert!(matches!(
+            g.recv().await.unwrap().msg,
+            Message::Attach { .. }
+        ));
+        assert!(matches!(
+            g.recv().await.unwrap().msg,
+            Message::DisplayHint {
+                width: 1600,
+                height: 900,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn flush_gives_up_when_the_guest_does_not_read() {
+        let (host, _guest) = tokio::io::duplex(256);
+        let mut s = SessionClient::new(host).await.unwrap();
+        for nonce in 0..200 {
+            s.queue(None, Message::Ping { nonce }).unwrap();
+        }
+        assert!(s.flush(Duration::from_millis(200)).await.is_err());
+    }
+
+    #[test]
+    fn guest_clipboard_accepts_each_requested_format_once() {
+        let mut c = GuestClipboard::default();
+        assert_eq!(
+            c.offer(7, &[ClipFormat::Text, ClipFormat::Html, ClipFormat::Text]),
+            vec![ClipFormat::Text, ClipFormat::Html],
+            "each format fetched once"
+        );
+        assert_eq!(
+            c.data(7, ClipFormat::Text, b"a".to_vec()),
+            None,
+            "HTML pending"
+        );
+        // Duplicates, unsolicited formats and stale serials are dropped.
+        for _ in 0..64 {
+            assert_eq!(c.data(7, ClipFormat::Text, vec![b'x'; 1 << 20]), None);
+        }
+        assert_eq!(c.data(7, ClipFormat::Png, b"img".to_vec()), None);
+        assert_eq!(c.data(6, ClipFormat::Html, b"old".to_vec()), None);
+        assert_eq!(c.items.len(), 1);
+        assert_eq!(c.bytes, 1);
+        let done = c.data(7, ClipFormat::Html, b"<b>a</b>".to_vec()).unwrap();
+        assert_eq!(
+            done,
+            vec![
+                (ClipFormat::Text, b"a".to_vec()),
+                (ClipFormat::Html, b"<b>a</b>".to_vec())
+            ]
+        );
+        // The offer is finished: nothing more is accepted for it.
+        assert_eq!(c.data(7, ClipFormat::Html, b"again".to_vec()), None);
+    }
+
+    #[test]
+    fn guest_clipboard_keeps_its_total_within_the_limit() {
+        let mut c = GuestClipboard::default();
+        let max = lsw_proto::MAX_CLIPBOARD_TOTAL as usize;
+        c.offer(1, &[ClipFormat::Text, ClipFormat::Html]);
+        assert_eq!(c.data(1, ClipFormat::Text, vec![b't'; max]), None);
+        // The second format would exceed the total: it is left out.
+        let done = c.data(1, ClipFormat::Html, vec![b'h'; 10]).unwrap();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].0, ClipFormat::Text);
+        // A new offer replaces an unfinished one.
+        c.offer(2, &[ClipFormat::Text, ClipFormat::Html]);
+        c.data(2, ClipFormat::Text, b"x".to_vec());
+        c.offer(3, &[ClipFormat::Text]);
+        assert_eq!(c.data(2, ClipFormat::Html, b"late".to_vec()), None);
+        assert_eq!(
+            c.data(3, ClipFormat::Text, b"y".to_vec()),
+            Some(vec![(ClipFormat::Text, b"y".to_vec())])
+        );
     }
 
     /// A stream that records when it is dropped.

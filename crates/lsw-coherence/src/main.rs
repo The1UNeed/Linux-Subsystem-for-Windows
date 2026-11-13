@@ -48,8 +48,44 @@ const MAX_FRAME_BYTES: usize = 768 << 20;
 /// Wayland buffers per window (double buffering). When both are still held
 /// by the compositor, updates are coalesced until one is released.
 const MAX_BUFFERS: usize = 2;
-/// Copies of a window's contents charged against [`MAX_FRAME_BYTES`].
+/// Copies of a window's contents charged against [`MAX_FRAME_BYTES`]
+/// (frame and buffers) while its size is stable.
 const HELD_COPIES: usize = 1 + MAX_BUFFERS;
+
+/// What to draw into, given a window's buffers.
+#[derive(Debug, PartialEq, Eq)]
+enum Pick {
+    Reuse(usize),
+    Create,
+    /// Every buffer is still held by the compositor: wait for a release.
+    Wait,
+}
+
+/// Choose a buffer of size `want` (height, stride). Free buffers of another
+/// size are dropped (destroyed at once); busy ones stay tracked, and
+/// charged, until the compositor releases them, so allocations never exceed
+/// [`MAX_BUFFERS`] per window, even while the window keeps changing size.
+fn pick_buffer<B>(
+    buffers: &mut Vec<B>,
+    want: (i32, i32),
+    size: impl Fn(&B) -> (i32, i32),
+    mut free: impl FnMut(&B) -> bool,
+) -> Pick {
+    buffers.retain(|b| size(b) == want || !free(b));
+    if let Some(i) = buffers.iter().position(|b| size(b) == want && free(b)) {
+        Pick::Reuse(i)
+    } else if buffers.len() < MAX_BUFFERS {
+        Pick::Create
+    } else {
+        Pick::Wait
+    }
+}
+
+/// Upper bound of the memory a window can hold: its frame plus
+/// [`MAX_BUFFERS`] buffers no larger than the largest one alive or needed.
+fn held_bound(frame: usize, buffers: impl Iterator<Item = usize>) -> usize {
+    frame + MAX_BUFFERS * buffers.fold(frame, usize::max)
+}
 /// Guest updates queued between the backend and the Wayland thread.
 const UPDATE_QUEUE: usize = 16;
 
@@ -128,9 +164,15 @@ struct Mirrored {
 }
 
 impl Mirrored {
+    fn buffer_bytes(&self) -> impl Iterator<Item = usize> + '_ {
+        self.buffers
+            .iter()
+            .map(|b| b.height() as usize * b.stride() as usize)
+    }
+
     /// Bytes charged against [`MAX_FRAME_BYTES`].
     fn held(&self) -> usize {
-        self.frame.len() * HELD_COPIES
+        held_bound(self.frame.len(), self.buffer_bytes())
     }
 }
 
@@ -316,7 +358,8 @@ impl App {
             return;
         };
         if w.size != (width, height) {
-            let needed = width as usize * height as usize * 4 * HELD_COPIES;
+            // Old-size buffers stay charged until released.
+            let needed = held_bound(width as usize * height as usize * 4, w.buffer_bytes());
             if held - w.held() + needed > MAX_FRAME_BYTES {
                 tracing::warn!("window {id:#x}: frame budget exhausted; frame dropped");
                 return;
@@ -356,13 +399,15 @@ impl App {
             return;
         }
         let stride = width as i32 * 4;
-        // Buffers of an old size go (a busy one is destroyed on release).
-        w.buffers
-            .retain(|b| b.height() == height as i32 && b.stride() == stride);
-        let free = w.buffers.iter().position(|b| b.canvas(pool).is_some());
-        let index = match free {
-            Some(i) => i,
-            None if w.buffers.len() < MAX_BUFFERS => {
+        let pick = pick_buffer(
+            &mut w.buffers,
+            (height as i32, stride),
+            |b| (b.height(), b.stride()),
+            |b| b.canvas(pool).is_some(),
+        );
+        let index = match pick {
+            Pick::Reuse(i) => i,
+            Pick::Create => {
                 let Ok((buffer, _)) = pool.create_buffer(
                     width as i32,
                     height as i32,
@@ -374,7 +419,7 @@ impl App {
                 w.buffers.push(buffer);
                 w.buffers.len() - 1
             }
-            None => {
+            Pick::Wait => {
                 w.dirty = true;
                 return;
             }
@@ -1043,6 +1088,60 @@ mod tests {
         assert_eq!(
             placeholder_within_budget(&info(900, 700), MAX_FRAME_BYTES - cost + 1),
             (64, 32)
+        );
+    }
+
+    /// A buffer the fake compositor may hold.
+    struct FakeBuf {
+        size: (i32, i32),
+        busy: bool,
+    }
+
+    #[test]
+    fn resizing_while_the_compositor_holds_buffers_never_exceeds_two() {
+        let mut bufs: Vec<FakeBuf> = Vec::new();
+        let size = |b: &FakeBuf| b.size;
+        let mut allocated = 0;
+        // The guest alternates sizes on every frame; the compositor never
+        // releases anything.
+        for i in 0..100 {
+            let want = if i % 2 == 0 { (600, 3200) } else { (700, 4000) };
+            match pick_buffer(&mut bufs, want, size, |b| !b.busy) {
+                Pick::Create => {
+                    bufs.push(FakeBuf {
+                        size: want,
+                        busy: true,
+                    });
+                    allocated += 1;
+                }
+                Pick::Reuse(_) => panic!("nothing is free"),
+                Pick::Wait => {}
+            }
+            assert!(bufs.len() <= MAX_BUFFERS);
+        }
+        assert_eq!(allocated, MAX_BUFFERS, "two allocations, then waiting");
+        // The charge covers what is alive: frame + 2 x largest buffer.
+        let bytes = |b: &FakeBuf| b.size.0 as usize * b.size.1 as usize;
+        let alive: usize = bufs.iter().map(bytes).sum();
+        let frame = 600 * 3200;
+        assert!(held_bound(frame, bufs.iter().map(bytes)) >= frame + alive);
+        // Releases come: free buffers of the old size go, one of the new
+        // size is made; a free one of the right size is reused.
+        for b in &mut bufs {
+            b.busy = false;
+        }
+        assert_eq!(
+            pick_buffer(&mut bufs, (800, 4800), size, |b| !b.busy),
+            Pick::Create
+        );
+        assert!(bufs.is_empty(), "free old-size buffers are dropped");
+        bufs.push(FakeBuf {
+            size: (800, 4800),
+            busy: false,
+        });
+        assert_eq!(
+            pick_buffer(&mut bufs, (800, 4800), size, |b| !b.busy),
+            Pick::Reuse(0)
         );
     }
 
