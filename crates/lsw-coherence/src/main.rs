@@ -724,6 +724,13 @@ impl PointerHandler for App {
                     let Some(b) = qemu_button(button) else {
                         continue;
                     };
+                    // Minimized in Windows: the placeholder has no position
+                    // in the guest; a click restores the window instead.
+                    if w.info.state == WindowState::Minimized {
+                        self.send(Request::Guest(CoMessage::Restore { id }));
+                        self.guest_foreground = Some(id);
+                        continue;
+                    }
                     self.send(Request::Motion { x: gx, y: gy });
                     // A real click activates the window in Windows by itself
                     // once it is on top; only raise windows that are not.
@@ -817,6 +824,16 @@ impl KeyboardHandler for App {
     ) {
         if let Some(id) = self.id_of(surface) {
             self.focused = Some(id);
+            if self
+                .windows
+                .get(&id)
+                .is_some_and(|w| w.info.state == WindowState::Minimized)
+            {
+                // Restored on Linux (dock, Alt+Tab): restore it in Windows.
+                self.send(Request::Guest(CoMessage::Restore { id }));
+                self.guest_foreground = Some(id);
+                return;
+            }
             // Keyboard focus moved on Linux (click, Alt+Tab): keys must go
             // to the same window in Windows.
             if self.guest_foreground != Some(id) {
