@@ -411,11 +411,15 @@ pub fn build_args(cfg: &VmConfig, paths: &VmPaths, opts: &LaunchOptions) -> Vec<
         Display::DbusP2p => push(&["-display", "dbus,p2p=yes,gl=off"]),
     }
 
-    // Serial console: first-boot scripts report progress on COM1.
-    push(&[
-        "-chardev",
-        &format!("file,id=ser0,path={}", p(&paths.serial_log())),
-    ]);
+    // COM1: Windows Setup reports progress there (read from the file by
+    // `lsw install`). Once installed, the guest could fill the host disk
+    // through it, so it goes to a 64 KiB ring buffer in QEMU instead.
+    let serial = if cfg.install.is_some() {
+        format!("file,id=ser0,path={}", p(&paths.serial_log()))
+    } else {
+        "ringbuf,id=ser0,size=65536".to_owned()
+    };
+    push(&["-chardev", &serial]);
     push(&["-device", "isa-serial,chardev=ser0"]);
 
     // Control.
@@ -585,6 +589,10 @@ mod tests {
         assert!(s.contains("-display none"));
         assert!(s.contains("-sandbox on,"));
         assert!(!s.contains("ide-cd"), "no install media after setup");
+        assert!(
+            s.contains("-chardev ringbuf,id=ser0,size=65536"),
+            "serial bounded after setup"
+        );
     }
 
     #[test]

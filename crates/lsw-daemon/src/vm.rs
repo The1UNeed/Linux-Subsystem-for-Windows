@@ -99,6 +99,18 @@ impl Vm {
         let qemu_bin = bins.qemu.as_ref().context("qemu-system-x86_64 not found")?;
         let swtpm_bin = bins.swtpm.as_ref().context("swtpm not found")?;
         self.cfg.validate()?;
+        if !self.cfg.passthrough.is_empty() {
+            let limit = rustix::process::getrlimit(rustix::process::Resource::Memlock).current;
+            if let Some(problem) = crate::gpu::passthrough_problem(
+                Path::new("/sys/bus/pci/devices"),
+                Path::new("/dev/vfio"),
+                &self.cfg.passthrough,
+                limit,
+                u64::from(self.cfg.memory_mib) << 20,
+            ) {
+                return Err(NotReady(problem).into());
+            }
+        }
         self.paths.create()?;
         for sock in [
             self.paths.qmp_socket(),
@@ -242,6 +254,19 @@ impl Vm {
         }
         (children, active)
     }
+}
+
+/// The VM cannot start until the user changes something (a GPU assignment
+/// lost at a host restart, a too-low limit). Restarting will not help:
+/// `lsw run` exits with [`NotReady::EXIT_CODE`], which the systemd unit does
+/// not restart.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct NotReady(pub String);
+
+impl NotReady {
+    /// `EX_CONFIG` from sysexits.h.
+    pub const EXIT_CODE: i32 = 78;
 }
 
 /// How a shutdown ended.

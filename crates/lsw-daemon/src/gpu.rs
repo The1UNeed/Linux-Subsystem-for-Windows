@@ -112,9 +112,10 @@ pub fn read_function(sysfs: &Path, addr: &PciAddr) -> Option<PciFunction> {
     })
 }
 
-/// The functions to pass through for `gpu`: the GPU and every audio
-/// function on the same slot (HDMI/DP audio), all of which must share its
-/// IOMMU group.
+/// The functions to pass through for `gpu`. A GPU at function 0 takes
+/// every function of its slot (HDMI/DP audio, USB-C, serial bus…); an
+/// SR-IOV virtual function goes alone. All must share one IOMMU group, and
+/// that group must hold nothing else but PCI bridges, or VFIO cannot use it.
 pub fn passthrough_set(sysfs: &Path, gpu: &PciAddr) -> Result<Vec<PciFunction>, String> {
     let main = read_function(sysfs, gpu).ok_or_else(|| format!("{gpu}: no such PCI device"))?;
     if !main.is_display() {
@@ -125,20 +126,92 @@ pub fn passthrough_set(sysfs: &Path, gpu: &PciAddr) -> Result<Vec<PciFunction>, 
         .clone()
         .ok_or_else(|| format!("{gpu} has no IOMMU group (enable VT-d / AMD-Vi)"))?;
     let mut set = vec![main];
-    for f in 1..8u8 {
-        let Some(addr) = PciAddr::parse(&format!("{}.{f}", gpu.slot())) else {
-            continue;
-        };
-        if let Some(func) = read_function(sysfs, &addr)
-            && func.is_audio()
-        {
-            if func.iommu_group.as_deref() != Some(group.as_str()) {
-                return Err(format!("{addr} is not in {gpu}'s IOMMU group"));
+    if gpu.function() == 0 {
+        for f in 1..8u8 {
+            let Some(addr) = PciAddr::parse(&format!("{}.{f}", gpu.slot())) else {
+                continue;
+            };
+            if let Some(func) = read_function(sysfs, &addr) {
+                if func.iommu_group.as_deref() != Some(group.as_str()) {
+                    return Err(format!("{addr} is not in {gpu}'s IOMMU group"));
+                }
+                set.push(func);
             }
-            set.push(func);
+        }
+    }
+    // Every other member of the group would go with it.
+    if let Ok(members) = std::fs::read_dir(sysfs.join(gpu.as_str()).join("iommu_group/devices")) {
+        for m in members.flatten() {
+            let name = m.file_name().to_string_lossy().into_owned();
+            let Some(addr) = PciAddr::parse(&name) else {
+                continue;
+            };
+            if set.iter().any(|f| f.addr == addr) {
+                continue;
+            }
+            let bridge = read_function(sysfs, &addr).is_some_and(|f| f.class >> 8 == 0x0604);
+            if !bridge {
+                return Err(format!(
+                    "{addr} shares {gpu}'s IOMMU group; the group cannot be given to Windows \
+                     (try another PCIe slot)"
+                ));
+            }
         }
     }
     Ok(set)
+}
+
+/// Before QEMU starts with passed-through `functions`: each must still be
+/// on vfio-pci (a host restart gives it back to its driver), its VFIO group
+/// node must be open to us, and the locked-memory limit must cover the
+/// guest's RAM (VFIO pins all of it). `None` when ready, else what to do.
+pub fn passthrough_problem(
+    sysfs: &Path,
+    vfio: &Path,
+    functions: &[PciAddr],
+    memlock_limit: Option<u64>,
+    guest_bytes: u64,
+) -> Option<String> {
+    for addr in functions {
+        let Some(f) = read_function(sysfs, addr) else {
+            return Some(format!(
+                "{addr} is no longer present; run `lsw gpu release`"
+            ));
+        };
+        if f.driver.as_deref() != Some("vfio-pci") {
+            return Some(format!(
+                "{addr} is not handed to Windows (driver: {}); after a host restart run \
+                 `lsw gpu assign {}` again, or `lsw gpu release`",
+                f.driver.as_deref().unwrap_or("none"),
+                functions[0]
+            ));
+        }
+        if let Some(group) = f.iommu_group.as_deref() {
+            let node = vfio.join(group);
+            if std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&node)
+                .is_err()
+            {
+                return Some(format!(
+                    "{} is not accessible; run `lsw gpu assign {}` again",
+                    node.display(),
+                    functions[0]
+                ));
+            }
+        }
+    }
+    match memlock_limit {
+        Some(limit) if limit < guest_bytes => Some(format!(
+            "GPU passthrough locks all of Windows' memory ({} MiB), but the locked-memory \
+             limit is {} MiB. Raise it for your user session (e.g. LimitMEMLOCK=infinity in \
+             a drop-in for user@.service, then log in again); see the user guide",
+            guest_bytes >> 20,
+            limit >> 20
+        )),
+        _ => None,
+    }
 }
 
 /// QEMU arguments passing `functions` through on fixed slots, keeping the
@@ -212,6 +285,7 @@ mod tests {
     fn func(sys: &Path, addr: &str, vendor: &str, class: &str, group: &str, driver: &str) {
         let d = sys.join(addr);
         std::fs::create_dir_all(&d).unwrap();
+        let _ = std::fs::remove_file(d.join("iommu_group"));
         std::fs::write(d.join("vendor"), vendor).unwrap();
         std::fs::write(d.join("class"), class).unwrap();
         let groups = sys.join("../groups").join(group);
@@ -286,5 +360,85 @@ mod tests {
         assert!(passthrough_set(&sys, &PciAddr::parse("0000:02:00.0").unwrap()).is_err());
         // Not a GPU.
         assert!(passthrough_set(&sys, &PciAddr::parse("0000:01:00.1").unwrap()).is_err());
+    }
+
+    #[test]
+    fn a_gpu_takes_its_whole_slot_and_its_group_must_be_complete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sys = tmp.path().join("devices");
+        // A GPU with audio, USB-C (xHCI) and a serial-bus function.
+        func(&sys, "0000:01:00.0", "0x10de", "0x030000", "1", "nouveau");
+        func(
+            &sys,
+            "0000:01:00.1",
+            "0x10de",
+            "0x040300",
+            "1",
+            "snd_hda_intel",
+        );
+        func(&sys, "0000:01:00.2", "0x10de", "0x0c0330", "1", "xhci_hcd");
+        func(
+            &sys,
+            "0000:01:00.3",
+            "0x10de",
+            "0x0c8000",
+            "1",
+            "nvidia-gpu",
+        );
+        let members = tmp.path().join("groups/1/devices");
+        std::fs::create_dir_all(&members).unwrap();
+        for m in [
+            "0000:01:00.0",
+            "0000:01:00.1",
+            "0000:01:00.2",
+            "0000:01:00.3",
+        ] {
+            std::fs::create_dir_all(members.join(m)).unwrap();
+        }
+        let gpu = PciAddr::parse("0000:01:00.0").unwrap();
+        assert_eq!(passthrough_set(&sys, &gpu).unwrap().len(), 4);
+        // A bridge in the group is fine; another device is not.
+        func(&sys, "0000:00:01.0", "0x8086", "0x060400", "1", "pcieport");
+        std::fs::create_dir_all(members.join("0000:00:01.0")).unwrap();
+        assert!(passthrough_set(&sys, &gpu).is_ok());
+        func(&sys, "0000:03:00.0", "0x8086", "0x020000", "1", "e1000e");
+        std::fs::create_dir_all(members.join("0000:03:00.0")).unwrap();
+        let e = passthrough_set(&sys, &gpu).unwrap_err();
+        assert!(e.contains("0000:03:00.0"), "{e}");
+        // An SR-IOV VF goes alone, not with its sibling VFs.
+        func(&sys, "0000:00:02.1", "0x8086", "0x030000", "7", "i915");
+        func(&sys, "0000:00:02.2", "0x8086", "0x030000", "8", "i915");
+        let vf = PciAddr::parse("0000:00:02.1").unwrap();
+        assert_eq!(passthrough_set(&sys, &vf).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn passthrough_needs_vfio_its_node_and_enough_locked_memory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sys = tmp.path().join("devices");
+        let vfio = tmp.path().join("vfio");
+        std::fs::create_dir_all(&vfio).unwrap();
+        func(&sys, "0000:01:00.0", "0x10de", "0x030000", "14", "nouveau");
+        let set = [PciAddr::parse("0000:01:00.0").unwrap()];
+        let gib8 = 8u64 << 30;
+        // After a host restart the GPU is back on its own driver.
+        let e = passthrough_problem(&sys, &vfio, &set, None, gib8).unwrap();
+        assert!(e.contains("lsw gpu assign 0000:01:00.0"), "{e}");
+        // On vfio-pci, but the node is missing.
+        std::fs::remove_file(sys.join("0000:01:00.0/driver")).unwrap();
+        func(&sys, "0000:01:00.0", "0x10de", "0x030000", "14", "vfio-pci");
+        assert!(
+            passthrough_problem(&sys, &vfio, &set, None, gib8)
+                .unwrap()
+                .contains("not accessible")
+        );
+        std::fs::write(vfio.join("14"), "").unwrap();
+        // The default 8 MiB locked-memory limit cannot hold 8 GiB.
+        let e = passthrough_problem(&sys, &vfio, &set, Some(8 << 20), gib8).unwrap();
+        assert!(e.contains("LimitMEMLOCK"), "{e}");
+        assert_eq!(
+            passthrough_problem(&sys, &vfio, &set, Some(u64::MAX), gib8),
+            None
+        );
     }
 }

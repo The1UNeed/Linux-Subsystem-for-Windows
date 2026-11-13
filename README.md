@@ -29,7 +29,7 @@ app starts from the Linux app grid ([Paint](docs/images/coherence-launch-paint.p
 | Window and Full Screen views | The whole Windows desktop in the LSW app; Windows follows the window size, and Full Screen runs at the monitor's native resolution. |
 | Shared folders | Linux Desktop, Documents, Downloads, Pictures, Music and Videos are the same folders in Windows (virtiofs, sandboxed). |
 | Clipboard | Text, HTML and images, both ways, in the Window and Full Screen views. |
-| Sound | Windows plays through PipeWire. The microphone is off unless you enable it. |
+| Sound | Windows plays through PipeWire. The microphone is off in this alpha. |
 | USB | Plug a USB device into Windows and back (`lsw usb`). |
 | Idle | With nothing of Windows on screen for a minute, the VM pauses (0 % CPU) and resumes when you need it. |
 | Updates of the in-guest agent | Automatic, from the LSW Tools CD that every boot attaches. |
@@ -40,8 +40,9 @@ app starts from the Linux app grid ([Paint](docs/images/coherence-launch-paint.p
   is still being developed; LSW never turns Secure Boot off or enables test
   signing without it. Windows gets a 2D display (tier D).
 * GPU passthrough (tier B, a second GPU; tier C, Intel SR-IOV) is
-  implemented on the Linux side (`lsw gpu`) but has not been tested on real
-  hardware yet.
+  experimental: implemented on the Linux side (`lsw gpu`) but not tested on
+  real hardware. You must raise the locked-memory limit yourself, and an
+  assignment does not survive a host restart.
 * The clipboard is not shared while you use Coherence (it is in the Window
   and Full Screen views).
 * Secure Boot needs UEFI firmware with Microsoft's keys enrolled. Ubuntu's

@@ -39,6 +39,25 @@ pub fn install_target(
     should_update(own_build, cd_build, last_attempt).then(|| cd_build.trim().to_owned())
 }
 
+/// Milliseconds between 1601-01-01 (FILETIME epoch) and 1970-01-01.
+const FILETIME_UNIX_OFFSET_MS: i64 = 11_644_473_600_000;
+
+/// Unix milliseconds → FILETIME (100 ns ticks since 1601).
+pub fn unix_ms_to_filetime(ms: i64) -> u64 {
+    ((ms + FILETIME_UNIX_OFFSET_MS) as u64) * 10_000
+}
+
+/// FILETIME → Unix milliseconds.
+pub fn filetime_to_unix_ms(ft: u64) -> i64 {
+    (ft / 10_000) as i64 - FILETIME_UNIX_OFFSET_MS
+}
+
+/// Whether the guest clock is far enough from the host's to be set (small
+/// differences are transport delay, not drift).
+pub fn clock_is_off(guest_ms: i64, host_ms: i64) -> bool {
+    (guest_ms - host_ms).abs() > 2_000
+}
+
 /// Files the Windows shell drops into folders on its own: not user data.
 pub fn is_shell_metadata(path: &std::path::Path) -> bool {
     path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
@@ -100,6 +119,9 @@ pub trait Platform {
     fn list_apps(&mut self) -> Vec<AppEntry>;
     /// Start an app by its shell id.
     fn launch(&mut self, launch: &str) -> Result<(), String>;
+    /// Set the clock to `utc_ms` and, unless empty, the time zone to the
+    /// IANA zone `time_zone`.
+    fn set_clock(&mut self, utc_ms: i64, time_zone: &str) -> Result<(), String>;
 }
 
 /// Port state: the host attached, and accepted our Hello.
@@ -243,6 +265,12 @@ impl<P: Platform> Agent<P> {
                 out.push(reply(Message::AppsDone));
                 out
             }
+            (PortId::Control, Message::Clock { utc_ms, time_zone }) => {
+                match self.platform.set_clock(utc_ms, &time_zone) {
+                    Ok(()) => Vec::new(),
+                    Err(e) => vec![error(ErrorCode::Internal, &e)],
+                }
+            }
             (PortId::Control, Message::Launch { launch }) => match self.platform.launch(&launch) {
                 Ok(()) => Vec::new(),
                 Err(e) => vec![error(ErrorCode::Internal, &e)],
@@ -374,6 +402,7 @@ mod tests {
         displays: Vec<(u32, u32, u16)>,
         mounts: Vec<String>,
         launched: Vec<String>,
+        clocks: Vec<(i64, String)>,
     }
 
     impl Platform for Mock {
@@ -420,6 +449,10 @@ mod tests {
             self.launched.push(launch.to_owned());
             Ok(())
         }
+        fn set_clock(&mut self, utc_ms: i64, time_zone: &str) -> Result<(), String> {
+            self.clocks.push((utc_ms, time_zone.to_owned()));
+            Ok(())
+        }
     }
 
     fn env(seq: u64, msg: Message) -> Envelope {
@@ -451,6 +484,18 @@ mod tests {
             "newer than the failed one"
         );
         assert!(!should_update("v+a", "  ", None), "empty file");
+    }
+
+    #[test]
+    fn clock_conversions() {
+        // 2026-11-13T00:00:00Z
+        let ms = 1_794_528_000_000;
+        assert_eq!(filetime_to_unix_ms(unix_ms_to_filetime(ms)), ms);
+        // The Unix epoch is 116444736000000000 FILETIME ticks.
+        assert_eq!(unix_ms_to_filetime(0), 116_444_736_000_000_000);
+        assert!(!clock_is_off(ms, ms + 1_500), "transport delay");
+        assert!(clock_is_off(ms, ms + 5 * 60_000), "a 5-minute pause");
+        assert!(clock_is_off(ms + 36_000_000, ms), "10 h ahead");
     }
 
     #[test]
@@ -486,6 +531,24 @@ mod tests {
             install_target("v+a", "v+b", None, false).as_deref(),
             Some("v+b")
         );
+    }
+
+    #[test]
+    fn the_host_clock_is_applied_from_the_control_port_only() {
+        let mut a = Agent::new(Mock::default());
+        attach(&mut a, PortId::Control);
+        let clock = || Message::Clock {
+            utc_ms: 1_794_600_000_000,
+            time_zone: "Europe/Berlin".into(),
+        };
+        assert!(a.on_message(PortId::Control, env(9, clock())).is_empty());
+        assert_eq!(
+            a.platform.clocks,
+            [(1_794_600_000_000, "Europe/Berlin".to_owned())]
+        );
+        attach(&mut a, PortId::Session);
+        a.on_message(PortId::Session, env(10, clock()));
+        assert_eq!(a.platform.clocks.len(), 1, "not from the session port");
     }
 
     #[test]

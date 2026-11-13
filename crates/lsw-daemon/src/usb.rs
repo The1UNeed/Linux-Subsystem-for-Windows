@@ -97,9 +97,16 @@ pub fn find<'a>(devices: &'a [UsbDevice], spec: &str) -> Option<&'a UsbDevice> {
 #[derive(Debug, thiserror::Error)]
 pub enum UsbError {
     #[error(
-        "no permission to open {0}; add a udev rule giving your user access (the LSW helper will do this from M3)"
+        "no permission to open {path}. Give your user access with a udev rule, e.g. in \
+         /etc/udev/rules.d/70-lsw-usb.rules:\n  SUBSYSTEM==\"usb\", ATTR{{idVendor}}==\"{vendor:04x}\", \
+         ATTR{{idProduct}}==\"{product:04x}\", TAG+=\"uaccess\"\nthen run `sudo udevadm control --reload` \
+         and plug the device in again"
     )]
-    Permission(PathBuf),
+    Permission {
+        path: PathBuf,
+        vendor: u16,
+        product: u16,
+    },
     #[error(transparent)]
     Qmp(#[from] QmpError),
 }
@@ -112,7 +119,11 @@ pub async fn attach(qmp: &mut Qmp, device: &UsbDevice) -> Result<(), UsbError> {
         .open(&device.node)
         .is_err()
     {
-        return Err(UsbError::Permission(device.node.clone()));
+        return Err(UsbError::Permission {
+            path: device.node.clone(),
+            vendor: device.vendor_id,
+            product: device.product_id,
+        });
     }
     qmp.execute(
         "device_add",
@@ -138,6 +149,19 @@ pub async fn detach(qmp: &mut Qmp, device: &UsbDevice) -> Result<(), UsbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_permission_error_gives_a_working_udev_rule() {
+        let e = UsbError::Permission {
+            path: "/dev/bus/usb/001/004".into(),
+            vendor: 0x046d,
+            product: 0xc52b,
+        }
+        .to_string();
+        assert!(e.contains(r#"ATTR{idVendor}=="046d""#), "{e}");
+        assert!(e.contains(r#"ATTR{idProduct}=="c52b""#), "{e}");
+        assert!(e.contains("uaccess"), "{e}");
+    }
 
     fn dev(root: &Path, name: &str, fields: &[(&str, &str)]) {
         let d = root.join(name);

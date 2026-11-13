@@ -12,6 +12,8 @@ KillSignal=SIGINT
 KillMode=mixed
 TimeoutStopSec=150
 Restart=on-failure
+# 78: a setup problem the user must fix (see `journalctl --user -u lsw@%i`).
+RestartPreventExitStatus=78
 RestartSec=5
 # GPU passthrough (tier B/C) pins guest memory.
 LimitMEMLOCK=infinity

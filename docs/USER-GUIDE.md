@@ -74,6 +74,10 @@ or run it in a terminal with `lsw run` (Ctrl+C shuts Windows down cleanly).
   agent is running).
 * **Status**: `lsw ctl status`, screenshots with `lsw ctl screenshot FILE`,
   ACPI shutdown with `lsw ctl powerdown`.
+* **Clock**: Windows takes its time and time zone from Linux when it
+  starts and after every idle pause.
+* **Switching views**: **Ctrl+Super+C** switches between the Window view
+  and Coherence; **Ctrl+Super+F** toggles Full Screen.
 
 ## GPU
 
@@ -81,10 +85,18 @@ or run it in a terminal with `lsw run` (Ctrl+C shuts Windows down cleanly).
 
 * **Tier D (default)**: a 2D display. Office, browsers and most apps run
   well.
-* **Tier B**: give a *second* GPU to Windows with `lsw gpu assign
-  0000:01:00.0` (asks for your password once; takes effect at the next
-  start); `lsw gpu release` gives it back. Needs IOMMU (VT-d / AMD-Vi)
-  enabled. Not yet tested on real hardware in this alpha.
+* **Tier B (experimental)**: give a *second* GPU to Windows with `lsw gpu
+  assign 0000:01:00.0` (asks for your password once; takes effect at the
+  next start); `lsw gpu release` gives it back. Every function of the GPU's
+  slot goes with it, and its IOMMU group must hold nothing else. Needs IOMMU
+  (VT-d / AMD-Vi) enabled. Not yet tested on real hardware in this alpha,
+  and two things are still manual:
+  * VFIO locks all of Windows' memory, so the locked-memory limit of your
+    session must allow it: as root, create
+    `/etc/systemd/system/user@.service.d/memlock.conf` with
+    `[Service]` and `LimitMEMLOCK=infinity`, then log in again.
+  * The assignment does not survive a host restart: run `lsw gpu assign`
+    again. Until then `lsw run` stops with that advice instead of starting.
 * **Tier C**: Intel SR-IOV virtual functions (11th gen and later; gen 11–13
   need the out-of-tree `i915-sriov-dkms`). Same commands, with a VF address.
 * **Tier A (paravirtualized 3D)**: not in this release.

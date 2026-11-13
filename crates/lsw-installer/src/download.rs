@@ -114,6 +114,9 @@ pub fn client() -> Result<Client, DownloadError> {
         .redirect(redirects)
         .https_only(true)
         .connect_timeout(std::time::Duration::from_secs(20))
+        // A stalled transfer (no bytes for a minute) fails instead of
+        // hanging `lsw create` forever; a slow one is fine.
+        .read_timeout(std::time::Duration::from_secs(60))
         .build()?)
 }
 

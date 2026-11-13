@@ -432,8 +432,15 @@ fn build_window(app: &adw::Application, options: Options) {
             #[upgrade_or]
             glib::ControlFlow::Break,
             move || {
-                let s = view.picture.scale_factor().max(1);
-                let size = (view.picture.width() * s, view.picture.height() * s);
+                // Fractional scale (125 %, 150 % …): the integer scale
+                // factor rounds up and would give Windows too many pixels.
+                let s = view
+                    .picture
+                    .native()
+                    .and_then(|n| n.surface())
+                    .map_or(f64::from(view.picture.scale_factor().max(1)), |s| s.scale());
+                let px = |logical: i32| (f64::from(logical) * s).round() as i32;
+                let size = (px(view.picture.width()), px(view.picture.height()));
                 if size != last.get() && size.0 > 0 && size.1 > 0 {
                     last.set(size);
                     view.send(Cmd::Resize {
@@ -546,10 +553,11 @@ fn remember_monitor_size(window: &adw::ApplicationWindow, paths: &VmPaths) {
         return;
     };
     let g = monitor.geometry();
-    let s = monitor.scale_factor().max(1);
+    // The monitor's native pixels, with fractional scaling too.
+    let s = monitor.scale();
     let size = lsw_daemon::config::DisplaySize {
-        width: (g.width() * s) as u32,
-        height: (g.height() * s) as u32,
+        width: (f64::from(g.width()) * s).round() as u32,
+        height: (f64::from(g.height()) * s).round() as u32,
     };
     let file = paths.display_size_file();
     if lsw_daemon::config::DisplaySize::load(&file) != (size.width, size.height)
@@ -562,7 +570,7 @@ fn remember_monitor_size(window: &adw::ApplicationWindow, paths: &VmPaths) {
 /// Leave the Window view for Coherence: start the Coherence client and
 /// close this window (Windows keeps running).
 fn switch_to_coherence(window: &adw::ApplicationWindow, name: &str) {
-    match spawn_lsw_program(
+    match lsw_daemon::detached::start(
         "lsw-coherence",
         &["--name", name],
         &format!("lsw-coherence-{name}"),
@@ -572,44 +580,11 @@ fn switch_to_coherence(window: &adw::ApplicationWindow, name: &str) {
     }
 }
 
-/// Start an LSW program next to this one, detached (systemd user unit
-/// when available).
-fn spawn_lsw_program(program: &str, args: &[&str], unit: &str) -> std::io::Result<()> {
-    let exe = std::env::current_exe()
-        .ok()
-        .and_then(|e| e.parent().map(|d| d.join(program)))
-        .filter(|p| p.is_file())
-        .unwrap_or_else(|| PathBuf::from(program));
-    let systemd = std::process::Command::new("systemd-run")
-        .args(["--user", "--collect", "--quiet", "--unit", unit])
-        // The VM supervisor shuts Windows down on SIGTERM (up to 120 s);
-        // only it gets the signal (QEMU would quit on it).
-        .args([
-            "--property",
-            "TimeoutStopSec=150",
-            "--property",
-            "KillMode=mixed",
-        ])
-        .arg(&exe)
-        .args(args)
-        .status();
-    match systemd {
-        Ok(s) if s.success() => Ok(()),
-        _ => std::process::Command::new(&exe)
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map(|_| ()),
-    }
-}
-
 /// Start the VM supervisor in the background: as a transient systemd user
 /// unit when systemd is available (it then outlives the app and logs to
 /// the journal), otherwise as a plain child process.
 fn start_vm(name: &str) -> std::io::Result<()> {
-    spawn_lsw_program("lsw", &["--name", name, "run"], &format!("lsw-vm-{name}"))
+    lsw_daemon::detached::start("lsw", &["--name", name, "run"], &format!("lsw-vm-{name}"))
 }
 
 /// Largest clipboard item read from the Linux side.

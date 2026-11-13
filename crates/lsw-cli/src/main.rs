@@ -214,8 +214,29 @@ enum CtlAction {
     },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> std::process::ExitCode {
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    match runtime.block_on(lsw_main()) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            // A configuration problem: the systemd unit must not restart.
+            if e.downcast_ref::<vm::NotReady>().is_some() {
+                std::process::ExitCode::from(vm::NotReady::EXIT_CODE as u8)
+            } else {
+                std::process::ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+async fn lsw_main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("LSW_LOG")
@@ -716,6 +737,32 @@ fn launch_options(host: &HostReport, l: &LaunchArgs) -> LaunchOptions {
     }
 }
 
+/// The signals that end a VM-owning command: Ctrl+C, SIGTERM and SIGHUP.
+/// QEMU runs in its own process group, so without handling them it would
+/// outlive `lsw`.
+struct StopSignals {
+    term: tokio::signal::unix::Signal,
+    hup: tokio::signal::unix::Signal,
+}
+
+impl StopSignals {
+    fn new() -> anyhow::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            term: signal(SignalKind::terminate())?,
+            hup: signal(SignalKind::hangup())?,
+        })
+    }
+
+    async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => "Interrupted",
+            _ = self.term.recv() => "Terminated",
+            _ = self.hup.recv() => "Hung up",
+        }
+    }
+}
+
 async fn install(
     paths: &VmPaths,
     timeout_min: u64,
@@ -732,13 +779,27 @@ async fn install(
     let opts = launch_options(&host, l);
     let _ = std::fs::remove_file(paths.serial_log());
     let started = std::time::Instant::now();
+    let mut stop = StopSignals::new()?;
+    let interrupted = |signal: &str| {
+        anyhow::anyhow!(
+            "{signal}: installation stopped (QEMU was stopped too). The VM is not marked \
+             installed; run `lsw install` to start over."
+        )
+    };
     let mut running = Vm::new(cfg.clone(), paths.clone())
         .start(&host.binaries, &opts)
         .await?;
     eprintln!("VM started; getting past the \"Press any key to boot from CD\" prompt…");
-    running
-        .press_key_repeatedly("ret", Duration::from_millis(500), Duration::from_secs(20))
-        .await;
+    let press =
+        running.press_key_repeatedly("ret", Duration::from_millis(500), Duration::from_secs(20));
+    let signal = tokio::select! {
+        () = press => None,
+        signal = stop.recv() => Some(signal),
+    };
+    if let Some(signal) = signal {
+        running.kill().await?;
+        return Err(interrupted(signal));
+    }
     eprintln!("Windows Setup is running unattended. Progress (from the guest's serial console):");
     // Either outcome marker ends the wait: DONE or FAILED <steps>.
     let marker = unattend::INSTALL_OUTCOME_PREFIX;
@@ -760,6 +821,10 @@ async fn install(
         r = wait => r?,
         status = running.wait() => {
             bail!("QEMU exited during installation ({:?}); see {}\n{}", status?, paths.qemu_log().display(), vm::tail(&paths.qemu_log(), 30));
+        }
+        signal = stop.recv() => {
+            running.kill().await?;
+            return Err(interrupted(signal));
         }
     };
     if outcome.contains(unattend::INSTALL_FAILED_MARKER) {
@@ -784,13 +849,12 @@ async fn install(
     );
     // Give the desktop a moment to settle for the screenshot.
     tokio::time::sleep(Duration::from_secs(15)).await;
+    // Best effort: a failed screenshot must not discard a finished install.
     let shot = screenshot.unwrap_or_else(|| paths.data.join("installed.png"));
-    running
-        .qmp
-        .screendump_png(&shot)
-        .await
-        .context("screenshot")?;
-    eprintln!("Screenshot: {}", shot.display());
+    match running.qmp.screendump_png(&shot).await {
+        Ok(()) => eprintln!("Screenshot: {}", shot.display()),
+        Err(e) => eprintln!("note: no screenshot ({e})"),
+    }
     eprintln!("{}", running.shutdown(Duration::from_secs(180)).await?);
 
     cfg.install = None;
@@ -858,9 +922,10 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
             tracing::warn!("API socket: {e}");
         }
     });
-    // SIGTERM (systemctl stop, logout, host shutdown) shuts Windows down
-    // like Ctrl+C does, instead of killing it.
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    // Ctrl+C, SIGTERM (systemctl stop, logout, host shutdown) and SIGHUP
+    // (the terminal closed) shut Windows down instead of leaving it
+    // running unsupervised.
+    let mut stop = StopSignals::new()?;
     let result = loop {
         tokio::select! {
             activity = running.next_activity() => match activity {
@@ -891,13 +956,8 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
                     }
                 }
             },
-            _ = async {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {}
-                    _ = sigterm.recv() => {}
-                }
-            } => {
-                println!("Shutting Windows down…");
+            signal = stop.recv() => {
+                println!("{signal}: shutting Windows down…");
                 println!("{}", running.shutdown(Duration::from_secs(120)).await?);
                 break Ok(());
             }
@@ -913,6 +973,8 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
                         if idle.wake(std::time::Instant::now()) == lsw_daemon::idle::Action::Resume {
                             running.resume().await?;
                             println!("Resumed for a view.");
+                        // The pause stopped Windows' clock.
+                        let _ = cmd_tx.send(ControlCommand::SyncClock);
                         }
                         let _ = call.reply.send(api::Response::ok());
                         continue;
@@ -930,6 +992,8 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
                         if idle.wake(std::time::Instant::now()) == lsw_daemon::idle::Action::Resume {
                             running.resume().await?;
                             println!("Resumed for a request.");
+                        // The pause stopped Windows' clock.
+                        let _ = cmd_tx.send(ControlCommand::SyncClock);
                         }
                     }
                 }
@@ -949,6 +1013,8 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
                     lsw_daemon::idle::Action::Resume => {
                         running.resume().await?;
                         println!("Resumed.");
+                        // The pause stopped Windows' clock.
+                        let _ = cmd_tx.send(ControlCommand::SyncClock);
                     }
                     lsw_daemon::idle::Action::None => {}
                 }
@@ -1109,7 +1175,8 @@ async fn supervise_agent(
                 continue;
             }
         };
-        let mut session = ControlSession::new(shares.clone());
+        let mut session =
+            ControlSession::new(shares.clone()).with_time_zone(lsw_daemon::host::time_zone());
         let r = serve_control(&mut channel, &mut session, &mut port_open, &mut commands, |event| match event {
             AgentEvent::Connected {
                 agent_version,

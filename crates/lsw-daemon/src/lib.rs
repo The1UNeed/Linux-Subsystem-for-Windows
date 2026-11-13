@@ -8,6 +8,7 @@ pub mod apps;
 pub mod channel;
 pub mod coherence;
 pub mod config;
+pub mod detached;
 pub mod display;
 pub mod firmware;
 pub mod gpu;

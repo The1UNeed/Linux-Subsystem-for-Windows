@@ -77,7 +77,8 @@ All four, as in Parallels: **Coherence** (default after setup), **Window**,
 - Coherence: Linux keeps its shortcuts (Super, Alt+Tab, workspaces); Windows
   apps get everything else.
 - Window / Full Screen: all keys go to Windows while focused (Wayland
-  `keyboard-shortcuts-inhibit`), released with `Ctrl+Alt`.
+  `keyboard-shortcuts-inhibit`), released with `Ctrl+Alt`. *(Changed: see
+  "Decisions made during implementation".)*
 - Keyboard layout follows Linux.
 - One virtual display per Linux monitor with matching resolution, refresh
   rate and (fractional) scale.
@@ -245,6 +246,10 @@ from running it.
 | Windows is never idle-paused until the agent is connected (no fixed boot grace). | A Windows that installs updates while shutting down boots, finishes them and powers off by itself; a 3-minute grace paused it mid-update. A reboot closes the agent's port, so the agent counts as gone until it says hello again. |
 | Coherence keeps its socket when the guest's Coherence port closes or reopens; it clears its windows and sends a new `Start`. | Dropping the socket looked like a host departure to the guest, which reopened its port: a reconnect loop. |
 | A shared folder counts as mounted only when WinFsp's mount point (a reparse point) is there and readable; a previous agent's mount is kept. | A plain folder of the same name passed a readability check, so the share silently wrote to the local disk. Remounting made the folder vanish briefly, which Explorer reports as an error. |
+| Windows' clock and time zone follow Linux: the supervisor sends the time and the host's IANA zone when the agent connects and after every idle pause (protocol 2); the agent sets the clock and maps the zone with the ICU built into Windows. | QEMU keeps the virtual clock on Linux local time, and a paused VM's clock stands still; Windows set to UTC was hours off. |
+| System shortcuts (Super, Alt+Tab) go to Windows only in Full Screen; in the Window view Linux keeps them. Ctrl+Super+C switches between the Window view and Coherence. | In a window among other Linux windows, taking the desktop's shortcuts away surprised users; Full Screen is where Windows owns the screen. |
+| Windows' DPI scale stays at 100 %; the Window view and Full Screen give Windows the monitor's native pixels (fractional scaling included). | Changing Windows' scale needs a sign-out for many apps; native pixels keep the picture sharp. |
+| After installation COM1 goes to a 64 KiB ring buffer in QEMU, not a file. | Setup reports progress there; afterwards a guest could fill the host disk through it. |
 
 ## 4. Delivery
 
@@ -259,15 +264,15 @@ from running it.
 ### Status of v0.0.1-alpha
 
 Verified means: run on Ubuntu 24.04 (KVM) with Windows 11 26H2 Enterprise
-Evaluation, with screenshots or recordings as evidence.
+Evaluation (build 26300), with screenshots or recordings as evidence.
 
 | Milestone | Delivered and verified | Delivered, not verified on hardware | Not in this release |
 |---|---|---|---|
 | M0 | Host check, media download and verification, unattended install (20.8 min), Secure Boot + TPM, virtio drivers. | — | Graphical setup wizard (CLI only). |
 | M1 | Agent over virtio-serial, Window view, dynamic resolution, native Full Screen resolution, clipboard both ways, PipeWire audio, shared folders both ways, USB hot-plug (emulated device; the test host has no USB bus). | Passthrough of a physical USB device. | — |
 | M2 | Coherence (separate native windows, input, native move/resize via hit test), app launchers with icons (70 written), launch from Linux. | — | Clipboard in Coherence (the Window view has it), Start menu window, tray icons, notifications, links to the Linux browser, file associations, drag and drop, Picture-in-Picture. |
-| M3 | — | Tier B (VFIO) and tier C (SR-IOV) host side: helper, polkit, QEMU arguments (unit-tested on fake sysfs; no IOMMU/GPU on the test host). | Tier A: the paravirtualized 3D guest driver (C/C++ fork) is not ready, so tier A is disabled and never turns Secure Boot off. |
-| M4 | Idle pause (0 % CPU), LSW Tools auto-update, Debian package, PKGBUILD, CI, docs. | — | Save state to disk when idle (QEMU 8.2 blocks migration with virtiofs), PPA publication, EV signing pipeline (nothing to sign until tier A), bundled pinned QEMU. |
+| M3 | — | Tier B (VFIO) and tier C (SR-IOV), experimental: helper, polkit, QEMU arguments, start-up checks (unit-tested on a fake sysfs and kernel; no IOMMU/GPU on the test host). Known gaps: the locked-memory limit must be raised by hand, and an assignment does not survive a host restart (`lsw run` then stops and says what to do). | Tier A: the paravirtualized 3D guest driver (C/C++ fork) is not ready, so tier A is disabled and never turns Secure Boot off. |
+| M4 | Idle pause (0 % CPU), LSW Tools auto-update, Debian package (built, installed and run), CI, docs. | Arch package: built, checked and installed in an `archlinux:base-devel` container (QEMU devices present); not run on CachyOS hardware. | Save state to disk when idle (QEMU 8.2 blocks migration with virtiofs), PPA publication, EV signing pipeline (nothing to sign until tier A), bundled pinned QEMU. |
 
 ### Testing
 

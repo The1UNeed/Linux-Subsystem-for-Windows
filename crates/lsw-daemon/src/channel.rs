@@ -126,6 +126,10 @@ pub enum AgentEvent {
 pub struct ControlSession {
     shares: Vec<ShareSpec>,
     accepted: bool,
+    /// Protocol agreed with the agent.
+    protocol: u16,
+    /// The host's IANA time zone, if known.
+    time_zone: Option<String>,
 }
 
 impl ControlSession {
@@ -133,7 +137,30 @@ impl ControlSession {
         Self {
             shares,
             accepted: false,
+            protocol: 0,
+            time_zone: None,
         }
+    }
+
+    /// Give the agent this IANA time zone along with the clock.
+    pub fn with_time_zone(mut self, zone: Option<String>) -> Self {
+        self.time_zone = zone.filter(|z| lsw_proto::valid_time_zone(z));
+        self
+    }
+
+    /// The host clock for the agent, if it understands it (protocol 2).
+    pub fn clock(&self) -> Option<Message> {
+        if !self.accepted || self.protocol < 2 {
+            return None;
+        }
+        let utc_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis() as i64;
+        Some(Message::Clock {
+            utc_ms,
+            time_zone: self.time_zone.clone().unwrap_or_default(),
+        })
     }
 
     pub fn accepted(&self) -> bool {
@@ -158,7 +185,12 @@ impl ControlSession {
                 Ok(v) => {
                     // A new Hello means the agent restarted: start over.
                     self.accepted = true;
+                    self.protocol = v;
                     out.push((Some(env.seq), Message::Welcome { protocol: v }));
+                    // Windows' clock is set before anything else uses it.
+                    if let Some(clock) = self.clock() {
+                        out.push((None, clock));
+                    }
                     out.push((
                         None,
                         Message::ShareFolders {
@@ -229,6 +261,8 @@ pub enum ControlCommand {
     ListApps(AppsReply),
     /// Start an app by its shell id.
     Launch(String, oneshot::Sender<Result<(), String>>),
+    /// Send the host's clock (after an idle pause stopped the guest's).
+    SyncClock,
 }
 
 /// Where an app listing is delivered.
@@ -294,6 +328,11 @@ pub async fn serve_control<S: AsyncRead + AsyncWrite + Unpin>(
                     Some(ControlCommand::Launch(_, reply)) => {
                         let _ = reply.send(Err("the guest agent is not connected".into()));
                     }
+                    Some(ControlCommand::SyncClock) => {
+                        if let Some(clock) = session.clock() {
+                            channel.send(clock).await?;
+                        }
+                    }
                     None => {}
                 }
                 continue;
@@ -356,6 +395,34 @@ mod tests {
     }
 
     #[test]
+    fn the_clock_goes_to_agents_that_understand_it() {
+        let mut s = ControlSession::new(shares()).with_time_zone(Some("Pacific/Auckland".into()));
+        assert!(s.clock().is_none(), "not before the handshake");
+        let (out, _) = s.handle(&hello(1, 2));
+        let clock = out.iter().find_map(|(_, m)| match m {
+            Message::Clock { utc_ms, time_zone } => Some((*utc_ms, time_zone.clone())),
+            _ => None,
+        });
+        let (ms, zone) = clock.expect("protocol 2 gets the clock");
+        assert_eq!(zone, "Pacific/Auckland");
+        assert!(lsw_proto::CLOCK_RANGE_MS.contains(&ms));
+        // Before the shares: Windows' clock is right before anything uses it.
+        let pos = |f: fn(&Message) -> bool| out.iter().position(|(_, m)| f(m)).unwrap();
+        assert!(
+            pos(|m| matches!(m, Message::Clock { .. }))
+                < pos(|m| matches!(m, Message::ShareFolders { .. }))
+        );
+        // A protocol-1 agent would not understand it.
+        let mut old = ControlSession::new(shares());
+        let (out, _) = old.handle(&hello(1, 1));
+        assert!(!out.iter().any(|(_, m)| matches!(m, Message::Clock { .. })));
+        assert!(old.clock().is_none());
+        // An invalid host zone is not sent.
+        let s = ControlSession::new(shares()).with_time_zone(Some("../x".into()));
+        assert!(s.time_zone.is_none());
+    }
+
+    #[test]
     fn handshake_then_shares_then_ping() {
         let mut s = ControlSession::new(shares());
         // Nothing but Hello is accepted before the handshake.
@@ -379,7 +446,9 @@ mod tests {
                 }
             )
         );
-        assert_eq!(out[1], (None, Message::ShareFolders { shares: shares() }));
+        // Protocol 2: the clock first, then the shares.
+        assert!(matches!(out[1], (None, Message::Clock { .. })));
+        assert_eq!(out[2], (None, Message::ShareFolders { shares: shares() }));
         assert!(matches!(ev, Some(AgentEvent::Connected { .. })));
         assert!(s.accepted());
 
@@ -446,6 +515,8 @@ mod tests {
             let welcome = guest.recv().await.unwrap();
             assert_eq!(welcome.reply_to, Some(1));
             assert!(matches!(welcome.msg, Message::Welcome { .. }));
+            let clock = guest.recv().await.unwrap();
+            assert!(matches!(clock.msg, Message::Clock { .. }));
             let shares = guest.recv().await.unwrap();
             assert!(matches!(shares.msg, Message::ShareFolders { .. }));
             // A hostile frame: oversized length header.

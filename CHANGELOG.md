@@ -15,4 +15,7 @@ First alpha. See the README for what works and the known limits.
   passthrough, idle pause.
 * LSW Tools CD with automatic agent updates.
 * GPU tiers B/C plumbing (`lsw gpu`, polkit helper); tier A not included.
+* Windows' clock and time zone follow Linux (also after idle pauses).
+* Clean shutdown on Ctrl+C, SIGTERM and SIGHUP; `lsw install` stops its VM
+  when interrupted.
 * Debian packaging, Arch PKGBUILD, CI.

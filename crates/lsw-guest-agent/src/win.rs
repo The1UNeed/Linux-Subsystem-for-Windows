@@ -442,6 +442,8 @@ struct Windows {
     /// Mounted shares: our virtiofs.exe (None for a mount adopted from a
     /// previous agent) and the mount path.
     shares: HashMap<String, (Option<Child>, String)>,
+    /// The IANA time zone last applied.
+    time_zone: Option<String>,
 }
 
 fn reg_dword(key: &str, value: &str) -> Option<u32> {
@@ -813,6 +815,15 @@ impl Platform for Windows {
         crate::apps::launch(launch)
     }
 
+    fn set_clock(&mut self, utc_ms: i64, time_zone: &str) -> Result<(), String> {
+        crate::clock::set_system_time(utc_ms)?;
+        if !time_zone.is_empty() && self.time_zone.as_deref() != Some(time_zone) {
+            crate::clock::set_time_zone(time_zone)?;
+            self.time_zone = Some(time_zone.to_owned());
+        }
+        Ok(())
+    }
+
     fn clipboard_formats(&mut self) -> Vec<ClipFormat> {
         let Some(cb) = ClipboardGuard::open(self.clipboard_owner) else {
             return Vec::new();
@@ -969,6 +980,7 @@ pub fn run() -> i32 {
         cf_html,
         cf_png,
         shares: HashMap::new(),
+        time_zone: None,
     };
     let mut agent = Agent::new(platform);
 

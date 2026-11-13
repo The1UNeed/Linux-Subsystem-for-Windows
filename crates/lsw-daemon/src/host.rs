@@ -395,9 +395,44 @@ fn render_node_map(root: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The host's IANA time zone (`Europe/Berlin`): `$TZ` when it names one,
+/// else the target of `/etc/localtime`.
+pub fn time_zone() -> Option<String> {
+    let from_tz = std::env::var("TZ")
+        .ok()
+        .map(|tz| tz.trim_start_matches(':').to_owned());
+    let from_link = std::fs::read_link("/etc/localtime")
+        .ok()
+        .and_then(|p| zone_from_path(&p.to_string_lossy()));
+    from_tz
+        .and_then(|tz| zone_from_path(&tz).or(Some(tz)))
+        .filter(|z| lsw_proto::valid_time_zone(z) && !z.is_empty())
+        .or(from_link)
+}
+
+/// `…/zoneinfo/Europe/Berlin` → `Europe/Berlin`.
+fn zone_from_path(path: &str) -> Option<String> {
+    let zone = path.rsplit_once("zoneinfo/")?.1;
+    (!zone.is_empty() && lsw_proto::valid_time_zone(zone)).then(|| zone.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn time_zone_from_the_localtime_link() {
+        assert_eq!(
+            zone_from_path("/usr/share/zoneinfo/Pacific/Auckland").as_deref(),
+            Some("Pacific/Auckland")
+        );
+        assert_eq!(
+            zone_from_path("../usr/share/zoneinfo/America/Argentina/Buenos_Aires").as_deref(),
+            Some("America/Argentina/Buenos_Aires")
+        );
+        assert_eq!(zone_from_path("/etc/localtime"), None);
+        assert_eq!(zone_from_path("/usr/share/zoneinfo/"), None);
+    }
 
     struct Fake(tempfile::TempDir);
 

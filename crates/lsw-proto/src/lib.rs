@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 pub mod coherence;
 
 /// Current protocol version. Bumped whenever [`Message`] gains a variant.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Oldest agent protocol the host still speaks.
 pub const MIN_SUPPORTED_VERSION: u16 = 1;
@@ -153,6 +153,25 @@ pub enum Message {
     AppsDone,
     /// Host → guest: start an app by its [`AppEntry::launch`] id.
     Launch { launch: String },
+    /// Host → guest (protocol 2): the host's clock. The guest sets its
+    /// clock to `utc_ms` (milliseconds since the Unix epoch) and, unless
+    /// empty, its time zone to the IANA zone `time_zone`. Sent when the
+    /// agent connects and after every idle pause, which stops the guest's
+    /// clock.
+    Clock { utc_ms: i64, time_zone: String },
+}
+
+/// Earliest and latest clock a host may send (2020-01-01 and 2200-01-01).
+pub const CLOCK_RANGE_MS: std::ops::RangeInclusive<i64> = 1_577_836_800_000..=7_258_118_400_000;
+
+/// Whether `zone` looks like an IANA time zone name (`Area/City`, `UTC`).
+pub fn valid_time_zone(zone: &str) -> bool {
+    zone.len() <= 64
+        && zone
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'_' | b'+' | b'-'))
+        && !zone.starts_with('/')
+        && !zone.contains("..")
 }
 
 /// An installed Windows app, as listed in Start.
@@ -344,6 +363,13 @@ impl Envelope {
                 Ok(())
             }
             Message::Launch { launch } => bounded("launch", launch),
+            Message::Clock { utc_ms, time_zone } => {
+                if CLOCK_RANGE_MS.contains(utc_ms) && valid_time_zone(time_zone) {
+                    Ok(())
+                } else {
+                    Err(ProtoError::BadRange)
+                }
+            }
             Message::ListApps | Message::AppsDone => Ok(()),
             Message::Welcome { .. }
             | Message::Ping { .. }
@@ -808,6 +834,30 @@ mod tests {
         };
         assert!(roundtrip(hint(1920, 1080, 100)).is_ok());
         assert_eq!(roundtrip(hint(0, 1080, 100)), Err(ProtoError::BadRange));
+        let clock = |ms, tz: &str| Message::Clock {
+            utc_ms: ms,
+            time_zone: tz.into(),
+        };
+        assert!(roundtrip(clock(1_794_600_000_000, "Pacific/Auckland")).is_ok());
+        assert!(
+            roundtrip(clock(1_794_600_000_000, "")).is_ok(),
+            "zone left alone"
+        );
+        assert!(roundtrip(clock(1_794_600_000_000, "America/Argentina/Buenos_Aires")).is_ok());
+        assert!(roundtrip(clock(1_794_600_000_000, "Etc/GMT+10")).is_ok());
+        assert_eq!(
+            roundtrip(clock(0, "UTC")),
+            Err(ProtoError::BadRange),
+            "1970"
+        );
+        assert_eq!(
+            roundtrip(clock(1_794_600_000_000, "\"; rm")),
+            Err(ProtoError::BadRange)
+        );
+        assert_eq!(
+            roundtrip(clock(1_794_600_000_000, "../etc")),
+            Err(ProtoError::BadRange)
+        );
         assert_eq!(roundtrip(hint(1920, 1080, 50)), Err(ProtoError::BadRange));
         let many = Message::ClipboardOffer {
             serial: 1,

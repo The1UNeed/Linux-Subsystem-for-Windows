@@ -93,6 +93,21 @@ async fn wake(paths: &VmPaths) {
     .await;
 }
 
+/// The same without waiting: input must not wait for a round trip to the
+/// supervisor. Input that reaches a paused VM waits in QEMU and is
+/// delivered when it resumes.
+fn wake_soon(paths: &VmPaths) {
+    let api = paths.api_socket();
+    tokio::spawn(async move {
+        let _ = lsw_daemon::api::call(
+            &api,
+            &lsw_daemon::api::Request::Wake,
+            Duration::from_secs(2),
+        )
+        .await;
+    });
+}
+
 async fn connection(
     paths: &VmPaths,
     updates: &Sender<Update>,
@@ -139,7 +154,7 @@ async fn connection(
                             msg,
                             CoMessage::Activate { .. } | CoMessage::Restore { .. } | CoMessage::HitTest { .. }
                         ) {
-                            wake(paths).await;
+                            wake_soon(paths);
                         }
                         writer.send(&msg).await?
                     }
@@ -147,7 +162,7 @@ async fn connection(
                     Request::Button { button, down } => {
                         tracing::debug!("button {button} {}", if down { "down" } else { "up" });
                         if down {
-                            wake(paths).await;
+                            wake_soon(paths);
                             mouse.press(button).await?
                         } else {
                             mouse.release(button).await?
@@ -166,7 +181,7 @@ async fn connection(
                     }
                     Request::Key { qnum, down } => {
                         if down {
-                            wake(paths).await;
+                            wake_soon(paths);
                             keyboard.press(qnum).await?
                         } else {
                             keyboard.release(qnum).await?

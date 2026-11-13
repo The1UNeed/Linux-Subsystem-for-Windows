@@ -56,6 +56,47 @@ fn value(s: &str) -> String {
 }
 
 /// The desktop entry for `app`, or `None` if any guest-provided field is
+/// Largest icon side accepted from the guest.
+const MAX_ICON_SIDE: u32 = 256;
+
+/// Decode a guest PNG icon (bounded) and re-encode it as 8-bit RGBA. None
+/// if it is empty, malformed or too large.
+pub fn clean_icon(png_bytes: &[u8]) -> Option<Vec<u8>> {
+    if png_bytes.is_empty() || png_bytes.len() > lsw_proto::MAX_ICON_LEN {
+        return None;
+    }
+    let mut decoder = png::Decoder::new_with_limits(
+        std::io::Cursor::new(png_bytes),
+        png::Limits { bytes: 1 << 20 },
+    );
+    decoder.set_transformations(
+        png::Transformations::normalize_to_color8() | png::Transformations::ALPHA,
+    );
+    let mut reader = decoder.read_info().ok()?;
+    let (w, h) = (reader.info().width, reader.info().height);
+    if w == 0 || h == 0 || w > MAX_ICON_SIDE || h > MAX_ICON_SIDE {
+        return None;
+    }
+    let mut pixels = vec![0u8; reader.output_buffer_size()?];
+    let frame = reader.next_frame(&mut pixels).ok()?;
+    let rgba: Vec<u8> = match frame.color_type {
+        png::ColorType::Rgba => pixels[..frame.buffer_size()].to_vec(),
+        png::ColorType::GrayscaleAlpha => pixels[..frame.buffer_size()]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .flat_map(|&[g, a]| [g, g, g, a])
+            .collect(),
+        _ => return None,
+    };
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, frame.width, frame.height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.write_header().ok()?.write_image_data(&rgba).ok()?;
+    Some(out)
+}
+
 /// not [`launcher_safe`].
 pub fn desktop_entry(app: &AppEntry, lsw: &Path, vm: &str, icon: Option<&Path>) -> Option<String> {
     if !launcher_safe(&app.launch) || !launcher_safe(&app.name) {
@@ -76,6 +117,8 @@ pub fn desktop_entry(app: &AppEntry, lsw: &Path, vm: &str, icon: Option<&Path>) 
         "--name".to_owned(),
         exec_arg(vm)?,
         "launch".to_owned(),
+        // The id comes from the guest: never an option.
+        "--".to_owned(),
         exec_arg(&app.launch)?,
     ]
     .join(" ");
@@ -112,12 +155,15 @@ pub fn sync(
             continue;
         }
         let id = linux_app_id(&app.app);
-        let icon = if app.icon_png.starts_with(b"\x89PNG") {
-            let p = icons_dir.join(format!("{id}.png"));
-            std::fs::write(&p, &app.icon_png)?;
-            Some(p)
-        } else {
-            None
+        // The desktop shell decodes these: never the guest's bytes, only a
+        // re-encoding of what decoded cleanly.
+        let icon = match clean_icon(&app.icon_png) {
+            Some(png) => {
+                let p = icons_dir.join(format!("{id}.png"));
+                std::fs::write(&p, png)?;
+                Some(p)
+            }
+            None => None,
         };
         let file = applications_dir.join(format!("{id}.desktop"));
         if keep.contains(&file) {
@@ -152,6 +198,58 @@ pub fn sync(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn png_of(w: u32, h: u32, color: png::ColorType) -> Vec<u8> {
+        let channels = match color {
+            png::ColorType::Rgba => 4,
+            png::ColorType::Rgb => 3,
+            png::ColorType::GrayscaleAlpha => 2,
+            _ => 1,
+        };
+        let mut out = Vec::new();
+        let mut e = png::Encoder::new(&mut out, w, h);
+        e.set_color(color);
+        e.set_depth(png::BitDepth::Eight);
+        e.write_header()
+            .unwrap()
+            .write_image_data(&vec![0x80; (w * h) as usize * channels])
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn guest_icons_are_re_encoded_or_dropped() {
+        for color in [
+            png::ColorType::Rgba,
+            png::ColorType::Rgb,
+            png::ColorType::Grayscale,
+        ] {
+            let clean = clean_icon(&png_of(64, 64, color)).expect("valid icon");
+            let mut d = png::Decoder::new(std::io::Cursor::new(&clean))
+                .read_info()
+                .unwrap();
+            assert_eq!(
+                (d.info().width, d.info().color_type),
+                (64, png::ColorType::Rgba)
+            );
+            let mut buf = vec![0; d.output_buffer_size().unwrap()];
+            d.next_frame(&mut buf).unwrap();
+        }
+        assert_eq!(clean_icon(b""), None);
+        assert_eq!(
+            clean_icon(b"\x89PNG\r\n\x1a\nnot really"),
+            None,
+            "magic only"
+        );
+        let mut truncated = png_of(64, 64, png::ColorType::Rgba);
+        truncated.truncate(truncated.len() / 2);
+        assert_eq!(clean_icon(&truncated), None);
+        assert_eq!(
+            clean_icon(&png_of(512, 16, png::ColorType::Rgba)),
+            None,
+            "too large"
+        );
+    }
 
     /// A Desktop Entry `Exec` parser written from the specification: the
     /// string-level unescape, then quoting, then `%%`.
@@ -213,7 +311,7 @@ mod tests {
             launch: launch.into(),
             name: name.into(),
             app: launch.into(),
-            icon_png: b"\x89PNG fake".to_vec(),
+            icon_png: png_of(32, 32, png::ColorType::Rgba),
         }
     }
 
@@ -230,7 +328,7 @@ mod tests {
                 desktop_entry(&app(id, "X"), Path::new("/usr/bin/lsw"), "windows", None).unwrap();
             assert_eq!(
                 parse_exec(&e),
-                ["/usr/bin/lsw", "--name", "windows", "launch", id],
+                ["/usr/bin/lsw", "--name", "windows", "launch", "--", id],
                 "{id}"
             );
             // Every line is one of ours: guest data never starts a key.
