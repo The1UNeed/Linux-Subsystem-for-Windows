@@ -3,11 +3,11 @@
 
 mod backend;
 mod framebuffer;
-mod keymap;
 
 use adw::prelude::*;
 use backend::{Cmd, Frame, UiMsg};
 use gtk::{gdk, gio, glib};
+use lsw_daemon::keymap;
 use lsw_daemon::paths::VmPaths;
 use lsw_proto::ClipFormat;
 use std::cell::Cell;

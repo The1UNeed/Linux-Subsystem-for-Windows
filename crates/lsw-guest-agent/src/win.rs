@@ -60,6 +60,11 @@ use windows::core::{HSTRING, PCWSTR, w};
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Whether a port read error means "no host end connected" (vioserial).
+pub(crate) fn is_host_absent(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(ERROR_NO_SYSTEM_RESOURCES.to_hresult().0)
+}
+
 /// Events delivered to the main loop.
 enum Event {
     Frame(PortId, Envelope),
@@ -99,7 +104,7 @@ pub fn log(msg: impl AsRef<str>) {
 // ------------------------------------------------------------------ ports
 
 /// An open virtio-serial port (overlapped handle).
-struct Port {
+pub(crate) struct Port {
     handle: HANDLE,
 }
 
@@ -139,7 +144,7 @@ impl Drop for OwnedEvent {
 }
 
 impl Port {
-    fn open(name: &str) -> std::io::Result<Self> {
+    pub(crate) fn open(name: &str) -> std::io::Result<Self> {
         let path = HSTRING::from(format!("\\\\.\\Global\\{name}"));
         // SAFETY: valid NUL-terminated path; no security attributes or template.
         let handle = unsafe {
@@ -157,7 +162,7 @@ impl Port {
     }
 
     /// Blocking read (waits for host data).
-    fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+    pub(crate) fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
         let event = OwnedEvent::new()?;
         let mut ov = OVERLAPPED {
             hEvent: event.0,
@@ -178,7 +183,7 @@ impl Port {
     }
 
     /// Write everything or fail after [`WRITE_TIMEOUT`] (host not reading).
-    fn write_all(&self, mut data: &[u8]) -> std::io::Result<()> {
+    pub(crate) fn write_all(&self, mut data: &[u8]) -> std::io::Result<()> {
         while !data.is_empty() {
             let event = OwnedEvent::new()?;
             let mut ov = OVERLAPPED {
@@ -494,7 +499,7 @@ fn drive_letters() -> Vec<char> {
         .collect()
 }
 
-fn wait_until(timeout: Duration, mut ready: impl FnMut() -> bool) -> bool {
+pub(crate) fn wait_until(timeout: Duration, mut ready: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if ready() {
@@ -851,6 +856,7 @@ pub fn run() -> i32 {
         tx.clone(),
     );
     drop(tx);
+    crate::coherence::spawn();
 
     let mut seq = 1u64;
     for event in rx {

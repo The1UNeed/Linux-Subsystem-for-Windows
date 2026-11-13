@@ -81,6 +81,10 @@ impl VmPaths {
     pub fn session_socket(&self) -> PathBuf {
         self.run.join("session.sock")
     }
+    /// virtio-serial Coherence channel (window list and frames).
+    pub fn coherence_socket(&self) -> PathBuf {
+        self.run.join("coherence.sock")
+    }
     /// QMP monitor reserved for the UI (display connection, input).
     pub fn ui_qmp_socket(&self) -> PathBuf {
         self.run.join("ui.sock")
@@ -118,6 +122,7 @@ impl VmPaths {
             self.ctl_socket(),
             self.agent_socket(),
             self.session_socket(),
+            self.coherence_socket(),
             self.ui_qmp_socket(),
             self.tpm_socket(),
             self.passt_socket(),

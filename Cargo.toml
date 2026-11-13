@@ -1,7 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
-# lsw-app needs GTK 4 and libadwaita development files; build it explicitly
+# lsw-app (GTK 4, libadwaita) and lsw-coherence (Wayland, xkbcommon) need
+# Linux desktop libraries; build them explicitly
 # (`cargo build --workspace`, as CI does) on Linux.
 default-members = [
     "crates/lsw-proto",
@@ -39,6 +40,9 @@ sha2 = "0.11.1"
 hex = "0.4.3"
 hadris-iso = { version = "2.5", features = ["joliet"] }
 png = "0.18"
+smithay-client-toolkit = "0.21"
+wayland-client = "0.31"
+lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
 async-channel = "2.5"
 zbus = { version = "5.19", default-features = false, features = ["tokio", "p2p"] }
 gtk = { package = "gtk4", version = "0.11" }

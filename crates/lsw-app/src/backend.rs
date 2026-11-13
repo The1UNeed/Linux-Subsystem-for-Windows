@@ -3,6 +3,7 @@
 //! thread through channels.
 
 use crate::framebuffer::Framebuffer;
+use lsw_daemon::display::{ConsoleProxy, KeyboardProxy, MouseProxy};
 use lsw_daemon::paths::VmPaths;
 use lsw_daemon::qmp::Qmp;
 use lsw_daemon::session::{self, SessionEvent};
@@ -62,46 +63,6 @@ pub enum Cmd {
 pub struct Frame {
     pub fb: Mutex<Framebuffer>,
     pub pending: AtomicBool,
-}
-
-#[zbus::proxy(
-    interface = "org.qemu.Display1.Console",
-    default_service = "org.qemu",
-    default_path = "/org/qemu/Display1/Console_0"
-)]
-trait Console {
-    fn register_listener(&self, listener: Fd<'_>) -> zbus::Result<()>;
-    #[zbus(name = "SetUIInfo")]
-    fn set_ui_info(
-        &self,
-        width_mm: u16,
-        height_mm: u16,
-        xoff: i32,
-        yoff: i32,
-        width: u32,
-        height: u32,
-    ) -> zbus::Result<()>;
-}
-
-#[zbus::proxy(
-    interface = "org.qemu.Display1.Keyboard",
-    default_service = "org.qemu",
-    default_path = "/org/qemu/Display1/Console_0"
-)]
-trait Keyboard {
-    fn press(&self, keycode: u32) -> zbus::Result<()>;
-    fn release(&self, keycode: u32) -> zbus::Result<()>;
-}
-
-#[zbus::proxy(
-    interface = "org.qemu.Display1.Mouse",
-    default_service = "org.qemu",
-    default_path = "/org/qemu/Display1/Console_0"
-)]
-trait Mouse {
-    fn press(&self, button: u32) -> zbus::Result<()>;
-    fn release(&self, button: u32) -> zbus::Result<()>;
-    fn set_abs_position(&self, x: u32, y: u32) -> zbus::Result<()>;
 }
 
 /// The object QEMU calls with frames (`org.qemu.Display1.Listener`).
@@ -262,13 +223,7 @@ async fn session_loop(
         .await
         .map_err(|_| anyhow::anyhow!("Windows is not running"))?;
     tracing::debug!("QMP connected; opening the D-Bus display");
-    let stream = lsw_daemon::display::open_p2p(&mut qmp).await?;
-    tracing::debug!("display socket handed to QEMU; authenticating");
-    stream.set_nonblocking(true)?;
-    let display = zbus::connection::Builder::unix_stream(tokio::net::UnixStream::from_std(stream)?)
-        .p2p()
-        .build()
-        .await?;
+    let display = lsw_daemon::display::connect(&mut qmp).await?;
     tracing::debug!("display connection up");
     let console = ConsoleProxy::new(&display).await?;
     let keyboard = KeyboardProxy::new(&display).await?;

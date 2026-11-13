@@ -32,6 +32,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod coherence;
+
 /// Current protocol version. Bumped whenever [`Message`] gains a variant.
 pub const PROTOCOL_VERSION: u16 = 1;
 
@@ -181,7 +183,7 @@ pub enum ErrorCode {
 /// Errors produced while encoding or decoding frames.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ProtoError {
-    #[error("frame of {0} bytes exceeds the {MAX_FRAME_LEN}-byte limit")]
+    #[error("frame of {0} bytes exceeds the channel's limit")]
     FrameTooLarge(u32),
     #[error("malformed frame payload")]
     Malformed,
@@ -322,48 +324,86 @@ pub fn is_valid_tag(tag: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
-/// Encode one envelope into a complete frame (header + payload).
-pub fn encode(env: &Envelope) -> Result<Vec<u8>, ProtoError> {
-    env.validate()?;
+/// A message type that travels in length-prefixed postcard frames.
+pub trait Wire: Serialize + for<'de> Deserialize<'de> {
+    /// Largest accepted payload for this channel.
+    const MAX_LEN: u32;
+    /// Check every bounded field (called on encode and decode).
+    fn validate(&self) -> Result<(), ProtoError>;
+}
+
+impl Wire for Envelope {
+    const MAX_LEN: u32 = MAX_FRAME_LEN;
+    fn validate(&self) -> Result<(), ProtoError> {
+        Envelope::validate(self)
+    }
+}
+
+/// Encode one message into a complete frame (header + payload).
+pub fn encode_message<T: Wire>(msg: &T) -> Result<Vec<u8>, ProtoError> {
+    msg.validate()?;
     let mut out =
-        postcard::to_extend(env, vec![0u8; HEADER_LEN]).map_err(|_| ProtoError::Malformed)?;
+        postcard::to_extend(msg, vec![0u8; HEADER_LEN]).map_err(|_| ProtoError::Malformed)?;
     let payload_len = out.len() - HEADER_LEN;
     let len = u32::try_from(payload_len).map_err(|_| ProtoError::FrameTooLarge(u32::MAX))?;
-    if len > MAX_FRAME_LEN {
+    if len > T::MAX_LEN {
         return Err(ProtoError::FrameTooLarge(len));
     }
     out[..HEADER_LEN].copy_from_slice(&len.to_le_bytes());
     Ok(out)
 }
 
+/// Encode one control/session envelope.
+pub fn encode(env: &Envelope) -> Result<Vec<u8>, ProtoError> {
+    encode_message(env)
+}
+
 /// Decode a single complete payload (no header).
-pub fn decode_payload(payload: &[u8]) -> Result<Envelope, ProtoError> {
-    let (env, rest): (Envelope, &[u8]) =
+pub fn decode_message<T: Wire>(payload: &[u8]) -> Result<T, ProtoError> {
+    let (msg, rest): (T, &[u8]) =
         postcard::take_from_bytes(payload).map_err(|_| ProtoError::Malformed)?;
     if !rest.is_empty() {
         return Err(ProtoError::TrailingBytes(rest.len()));
     }
-    env.validate()?;
-    Ok(env)
+    msg.validate()?;
+    Ok(msg)
 }
 
-/// Incremental decoder for a byte stream of frames.
-#[derive(Debug, Default)]
-pub struct FrameDecoder {
+/// Decode a single control/session payload (no header).
+pub fn decode_payload(payload: &[u8]) -> Result<Envelope, ProtoError> {
+    decode_message(payload)
+}
+
+/// Incremental decoder for a byte stream of frames of `T`.
+#[derive(Debug)]
+pub struct Decoder<T> {
     buf: Vec<u8>,
     poisoned: bool,
+    _msg: std::marker::PhantomData<fn() -> T>,
 }
 
-impl FrameDecoder {
+/// Decoder for the control and session channels.
+pub type FrameDecoder = Decoder<Envelope>;
+
+impl<T: Wire> Default for Decoder<T> {
+    fn default() -> Self {
+        Self {
+            buf: Vec::new(),
+            poisoned: false,
+            _msg: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T: Wire> Decoder<T> {
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Append bytes read from the transport.
     ///
-    /// The buffer never grows past one maximum frame plus its header: once a
-    /// header announces an oversized frame the decoder poisons itself instead
-    /// of buffering.
+    /// Once a header announces an oversized frame the decoder poisons
+    /// itself instead of buffering it.
     pub fn push(&mut self, bytes: &[u8]) -> Result<(), ProtoError> {
         if self.poisoned {
             return Err(ProtoError::Poisoned);
@@ -371,7 +411,7 @@ impl FrameDecoder {
         self.buf.extend_from_slice(bytes);
         if self.buf.len() >= HEADER_LEN {
             let len = self.peek_len();
-            if len > MAX_FRAME_LEN {
+            if len > T::MAX_LEN {
                 self.poisoned = true;
                 self.buf.clear();
                 return Err(ProtoError::FrameTooLarge(len));
@@ -380,8 +420,8 @@ impl FrameDecoder {
         Ok(())
     }
 
-    /// Pop the next complete envelope, if one is buffered.
-    pub fn next_envelope(&mut self) -> Result<Option<Envelope>, ProtoError> {
+    /// Pop the next complete message, if one is buffered.
+    pub fn next_message(&mut self) -> Result<Option<T>, ProtoError> {
         if self.poisoned {
             return Err(ProtoError::Poisoned);
         }
@@ -389,7 +429,7 @@ impl FrameDecoder {
             return Ok(None);
         }
         let len = self.peek_len();
-        if len > MAX_FRAME_LEN {
+        if len > T::MAX_LEN {
             self.poisoned = true;
             self.buf.clear();
             return Err(ProtoError::FrameTooLarge(len));
@@ -398,10 +438,10 @@ impl FrameDecoder {
         if self.buf.len() < total {
             return Ok(None);
         }
-        let result = decode_payload(&self.buf[HEADER_LEN..total]);
+        let result = decode_message(&self.buf[HEADER_LEN..total]);
         self.buf.drain(..total);
         match result {
-            Ok(env) => Ok(Some(env)),
+            Ok(msg) => Ok(Some(msg)),
             Err(e) => {
                 self.poisoned = true;
                 self.buf.clear();
@@ -417,6 +457,13 @@ impl FrameDecoder {
 
     fn peek_len(&self) -> u32 {
         u32::from_le_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]])
+    }
+}
+
+impl Decoder<Envelope> {
+    /// Pop the next complete envelope, if one is buffered.
+    pub fn next_envelope(&mut self) -> Result<Option<Envelope>, ProtoError> {
+        self.next_message()
     }
 }
 

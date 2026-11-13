@@ -60,6 +60,7 @@ pub mod slot {
 /// QEMU device ids of the agent ports, as reported in `VSERPORT_CHANGE`.
 pub const CONTROL_PORT_ID: &str = "lswctl";
 pub const SESSION_PORT_ID: &str = "lswsession";
+pub const COHERENCE_PORT_ID: &str = "lswcoherence";
 
 /// Where guest audio goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -334,6 +335,20 @@ pub fn build_args(cfg: &VmConfig, paths: &VmPaths, opts: &LaunchOptions) -> Vec<
         "-device",
         &format!(
             "virtserialport,bus=vser0.0,chardev=session,id={SESSION_PORT_ID},name={SESSION_PORT_NAME}"
+        ),
+    ]);
+    push(&[
+        "-chardev",
+        &format!(
+            "socket,id=coherence,path={},server=on,wait=off",
+            p(&paths.coherence_socket())
+        ),
+    ]);
+    push(&[
+        "-device",
+        &format!(
+            "virtserialport,bus=vser0.0,chardev=coherence,id={COHERENCE_PORT_ID},name={}",
+            lsw_proto::coherence::COHERENCE_PORT_NAME
         ),
     ]);
 

@@ -4,10 +4,12 @@
 //! and the process supervisor used to boot and install Windows 11.
 
 pub mod channel;
+pub mod coherence;
 pub mod config;
 pub mod display;
 pub mod firmware;
 pub mod host;
+pub mod keymap;
 pub mod paths;
 pub mod qemu;
 pub mod qmp;

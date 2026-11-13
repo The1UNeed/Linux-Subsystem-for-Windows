@@ -9,6 +9,61 @@ use crate::qmp::{Qmp, QmpError};
 use serde_json::json;
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
+use zbus::zvariant::Fd;
+
+// Proxies for QEMU's `org.qemu.Display1` interfaces on console 0. Over a
+// peer-to-peer connection the service name is not used for routing.
+#[zbus::proxy(
+    interface = "org.qemu.Display1.Console",
+    default_service = "org.qemu",
+    default_path = "/org/qemu/Display1/Console_0"
+)]
+pub trait Console {
+    fn register_listener(&self, listener: Fd<'_>) -> zbus::Result<()>;
+    #[zbus(name = "SetUIInfo")]
+    fn set_ui_info(
+        &self,
+        width_mm: u16,
+        height_mm: u16,
+        xoff: i32,
+        yoff: i32,
+        width: u32,
+        height: u32,
+    ) -> zbus::Result<()>;
+}
+
+#[zbus::proxy(
+    interface = "org.qemu.Display1.Keyboard",
+    default_service = "org.qemu",
+    default_path = "/org/qemu/Display1/Console_0"
+)]
+pub trait Keyboard {
+    fn press(&self, keycode: u32) -> zbus::Result<()>;
+    fn release(&self, keycode: u32) -> zbus::Result<()>;
+}
+
+#[zbus::proxy(
+    interface = "org.qemu.Display1.Mouse",
+    default_service = "org.qemu",
+    default_path = "/org/qemu/Display1/Console_0"
+)]
+pub trait Mouse {
+    fn press(&self, button: u32) -> zbus::Result<()>;
+    fn release(&self, button: u32) -> zbus::Result<()>;
+    fn set_abs_position(&self, x: u32, y: u32) -> zbus::Result<()>;
+}
+
+/// Connect to the display as a peer and return the D-Bus connection.
+pub async fn connect(qmp: &mut Qmp) -> anyhow::Result<zbus::Connection> {
+    let stream = open_p2p(qmp).await?;
+    stream.set_nonblocking(true)?;
+    Ok(
+        zbus::connection::Builder::unix_stream(tokio::net::UnixStream::from_std(stream)?)
+            .p2p()
+            .build()
+            .await?,
+    )
+}
 
 /// Name under which the fd is registered with QEMU; reused by every
 /// connection (QEMU consumes it in `add_client`).

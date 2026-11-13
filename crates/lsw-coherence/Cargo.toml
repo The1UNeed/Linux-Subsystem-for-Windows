@@ -1,0 +1,21 @@
+[package]
+name = "lsw-coherence"
+description = "LSW Coherence: Windows windows as native Wayland windows"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+lsw-daemon.workspace = true
+lsw-proto.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+smithay-client-toolkit.workspace = true
+wayland-client.workspace = true
+
+[lints]
+workspace = true

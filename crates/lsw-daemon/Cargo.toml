@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 lsw-proto.workspace = true
 rustix.workspace = true
+zbus.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
