@@ -6,7 +6,8 @@ pkgdesc="Linux Subsystem for Windows: Windows 11 apps on the Linux desktop"
 arch=('x86_64')
 url="https://github.com/The1UNeed/Linux-Subsystem-for-Windows"
 license=('Apache-2.0')
-depends=('qemu-base' 'qemu-ui-dbus' 'qemu-audio-pipewire' 'qemu-hw-usb-host'
+# qemu-ui-dbus loads only with qemu-ui-opengl (as on Debian).
+depends=('qemu-base' 'qemu-ui-dbus' 'qemu-ui-opengl' 'qemu-audio-pipewire' 'qemu-hw-usb-host'
          'qemu-hw-display-virtio-vga' 'qemu-hw-display-virtio-gpu' 'edk2-ovmf'
          'swtpm' 'passt' 'virtiofsd' 'shadow' 'polkit' 'gtk4' 'libadwaita' 'libxkbcommon')
 makedepends=('rustup' 'mingw-w64-gcc' 'git')
