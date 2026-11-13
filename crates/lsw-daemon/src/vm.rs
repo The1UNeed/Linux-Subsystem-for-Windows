@@ -366,6 +366,9 @@ fn spawn_logged(bin: &Path, args: &[String], log: &Path) -> anyhow::Result<Child
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(err_file))
         .kill_on_drop(true)
+        // Own process group: a terminal's Ctrl+C reaches only `lsw`, which
+        // shuts Windows down; QEMU would otherwise quit on the same SIGINT.
+        .process_group(0)
         .spawn()
         .with_context(|| format!("starting {}", bin.display()))
 }

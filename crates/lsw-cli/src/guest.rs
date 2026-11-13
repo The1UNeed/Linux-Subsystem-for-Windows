@@ -47,8 +47,14 @@ pub fn start_detached(program: &str, args: &[&str], unit: &str) -> std::io::Resu
         .unwrap_or_else(|| PathBuf::from(program));
     let systemd = std::process::Command::new("systemd-run")
         .args(["--user", "--collect", "--quiet", "--unit", unit])
-        // The VM supervisor shuts Windows down on SIGTERM (up to 120 s).
-        .args(["--property", "TimeoutStopSec=150"])
+        // The VM supervisor shuts Windows down on SIGTERM (up to 120 s);
+        // only it gets the signal (QEMU would quit on it).
+        .args([
+            "--property",
+            "TimeoutStopSec=150",
+            "--property",
+            "KillMode=mixed",
+        ])
         .arg(&exe)
         .args(args)
         .status();
