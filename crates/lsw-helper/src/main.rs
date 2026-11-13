@@ -14,6 +14,13 @@ use std::path::{Path, PathBuf};
 
 const INTEL: u32 = 0x8086;
 
+/// A PCI function's state before `bind_vfio` touched it.
+struct Original {
+    addr: PciAddr,
+    driver_override: String,
+    driver: Option<String>,
+}
+
 struct Sys {
     /// `/sys/bus/pci`
     pci: PathBuf,
@@ -40,27 +47,77 @@ impl Sys {
             ));
         }
         let set = passthrough_set(&self.devices(), gpu)?;
-        let mut done: Vec<&PciAddr> = Vec::new();
-        for f in &set {
-            if let Err(e) = self.bind_one(f) {
-                // Give back what was already changed.
-                for addr in done {
-                    let _ = self.release_one(addr, true);
+        // Each function's state is recorded before it is touched; any later
+        // failure (including the failing function itself and the VFIO node
+        // ownership) restores every touched function.
+        let mut touched: Vec<Original> = Vec::new();
+        let result = (|| {
+            for f in &set {
+                touched.push(self.snapshot(f));
+                self.bind_one(f)?;
+            }
+            if let (Some(uid), Some(group)) = (user, set[0].iommu_group.as_deref()) {
+                // Only a numeric group name can come from sysfs; never a path.
+                if !group.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(format!("unexpected IOMMU group {group:?}"));
                 }
-                return Err(e);
+                let node = self.vfio.join(group);
+                std::os::unix::fs::chown(&node, Some(uid), None)
+                    .map_err(|e| format!("{}: {e}", node.display()))?;
             }
-            done.push(&f.addr);
-        }
-        if let (Some(uid), Some(group)) = (user, set[0].iommu_group.as_deref()) {
-            // Only a numeric group name can come from sysfs; never a path.
-            if !group.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(format!("unexpected IOMMU group {group:?}"));
+            Ok(())
+        })();
+        if result.is_err() {
+            for original in touched.iter().rev() {
+                self.restore(original);
             }
-            let node = self.vfio.join(group);
-            std::os::unix::fs::chown(&node, Some(uid), None)
-                .map_err(|e| format!("{}: {e}", node.display()))?;
         }
-        Ok(())
+        result
+    }
+
+    fn current_driver(&self, addr: &PciAddr) -> Option<String> {
+        std::fs::read_link(self.devices().join(addr.as_str()).join("driver"))
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+    }
+
+    fn snapshot(&self, f: &lsw_daemon::gpu::PciFunction) -> Original {
+        let dev = self.devices().join(f.addr.as_str());
+        Original {
+            addr: f.addr.clone(),
+            driver_override: std::fs::read_to_string(dev.join("driver_override"))
+                .unwrap_or_default()
+                .trim()
+                .to_owned(),
+            driver: f.driver.clone(),
+        }
+    }
+
+    /// Best effort: put a function back as it was before `bind_vfio`.
+    fn restore(&self, o: &Original) {
+        let dev = self.devices().join(o.addr.as_str());
+        let ov = if o.driver_override.is_empty() || o.driver_override == "(null)" {
+            "\n"
+        } else {
+            o.driver_override.as_str()
+        };
+        let _ = self.write(&dev.join("driver_override"), ov);
+        let now = self.current_driver(&o.addr);
+        if now.is_some() && now != o.driver {
+            let _ = self.write(&dev.join("driver/unbind"), o.addr.as_str());
+        }
+        match &o.driver {
+            Some(d) if self.current_driver(&o.addr).as_deref() != Some(d.as_str()) => {
+                let _ = self.write(
+                    &self.pci.join("drivers").join(d).join("bind"),
+                    o.addr.as_str(),
+                );
+            }
+            Some(_) => {}
+            None => {
+                let _ = self.write(&self.pci.join("drivers_probe"), o.addr.as_str());
+            }
+        }
     }
 
     fn bind_one(&self, f: &lsw_daemon::gpu::PciFunction) -> Result<(), String> {
@@ -220,5 +277,42 @@ mod tests {
             std::fs::read_to_string(sys.devices().join("0000:00:02.0/sriov_numvfs")).unwrap(),
             "2"
         );
+    }
+
+    fn override_of(sys: &Sys, addr: &str) -> String {
+        std::fs::read_to_string(sys.devices().join(addr).join("driver_override"))
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_failing_function_is_rolled_back_with_the_ones_before_it() {
+        let (_t, sys) = fake();
+        // The audio function's override cannot be written.
+        let ov = sys.devices().join("0000:01:00.1/driver_override");
+        std::fs::remove_file(&ov).unwrap();
+        std::fs::create_dir(&ov).unwrap();
+        assert!(run(&s(&["bind-vfio", "0000:01:00.0"]), &sys, None).is_err());
+        assert_eq!(
+            override_of(&sys, "0000:01:00.0"),
+            "\n",
+            "GPU override restored"
+        );
+        // The GPU was given back to its original driver.
+        let bind = sys.pci.join("drivers/nouveau/bind");
+        assert_eq!(
+            std::fs::read_to_string(bind).unwrap_or_default(),
+            "",
+            "still bound: nothing to rebind"
+        );
+    }
+
+    #[test]
+    fn an_ownership_failure_rolls_everything_back() {
+        let (_t, sys) = fake();
+        // The VFIO node for group 14 does not exist: chown fails at the end.
+        assert!(run(&s(&["bind-vfio", "0000:01:00.0"]), &sys, Some(1000)).is_err());
+        for f in ["0000:01:00.0", "0000:01:00.1"] {
+            assert_eq!(override_of(&sys, f), "\n", "{f} override restored");
+        }
     }
 }

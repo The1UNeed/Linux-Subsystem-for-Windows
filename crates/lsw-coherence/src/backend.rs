@@ -163,7 +163,19 @@ async fn connection(
                     }
                 }
             }
-            event = qmp.next_event() => { event?; }
+            event = qmp.next_event() => {
+                // The agent restarted or Windows rebooted: the guest closed
+                // or reopened its Coherence port. Its new engine waits for
+                // Start, so drop this session (the Wayland side clears its
+                // windows) and begin a new one.
+                let event = event?;
+                if event.name == "VSERPORT_CHANGE"
+                    && event.data.get("id").and_then(|v| v.as_str())
+                        == Some(lsw_daemon::qemu::COHERENCE_PORT_ID)
+                {
+                    anyhow::bail!("the guest agent restarted its Coherence port");
+                }
+            }
         }
     }
 }

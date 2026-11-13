@@ -142,7 +142,9 @@ pub struct Payload {
 }
 
 impl Payload {
-    pub async fn load(cache: &Path) -> anyhow::Result<Option<Self>> {
+    /// `require_winfsp`: fail instead of warning when WinFsp cannot be
+    /// fetched (setup media must be complete; a Tools CD can be partial).
+    pub async fn load(cache: &Path, require_winfsp: bool) -> anyhow::Result<Option<Self>> {
         let Some(exe) = find_agent_exe() else {
             return Ok(None);
         };
@@ -150,6 +152,9 @@ impl Payload {
         let build_id = lsw_proto::agent_build_id(env!("CARGO_PKG_VERSION"), &agent);
         let winfsp = match winfsp_msi(cache).await {
             Ok(p) => Some(std::fs::read(p)?),
+            Err(e) if require_winfsp => {
+                return Err(e.context("WinFsp (needed by shared folders) could not be downloaded"));
+            }
             Err(e) => {
                 eprintln!("warning: WinFsp unavailable ({e:#}); shared folders will not work");
                 None
@@ -174,7 +179,7 @@ impl Payload {
 /// Build the LSW Tools CD for this boot; `None` when no agent build exists.
 pub async fn prepare_tools(paths: &VmPaths) -> anyhow::Result<Option<PathBuf>> {
     let cache = cache_dir(paths)?;
-    let Some(payload) = Payload::load(&cache).await? else {
+    let Some(payload) = Payload::load(&cache, false).await? else {
         eprintln!("note: no lsw-agent.exe found; starting without the LSW Tools CD");
         return Ok(None);
     };

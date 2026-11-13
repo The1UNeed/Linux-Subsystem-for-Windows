@@ -81,6 +81,9 @@ if (Test-Path $installer) {
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer -Media $Media
     Stage "agent-exit-$LASTEXITCODE"
     if ($LASTEXITCODE -ne 0) { $failed += 'agent' }
+} else {
+    Stage 'agent-missing'
+    $failed += 'agent-missing'
 }
 
 # 7. The answer file contained the account password; remove every copy.

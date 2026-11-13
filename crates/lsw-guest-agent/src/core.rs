@@ -21,6 +21,24 @@ pub fn should_update(own_build: &str, cd_build: &str, last_attempt: Option<&str>
     !cd_build.is_empty() && cd_build != own_build && last_attempt.map(str::trim) != Some(cd_build)
 }
 
+/// What the LSW Tools installer should be run for, if anything: another
+/// agent build ([`should_update`]), or the CD's build plus `+winfsp` when
+/// WinFsp is missing and the CD carries it (a guest installed without it is
+/// repaired). The result is recorded as the last attempt, so neither loops.
+pub fn install_target(
+    own_build: &str,
+    cd_build: &str,
+    last_attempt: Option<&str>,
+    winfsp_missing: bool,
+) -> Option<String> {
+    let last = last_attempt.map(str::trim);
+    if winfsp_missing {
+        let target = format!("{}+winfsp", cd_build.trim());
+        return (last != Some(target.as_str())).then_some(target);
+    }
+    should_update(own_build, cd_build, last_attempt).then(|| cd_build.trim().to_owned())
+}
+
 /// The largest of `modes` that fits inside `width`×`height`.
 pub fn best_fitting_mode(modes: &[(u32, u32)], width: u32, height: u32) -> Option<(u32, u32)> {
     modes
@@ -426,6 +444,30 @@ mod tests {
             "newer than the failed one"
         );
         assert!(!should_update("v+a", "  ", None), "empty file");
+    }
+
+    #[test]
+    fn a_missing_winfsp_is_repaired_once() {
+        assert_eq!(install_target("v+a", "v+a\n", None, false), None);
+        assert_eq!(
+            install_target("v+a", "v+a\n", None, true).as_deref(),
+            Some("v+a+winfsp"),
+            "same agent build, WinFsp missing"
+        );
+        assert_eq!(
+            install_target("v+a", "v+a", Some("v+a+winfsp\r\n"), true),
+            None,
+            "the repair already failed once"
+        );
+        assert_eq!(
+            install_target("v+a", "v+b", Some("v+a+winfsp"), true).as_deref(),
+            Some("v+b+winfsp"),
+            "a new CD gets a new attempt"
+        );
+        assert_eq!(
+            install_target("v+a", "v+b", None, false).as_deref(),
+            Some("v+b")
+        );
     }
 
     #[test]

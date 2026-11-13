@@ -772,8 +772,9 @@ impl Platform for Windows {
 
 // ------------------------------------------------------------ self-update
 
-/// If the LSW Tools CD carries another agent build, start its installer
-/// (which stops this process and replaces it) and return true.
+/// If the LSW Tools CD carries another agent build, or WinFsp is missing
+/// and the CD carries it, start its installer (which stops this process
+/// and replaces it) and return true.
 fn self_update() -> bool {
     let Ok(exe_path) = std::env::current_exe() else {
         return false;
@@ -792,14 +793,21 @@ fn self_update() -> bool {
     let cd = std::fs::read_to_string(format!("{media}\\lsw\\version.txt")).unwrap_or_default();
     let marker = log_path().with_file_name("update-attempt.txt");
     let last = std::fs::read_to_string(&marker).ok();
-    if !crate::core::should_update(&own, &cd, last.as_deref()) {
+    // A guest installed without WinFsp is repaired once a CD carries it.
+    let program_files_x86 =
+        std::env::var_os("ProgramFiles(x86)").unwrap_or_else(|| "C:\\Program Files (x86)".into());
+    let winfsp_missing = !Path::new(&program_files_x86)
+        .join("WinFsp\\bin\\winfsp-x64.dll")
+        .exists()
+        && Path::new(&format!("{media}\\lsw\\winfsp.msi")).exists();
+    let Some(target) = crate::core::install_target(&own, &cd, last.as_deref(), winfsp_missing)
+    else {
         return false;
-    }
+    };
     log(format!(
-        "updating agent {own} -> {} from {media}",
-        cd.trim()
+        "installing LSW Tools {target} from {media} (agent {own})"
     ));
-    let _ = std::fs::write(&marker, cd.trim());
+    let _ = std::fs::write(&marker, &target);
     let script = format!("{media}\\lsw\\install-agent.ps1");
     Command::new("powershell.exe")
         .args([

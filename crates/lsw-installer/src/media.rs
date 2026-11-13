@@ -280,6 +280,17 @@ mod tests {
     }
 
     #[test]
+    fn missing_prerequisites_fail_the_install() {
+        // No agent installer on the medium: firstboot reports a failure.
+        assert!(FIRSTBOOT_PS1.contains("$failed += 'agent-missing'"));
+        // WinFsp neither installed nor installable: the installer fails.
+        assert!(
+            INSTALL_AGENT_PS1
+                .contains("if (-not (Test-Path $winfspDll)) { Fail \"WinFsp is neither installed")
+        );
+    }
+
+    #[test]
     fn firstboot_reports_completion_marker() {
         assert!(FIRSTBOOT_PS1.contains(crate::unattend::INSTALL_DONE_MARKER));
         assert!(FIRSTBOOT_PS1.contains(crate::unattend::INSTALL_FAILED_MARKER));

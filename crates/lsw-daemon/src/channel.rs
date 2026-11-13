@@ -23,6 +23,8 @@ pub enum ChannelError {
     Protocol(#[from] ProtoError),
     #[error("channel closed")]
     Closed,
+    #[error("the guest is not reading what it asked for; disconnecting")]
+    Overloaded,
 }
 
 /// A framed, bidirectional channel.

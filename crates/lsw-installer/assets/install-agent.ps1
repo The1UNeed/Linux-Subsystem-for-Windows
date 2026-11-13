@@ -22,6 +22,7 @@ if ((Test-Path $winfsp) -and -not (Test-Path $winfspDll)) {
     # 3010: success, reboot required.
     if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { Fail "WinFsp installer exit $($p.ExitCode)" }
 }
+if (-not (Test-Path $winfspDll)) { Fail "WinFsp is neither installed nor on this medium" }
 
 # virtio-win's own service would claim the first virtio-fs device; the LSW
 # agent mounts every share itself.

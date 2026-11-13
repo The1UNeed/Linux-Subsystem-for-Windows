@@ -24,7 +24,9 @@ cargo test --workspace
 
 From a source tree, `lsw` finds the Windows agent next to itself
 (`target/x86_64-pc-windows-gnu/release/lsw-agent.exe`); set `LSW_GUEST_DIR`
-to use another build.
+to use another build. `lsw create` stops if it finds no agent build: a
+Windows installed without it would have no Coherence, shared folders or
+clipboard.
 
 `cargo build` without `--workspace` builds only the crates that need no
 desktop libraries (useful on macOS for the protocol and logic crates).

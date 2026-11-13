@@ -435,7 +435,9 @@ async fn create(name: &str, paths: &VmPaths, a: CreateArgs) -> anyhow::Result<()
         eprintln!("note: Secure Boot is off for this VM (--no-secure-boot).");
     }
     let vars = paths.data.join("OVMF_VARS.fd");
-    firmware::instantiate_vars(&fw, &vars)?;
+    // No vm.json yet: this VM is still being created (possibly a retry of
+    // a failed creation), so its NVRAM must come from this template.
+    firmware::reset_vars(&fw, &vars)?;
 
     let client = download::client()?;
     let virtio_iso = cache.join(format!("virtio-win-{}.iso", download::VIRTIO_WIN_VERSION));
@@ -511,17 +513,23 @@ async fn create(name: &str, paths: &VmPaths, a: CreateArgs) -> anyhow::Result<()
         image_index,
         product_key: None,
     })?;
-    let payload = guest::Payload::load(&cache).await?;
-    match &payload {
-        Some(p) => eprintln!("Including LSW agent {} in the setup medium.", p.build_id),
-        None => eprintln!("note: no lsw-agent.exe found; Windows will install without the agent"),
-    }
+    // The agent and WinFsp are part of a working install: no silent
+    // partial setup medium.
+    let payload = guest::Payload::load(&cache, true).await?.context(
+        "no LSW agent build found (the lsw package ships it in /usr/lib/lsw/guest; from a \
+         source tree, build it with `cargo build --release -p lsw-guest-agent --target \
+         x86_64-pc-windows-gnu` or set LSW_GUEST_DIR)",
+    )?;
+    eprintln!(
+        "Including LSW agent {} in the setup medium.",
+        payload.build_id
+    );
     let setup_iso = paths.data.join("setup.iso");
     media::build_setup_media(
         &setup_iso,
         &xml,
         &media::FirstBootConfig { test_signing },
-        payload.as_ref().map(guest::Payload::as_guest),
+        Some(payload.as_guest()),
     )?;
     restrict_file(&setup_iso)?;
 

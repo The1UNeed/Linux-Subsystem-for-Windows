@@ -7,9 +7,16 @@ use lsw_proto::{
     ClipFormat, ClipboardAssembler, Envelope, FrameDecoder, Message, PROTOCOL_VERSION,
     clipboard_chunks, encode, negotiate,
 };
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
+
+/// Most bytes waiting for the guest to read. A guest that keeps requesting
+/// clipboard content without reading the replies hits this and is
+/// disconnected instead of growing host memory.
+pub const MAX_QUEUED_BYTES: usize = 64 << 20;
 
 /// Something the UI should react to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +51,8 @@ pub struct SessionClient<S> {
     decoder: FrameDecoder,
     buf: Box<[u8]>,
     out: mpsc::UnboundedSender<Vec<u8>>,
+    /// Bytes queued but not yet written (shared with the writer task).
+    queued: Arc<AtomicUsize>,
     next_seq: u64,
     attached: bool,
     /// Host clipboard content offered to the guest, by serial.
@@ -57,9 +66,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> SessionClient<S> {
     pub async fn new(stream: S) -> Result<Self, ChannelError> {
         let (reader, mut writer) = tokio::io::split(stream);
         let (out, mut frames) = mpsc::unbounded_channel::<Vec<u8>>();
+        let queued = Arc::new(AtomicUsize::new(0));
+        let written = queued.clone();
         tokio::spawn(async move {
             while let Some(frame) = frames.recv().await {
-                if writer.write_all(&frame).await.is_err() {
+                let ok = writer.write_all(&frame).await.is_ok();
+                written.fetch_sub(frame.len(), Ordering::AcqRel);
+                if !ok {
                     break;
                 }
             }
@@ -69,6 +82,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> SessionClient<S> {
             decoder: FrameDecoder::new(),
             buf: vec![0u8; 64 * 1024].into_boxed_slice(),
             out,
+            queued,
             next_seq: 1,
             attached: false,
             host_serial: 0,
@@ -88,6 +102,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> SessionClient<S> {
         };
         self.next_seq += 1;
         let frame = encode(&env)?;
+        let len = frame.len();
+        if self.queued.fetch_add(len, Ordering::AcqRel) + len > MAX_QUEUED_BYTES {
+            self.queued.fetch_sub(len, Ordering::AcqRel);
+            return Err(ChannelError::Overloaded);
+        }
         self.out.send(frame).map_err(|_| ChannelError::Closed)
     }
 
@@ -413,5 +432,55 @@ mod tests {
         }
         s.display_hint(800, 600, 100).await.unwrap();
         guest.await.unwrap();
+    }
+
+    /// Regression: a guest that requests the clipboard over and over
+    /// without reading the replies is disconnected at the byte budget
+    /// instead of growing host memory without bound.
+    #[tokio::test]
+    async fn a_guest_that_never_reads_is_cut_off() {
+        let (host, guest) = tokio::io::duplex(4096);
+        let mut s = SessionClient::new(host).await.unwrap();
+        let mut g = Channel::new(guest);
+        let attach = g.recv().await.unwrap();
+        g.reply(
+            attach.seq,
+            Message::Hello {
+                protocol: PROTOCOL_VERSION,
+                agent_version: "t".into(),
+                os_build: "b".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            s.next_event().await.unwrap(),
+            SessionEvent::Attached { .. }
+        ));
+        s.offer(vec![(ClipFormat::Text, vec![b'x'; 700_000])])
+            .await
+            .unwrap();
+        let serial = s.host_serial;
+        // Flood requests; the guest reads nothing after this point.
+        let flood = async {
+            for _ in 0..200 {
+                g.send(Message::ClipboardRequest {
+                    serial,
+                    format: ClipFormat::Text,
+                })
+                .await
+                .unwrap();
+            }
+        };
+        let host_side = async {
+            loop {
+                if let Err(e) = s.next_event().await {
+                    return e;
+                }
+            }
+        };
+        let (_, err) = tokio::join!(flood, host_side);
+        assert!(matches!(err, ChannelError::Overloaded), "{err:?}");
+        assert!(s.queued.load(Ordering::Acquire) <= MAX_QUEUED_BYTES);
     }
 }

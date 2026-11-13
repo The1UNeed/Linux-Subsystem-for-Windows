@@ -85,6 +85,15 @@ pub fn find(root: &Path, want_secure_boot: bool) -> Option<FirmwarePair> {
         })
 }
 
+/// Replace the VM's NVRAM with a fresh copy of the template (atomic). Used
+/// while a VM is being created, so a retried creation never keeps NVRAM
+/// from a template with a different Secure Boot state.
+pub fn reset_vars(pair: &FirmwarePair, dest: &Path) -> std::io::Result<()> {
+    let tmp = dest.with_extension("fd.tmp");
+    std::fs::copy(&pair.vars_template, &tmp)?;
+    std::fs::rename(tmp, dest)
+}
+
 /// Copy the NVRAM template into the VM directory (once; the copy is the
 /// VM's persistent UEFI state).
 pub fn instantiate_vars(pair: &FirmwarePair, dest: &Path) -> std::io::Result<()> {
@@ -153,5 +162,26 @@ mod tests {
         std::fs::write(&dest, b"modified").unwrap();
         instantiate_vars(&pair, &dest).unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"modified");
+    }
+
+    #[test]
+    fn reset_replaces_nvram_from_another_template() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (blank, enrolled) = (tmp.path().join("blank.fd"), tmp.path().join("ms.fd"));
+        std::fs::write(&blank, b"blank").unwrap();
+        std::fs::write(&enrolled, b"ms-keys").unwrap();
+        let dest = tmp.path().join("OVMF_VARS.fd");
+        let pair = |vars: &Path, ms| FirmwarePair {
+            code: tmp.path().join("code.fd"),
+            vars_template: vars.to_path_buf(),
+            ms_keys_enrolled: ms,
+        };
+        // A first, failed creation copied the blank template …
+        instantiate_vars(&pair(&blank, false), &dest).unwrap();
+        // … instantiate keeps it, reset replaces it.
+        instantiate_vars(&pair(&enrolled, true), &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"blank");
+        reset_vars(&pair(&enrolled, true), &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"ms-keys");
     }
 }

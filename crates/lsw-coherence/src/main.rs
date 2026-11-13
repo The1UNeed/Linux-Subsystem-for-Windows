@@ -58,6 +58,17 @@ fn placeholder_size(info: &WindowInfo) -> (u32, u32) {
     }
 }
 
+/// Placeholder size charged against [`MAX_FRAME_BYTES`]: once the budget is
+/// spent, a 64×32 one (8 KiB; at most `MAX_WINDOWS` of them beyond it).
+fn placeholder_within_budget(info: &WindowInfo, held: usize) -> (u32, u32) {
+    let size = placeholder_size(info);
+    if held + size.0 as usize * size.1 as usize * 4 > MAX_FRAME_BYTES {
+        (64, 32)
+    } else {
+        size
+    }
+}
+
 /// Linux input button codes (`linux/input-event-codes.h`).
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
@@ -240,7 +251,8 @@ impl App {
         // capture), but it must still exist on Linux (in the dock) so the
         // user can restore it: show a neutral placeholder until it does.
         let (frame, size) = if info.state == WindowState::Minimized {
-            let size = placeholder_size(&info);
+            let held = self.windows.values().map(|w| w.frame.len()).sum();
+            let size = placeholder_within_budget(&info, held);
             (vec![0xf0; size.0 as usize * size.1 as usize * 4], size)
         } else {
             (Vec::new(), (0, 0))
@@ -948,6 +960,16 @@ mod tests {
         assert_eq!(placeholder_size(&info(0, 0)), (640, 400));
         assert_eq!(placeholder_size(&info(900, 700)), (900, 700));
         assert_eq!(placeholder_size(&info(5000, 3000)), (1280, 800));
+        // Charged against the frame budget.
+        assert_eq!(placeholder_within_budget(&info(900, 700), 0), (900, 700));
+        assert_eq!(
+            placeholder_within_budget(&info(900, 700), MAX_FRAME_BYTES - 900 * 700 * 4),
+            (900, 700)
+        );
+        assert_eq!(
+            placeholder_within_budget(&info(900, 700), MAX_FRAME_BYTES - 900 * 700 * 4 + 1),
+            (64, 32)
+        );
     }
 
     #[test]
