@@ -269,6 +269,9 @@ impl NotReady {
     pub const EXIT_CODE: i32 = 78;
 }
 
+/// How often the ACPI power button is pressed during a shutdown.
+const POWER_BUTTON_REPEAT: Duration = Duration::from_secs(10);
+
 /// How a shutdown ended.
 #[derive(Debug, Clone, Copy)]
 pub enum PowerOff {
@@ -347,17 +350,24 @@ impl Running {
         if let Err(e) = self.qmp.execute("cont", None).await {
             tracing::warn!("cont before shutdown failed: {e}");
         }
-        if let Err(e) = self.qmp.execute("system_powerdown", None).await {
-            tracing::warn!("system_powerdown failed: {e}");
-        }
-        match tokio::time::timeout(grace, self.qemu.wait()).await {
-            Ok(status) => {
-                self.reap_helpers().await;
-                Ok(PowerOff::Clean(status?))
+        // Windows ignores the power button while it boots: press it again
+        // every few seconds until it shuts down or the grace period ends.
+        let deadline = tokio::time::Instant::now() + grace;
+        loop {
+            if let Err(e) = self.qmp.execute("system_powerdown", None).await {
+                tracing::debug!("system_powerdown failed: {e}");
             }
-            Err(_) => {
-                tracing::warn!("guest did not power off within {grace:?}; quitting QEMU");
-                Ok(PowerOff::Forced(grace, self.kill().await?))
+            let next = (tokio::time::Instant::now() + POWER_BUTTON_REPEAT).min(deadline);
+            match tokio::time::timeout_at(next, self.qemu.wait()).await {
+                Ok(status) => {
+                    self.reap_helpers().await;
+                    return Ok(PowerOff::Clean(status?));
+                }
+                Err(_) if next >= deadline => {
+                    tracing::warn!("guest did not power off within {grace:?}; quitting QEMU");
+                    return Ok(PowerOff::Forced(grace, self.kill().await?));
+                }
+                Err(_) => {}
             }
         }
     }

@@ -816,12 +816,22 @@ impl Platform for Windows {
     }
 
     fn set_clock(&mut self, utc_ms: i64, time_zone: &str) -> Result<(), String> {
-        crate::clock::set_system_time(utc_ms)?;
-        if !time_zone.is_empty() && self.time_zone.as_deref() != Some(time_zone) {
-            crate::clock::set_time_zone(time_zone)?;
-            self.time_zone = Some(time_zone.to_owned());
+        // Each part on its own: a failing clock must not keep the zone.
+        let clock = crate::clock::set_system_time(utc_ms);
+        let zone = if !time_zone.is_empty() && self.time_zone.as_deref() != Some(time_zone) {
+            crate::clock::set_time_zone(time_zone).map(|()| {
+                self.time_zone = Some(time_zone.to_owned());
+            })
+        } else {
+            Ok(())
+        };
+        let errors: Vec<String> = [clock, zone].into_iter().filter_map(Result::err).collect();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            log(format!("clock: {}", errors.join("; ")));
+            Err(errors.join("; "))
         }
-        Ok(())
     }
 
     fn clipboard_formats(&mut self) -> Vec<ClipFormat> {

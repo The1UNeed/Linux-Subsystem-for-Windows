@@ -202,12 +202,14 @@ pub fn passthrough_problem(
             }
         }
     }
+    // VFIO also pins ROMs, VGA and firmware memory (libvirt allows 1 GiB).
+    let needed = guest_bytes + (1 << 30);
     match memlock_limit {
-        Some(limit) if limit < guest_bytes => Some(format!(
-            "GPU passthrough locks all of Windows' memory ({} MiB), but the locked-memory \
+        Some(limit) if limit < needed => Some(format!(
+            "GPU passthrough locks all of Windows' memory ({} MiB with device memory), but the locked-memory \
              limit is {} MiB. Raise it for your user session (e.g. LimitMEMLOCK=infinity in \
              a drop-in for user@.service, then log in again); see the user guide",
-            guest_bytes >> 20,
+            needed >> 20,
             limit >> 20
         )),
         _ => None,

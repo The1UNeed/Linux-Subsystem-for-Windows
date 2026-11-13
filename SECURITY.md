@@ -10,8 +10,10 @@
 * **No privileges.** The VM, QEMU (seccomp sandbox), swtpm, passt and
   virtiofsd (its own user namespace) run as the logged-in user. The only
   privileged component is `lsw-helper`, gated by polkit
-  (`dev.lsw.helper.gpu`, administrator authentication), which only binds
-  validated display controllers to `vfio-pci` or creates SR-IOV VFs.
+  (`dev.lsw.helper.gpu`, administrator authentication), which only binds a
+  validated non-boot display controller and every function of its PCI slot
+  (whose IOMMU group must hold nothing else but bridges) to `vfio-pci`, or
+  creates SR-IOV VFs.
 * **Local sockets only.** All sockets live in `0700` directories
   (`$XDG_RUNTIME_DIR/lsw`, `~/.cache/lsw/sock`); the display uses QEMU's
   peer-to-peer D-Bus, never the session bus.

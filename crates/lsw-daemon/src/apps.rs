@@ -55,7 +55,6 @@ fn value(s: &str) -> String {
     s.replace('\\', "\\\\")
 }
 
-/// The desktop entry for `app`, or `None` if any guest-provided field is
 /// Largest icon side accepted from the guest.
 const MAX_ICON_SIDE: u32 = 256;
 
@@ -97,6 +96,7 @@ pub fn clean_icon(png_bytes: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// The desktop entry for `app`, or `None` if any guest-provided field is
 /// not [`launcher_safe`].
 pub fn desktop_entry(app: &AppEntry, lsw: &Path, vm: &str, icon: Option<&Path>) -> Option<String> {
     if !launcher_safe(&app.launch) || !launcher_safe(&app.name) {

@@ -93,9 +93,8 @@ async fn wake(paths: &VmPaths) {
     .await;
 }
 
-/// The same without waiting: input must not wait for a round trip to the
-/// supervisor. Input that reaches a paused VM waits in QEMU and is
-/// delivered when it resumes.
+/// The same without waiting, while a window is visible: then Windows is not
+/// idle-paused and input must not wait for a round trip to the supervisor.
 fn wake_soon(paths: &VmPaths) {
     let api = paths.api_socket();
     tokio::spawn(async move {
@@ -126,6 +125,9 @@ async fn connection(
     wake(paths).await;
     writer.send(&CoMessage::Start { max_fps: MAX_FPS }).await?;
     tracing::info!("Coherence started");
+    // Visible windows as last reported (0: Windows may be idle-paused).
+    let mut visible: u32 = 0;
+    let mut last_motion: Option<(u32, u32)> = None;
     *reported = None;
     loop {
         tokio::select! {
@@ -149,7 +151,8 @@ async fn connection(
                 match req {
                     Request::Guest(msg) => {
                         // Windows may be idle-paused (all windows were
-                        // minimized): user actions need it running.
+                        // minimized): user actions need it running. These
+                        // go over the Coherence channel, which buffers.
                         if matches!(
                             msg,
                             CoMessage::Activate { .. } | CoMessage::Restore { .. } | CoMessage::HitTest { .. }
@@ -158,17 +161,32 @@ async fn connection(
                         }
                         writer.send(&msg).await?
                     }
-                    Request::Motion { x, y } => mouse.set_abs_position(x, y).await?,
+                    Request::Motion { x, y } => {
+                        last_motion = Some((x, y));
+                        mouse.set_abs_position(x, y).await?
+                    }
                     Request::Button { button, down } => {
                         tracing::debug!("button {button} {}", if down { "down" } else { "up" });
                         if down {
-                            wake_soon(paths);
+                            // QEMU drops input while the VM is paused, which
+                            // only happens when no window is visible: then
+                            // wait for the resume and re-send the pointer
+                            // position (moves made while paused were lost).
+                            if visible == 0 {
+                                wake(paths).await;
+                                if let Some((x, y)) = last_motion {
+                                    mouse.set_abs_position(x, y).await?;
+                                }
+                            } else {
+                                wake_soon(paths);
+                            }
                             mouse.press(button).await?
                         } else {
                             mouse.release(button).await?
                         }
                     }
                     Request::WindowCount(count) => {
+                        visible = count;
                         let api = paths.api_socket();
                         tokio::spawn(async move {
                             let _ = lsw_daemon::api::call(
@@ -181,7 +199,11 @@ async fn connection(
                     }
                     Request::Key { qnum, down } => {
                         if down {
-                            wake_soon(paths);
+                            if visible == 0 {
+                                wake(paths).await;
+                            } else {
+                                wake_soon(paths);
+                            }
                             keyboard.press(qnum).await?
                         } else {
                             keyboard.release(qnum).await?

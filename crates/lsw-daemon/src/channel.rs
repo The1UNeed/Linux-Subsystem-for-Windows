@@ -128,8 +128,8 @@ pub struct ControlSession {
     accepted: bool,
     /// Protocol agreed with the agent.
     protocol: u16,
-    /// The host's IANA time zone, if known.
-    time_zone: Option<String>,
+    /// Reads the host's IANA time zone (each time: it can change).
+    time_zone: fn() -> Option<String>,
 }
 
 impl ControlSession {
@@ -138,13 +138,14 @@ impl ControlSession {
             shares,
             accepted: false,
             protocol: 0,
-            time_zone: None,
+            time_zone: || None,
         }
     }
 
-    /// Give the agent this IANA time zone along with the clock.
-    pub fn with_time_zone(mut self, zone: Option<String>) -> Self {
-        self.time_zone = zone.filter(|z| lsw_proto::valid_time_zone(z));
+    /// Give the agent the host's time zone, read by `source`, with the
+    /// clock.
+    pub fn with_time_zone(mut self, source: fn() -> Option<String>) -> Self {
+        self.time_zone = source;
         self
     }
 
@@ -157,10 +158,10 @@ impl ControlSession {
             .duration_since(std::time::UNIX_EPOCH)
             .ok()?
             .as_millis() as i64;
-        Some(Message::Clock {
-            utc_ms,
-            time_zone: self.time_zone.clone().unwrap_or_default(),
-        })
+        let time_zone = (self.time_zone)()
+            .filter(|z| lsw_proto::valid_time_zone(z))
+            .unwrap_or_default();
+        Some(Message::Clock { utc_ms, time_zone })
     }
 
     pub fn accepted(&self) -> bool {
@@ -236,7 +237,12 @@ impl ControlSession {
                 ok: *ok,
                 detail: detail.clone(),
             }),
-            Message::Pong { .. } | Message::Error { .. } => None,
+            Message::Pong { .. } => None,
+            // A request failed in Windows (a clock, a share…): say so.
+            Message::Error { code, detail } => {
+                tracing::warn!("the guest agent reports {code:?}: {detail}");
+                None
+            }
             // Session-channel and host-to-guest messages have no business
             // on the control channel from the guest.
             _ => {
@@ -396,7 +402,8 @@ mod tests {
 
     #[test]
     fn the_clock_goes_to_agents_that_understand_it() {
-        let mut s = ControlSession::new(shares()).with_time_zone(Some("Pacific/Auckland".into()));
+        let mut s =
+            ControlSession::new(shares()).with_time_zone(|| Some("Pacific/Auckland".into()));
         assert!(s.clock().is_none(), "not before the handshake");
         let (out, _) = s.handle(&hello(1, 2));
         let clock = out.iter().find_map(|(_, m)| match m {
@@ -417,9 +424,12 @@ mod tests {
         let (out, _) = old.handle(&hello(1, 1));
         assert!(!out.iter().any(|(_, m)| matches!(m, Message::Clock { .. })));
         assert!(old.clock().is_none());
-        // An invalid host zone is not sent.
-        let s = ControlSession::new(shares()).with_time_zone(Some("../x".into()));
-        assert!(s.time_zone.is_none());
+        // An invalid host zone is not sent (the clock still is).
+        let mut s = ControlSession::new(shares()).with_time_zone(|| Some("../x".into()));
+        s.handle(&hello(1, 2));
+        assert!(
+            matches!(s.clock(), Some(Message::Clock { time_zone, .. }) if time_zone.is_empty())
+        );
     }
 
     #[test]

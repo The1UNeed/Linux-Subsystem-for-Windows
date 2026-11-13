@@ -160,8 +160,9 @@ struct LaunchArgs {
 enum GpuAction {
     /// List display controllers and their IOMMU groups.
     List,
-    /// Give a GPU (and its HDMI/DP audio) to Windows; takes effect at the
-    /// next start. Asks for an administrator password (polkit).
+    /// Give a GPU (with every function of its slot: HDMI/DP audio, USB-C…)
+    /// to Windows from the next start. Asks for an administrator password
+    /// (polkit). Experimental.
     Assign { pci: String },
     /// Give the GPU back to Linux.
     Release,
@@ -737,10 +738,16 @@ fn launch_options(host: &HostReport, l: &LaunchArgs) -> LaunchOptions {
     }
 }
 
+/// How long after QEMU starts the VM is still in its UEFI firmware (no
+/// Windows code runs yet; Windows' boot manager starts after about 4 s).
+const FIRMWARE_STAGE: Duration = Duration::from_secs(4);
+
 /// The signals that end a VM-owning command: Ctrl+C, SIGTERM and SIGHUP.
 /// QEMU runs in its own process group, so without handling them it would
-/// outlive `lsw`.
+/// outlive `lsw`. Created before the VM starts, so a signal during start
+/// is not lost (it is seen right after).
 struct StopSignals {
+    int: tokio::signal::unix::Signal,
     term: tokio::signal::unix::Signal,
     hup: tokio::signal::unix::Signal,
 }
@@ -749,18 +756,58 @@ impl StopSignals {
     fn new() -> anyhow::Result<Self> {
         use tokio::signal::unix::{SignalKind, signal};
         Ok(Self {
+            int: signal(SignalKind::interrupt())?,
             term: signal(SignalKind::terminate())?,
             hup: signal(SignalKind::hangup())?,
         })
     }
 
     async fn recv(&mut self) -> &'static str {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => "Interrupted",
+        let signal = tokio::select! {
+            _ = self.int.recv() => "Interrupted",
             _ = self.term.recv() => "Terminated",
             _ = self.hup.recv() => "Hung up",
+        };
+        if signal == "Hung up" {
+            detach_from_terminal();
+        }
+        signal
+    }
+
+    /// A signal that already arrived (e.g. while the VM was starting).
+    async fn pending(&mut self) -> Option<&'static str> {
+        tokio::select! {
+            biased;
+            signal = self.recv() => Some(signal),
+            () = std::future::ready(()) => None,
         }
     }
+}
+
+/// The terminal is gone: writing to it would fail (and `println!` would
+/// panic, killing QEMU on unwind). Send stdout and stderr to /dev/null.
+fn detach_from_terminal() {
+    if let Ok(null) = std::fs::OpenOptions::new().write(true).open("/dev/null") {
+        let _ = rustix::stdio::dup2_stdout(&null);
+        let _ = rustix::stdio::dup2_stderr(&null);
+    }
+}
+
+/// `println!` that never panics: the supervisor's output may go to a
+/// terminal that has gone away.
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout(), $($arg)*);
+    }};
+}
+
+/// `eprintln!` that never panics (see [`say!`]).
+macro_rules! esay {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
 }
 
 async fn install(
@@ -769,6 +816,7 @@ async fn install(
     screenshot: Option<PathBuf>,
     l: &LaunchArgs,
 ) -> anyhow::Result<()> {
+    let mut stop = StopSignals::new()?;
     let _lock = vm::lock_vm(paths)?;
     let mut cfg = VmConfig::load(&paths.data)?;
     let install = cfg
@@ -779,7 +827,6 @@ async fn install(
     let opts = launch_options(&host, l);
     let _ = std::fs::remove_file(paths.serial_log());
     let started = std::time::Instant::now();
-    let mut stop = StopSignals::new()?;
     let interrupted = |signal: &str| {
         anyhow::anyhow!(
             "{signal}: installation stopped (QEMU was stopped too). The VM is not marked \
@@ -789,6 +836,10 @@ async fn install(
     let mut running = Vm::new(cfg.clone(), paths.clone())
         .start(&host.binaries, &opts)
         .await?;
+    if let Some(signal) = stop.pending().await {
+        running.kill().await?;
+        return Err(interrupted(signal));
+    }
     eprintln!("VM started; getting past the \"Press any key to boot from CD\" prompt…");
     let press =
         running.press_key_repeatedly("ret", Duration::from_millis(500), Duration::from_secs(20));
@@ -866,6 +917,11 @@ async fn install(
 }
 
 async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
+    // Ctrl+C, SIGTERM (systemctl stop, logout, host shutdown) and SIGHUP
+    // (the terminal closed) shut Windows down instead of leaving it
+    // running unsupervised. Handled from the start: one that arrives while
+    // the VM is being prepared is seen before QEMU starts.
+    let mut stop = StopSignals::new()?;
     let _lock = vm::lock_vm(paths)?;
     let cfg = VmConfig::load(&paths.data)?;
     if cfg.install.is_some() {
@@ -877,14 +933,25 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
     opts.tools_iso = match guest::prepare_tools(paths).await {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("warning: LSW Tools CD not built: {e:#}");
+            esay!("warning: LSW Tools CD not built: {e:#}");
             None
         }
     };
     let cfg_name = cfg.name.clone();
+    if let Some(signal) = stop.pending().await {
+        say!("{signal}: not starting Windows.");
+        return Ok(());
+    }
     let mut running = Vm::new(cfg, paths.clone())
         .start(&host.binaries, &opts)
         .await?;
+    let qemu_started = std::time::Instant::now();
+    if let Some(signal) = stop.pending().await {
+        // Windows has not booted yet: nothing to shut down cleanly.
+        say!("{signal}: stopping the VM before Windows starts.");
+        running.kill().await?;
+        return Ok(());
+    }
     let shares: Vec<ShareSpec> = running
         .shares
         .iter()
@@ -893,7 +960,7 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
             folder: s.folder,
         })
         .collect();
-    println!(
+    say!(
         "VM running ({} shared folder(s)). Control it with `lsw ctl …`; Ctrl+C shuts Windows down.",
         shares.len()
     );
@@ -922,10 +989,6 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
             tracing::warn!("API socket: {e}");
         }
     });
-    // Ctrl+C, SIGTERM (systemctl stop, logout, host shutdown) and SIGHUP
-    // (the terminal closed) shut Windows down instead of leaving it
-    // running unsupervised.
-    let mut stop = StopSignals::new()?;
     let result = loop {
         tokio::select! {
             activity = running.next_activity() => match activity {
@@ -957,8 +1020,16 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
                 }
             },
             signal = stop.recv() => {
-                println!("{signal}: shutting Windows down…");
-                println!("{}", running.shutdown(Duration::from_secs(120)).await?);
+                // In the first seconds the VM is still in its firmware: no
+                // Windows to shut down, and a power-button press there is
+                // lost.
+                if qemu_started.elapsed() < FIRMWARE_STAGE {
+                    say!("{signal}: stopping the VM before Windows starts.");
+                    running.kill().await?;
+                    break Ok(());
+                }
+                say!("{signal}: shutting Windows down…");
+                say!("{}", running.shutdown(Duration::from_secs(120)).await?);
                 break Ok(());
             }
             call = call_rx.recv() => {
@@ -972,9 +1043,9 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
                     api::Request::Wake => {
                         if idle.wake(std::time::Instant::now()) == lsw_daemon::idle::Action::Resume {
                             running.resume().await?;
-                            println!("Resumed for a view.");
-                        // The pause stopped Windows' clock.
-                        let _ = cmd_tx.send(ControlCommand::SyncClock);
+                            say!("Resumed for a view.");
+                            // The pause stopped Windows' clock.
+                            let _ = cmd_tx.send(ControlCommand::SyncClock);
                         }
                         let _ = call.reply.send(api::Response::ok());
                         continue;
@@ -991,9 +1062,9 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
                         // The agent must run to answer.
                         if idle.wake(std::time::Instant::now()) == lsw_daemon::idle::Action::Resume {
                             running.resume().await?;
-                            println!("Resumed for a request.");
-                        // The pause stopped Windows' clock.
-                        let _ = cmd_tx.send(ControlCommand::SyncClock);
+                            say!("Resumed for a request.");
+                            // The pause stopped Windows' clock.
+                            let _ = cmd_tx.send(ControlCommand::SyncClock);
                         }
                     }
                 }
@@ -1008,11 +1079,11 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
                 match idle.observe(obs, std::time::Instant::now()) {
                     lsw_daemon::idle::Action::Pause => {
                         running.pause().await?;
-                        println!("Nothing of Windows is visible: paused (0% CPU).");
+                        say!("Nothing of Windows is visible: paused (0% CPU).");
                     }
                     lsw_daemon::idle::Action::Resume => {
                         running.resume().await?;
-                        println!("Resumed.");
+                        say!("Resumed.");
                         // The pause stopped Windows' clock.
                         let _ = cmd_tx.send(ControlCommand::SyncClock);
                     }
@@ -1032,7 +1103,7 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
 /// `Restart=on-failure` applies.
 fn qemu_exit(status: std::process::ExitStatus, paths: &VmPaths) -> anyhow::Result<()> {
     if status.success() {
-        println!("Windows shut down; QEMU exited ({status}).");
+        say!("Windows shut down; QEMU exited ({status}).");
         Ok(())
     } else {
         bail!(
@@ -1176,14 +1247,14 @@ async fn supervise_agent(
             }
         };
         let mut session =
-            ControlSession::new(shares.clone()).with_time_zone(lsw_daemon::host::time_zone());
+            ControlSession::new(shares.clone()).with_time_zone(lsw_daemon::host::time_zone);
         let r = serve_control(&mut channel, &mut session, &mut port_open, &mut commands, |event| match event {
             AgentEvent::Connected {
                 agent_version,
                 os_build,
                 protocol,
             } => {
-                println!("Agent connected: lsw-agent {agent_version}, Windows {os_build}, protocol {protocol}");
+                say!("Agent connected: lsw-agent {agent_version}, Windows {os_build}, protocol {protocol}");
                 connected.store(true, Ordering::Release);
                 if !synced {
                     // Launchers appear once Windows is installed and running.
@@ -1198,9 +1269,9 @@ async fn supervise_agent(
             }
             AgentEvent::Share { tag, ok, detail } => {
                 if ok {
-                    println!("Shared folder {tag} mounted at {detail}");
+                    say!("Shared folder {tag} mounted at {detail}");
                 } else {
-                    println!("Shared folder {tag} failed: {detail}");
+                    say!("Shared folder {tag} failed: {detail}");
                 }
             }
         })

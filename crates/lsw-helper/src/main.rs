@@ -2,10 +2,11 @@
 //! (`pkexec /usr/lib/lsw/lsw-helper …`, action `dev.lsw.helper.gpu`).
 //!
 //! It does three things and nothing else, each on validated PCI addresses
-//! of display controllers (and their same-slot audio functions):
+//! of non-boot display controllers:
 //!
-//! * `bind-vfio ADDR` – hand a GPU (and its HDMI/DP audio) to `vfio-pci`
-//!   and give the invoking user its `/dev/vfio/<group>` node.
+//! * `bind-vfio ADDR` – hand a GPU and every function of its slot (HDMI/DP
+//!   audio, USB-C…; its IOMMU group must hold nothing else but bridges) to
+//!   `vfio-pci` and give the invoking user its `/dev/vfio/<group>` node.
 //! * `release ADDR` – give the devices back to their normal drivers.
 //! * `create-vfs ADDR N` – create N SR-IOV virtual functions on an Intel GPU.
 

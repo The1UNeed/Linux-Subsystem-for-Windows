@@ -1595,6 +1595,7 @@ dependencies = [
  "lsw-daemon",
  "lsw-installer",
  "lsw-proto",
+ "rustix",
  "serde_json",
  "tempfile",
  "tokio",
