@@ -40,6 +40,13 @@ use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface};
 use wayland_client::{Connection, QueueHandle};
 
+/// Most windows mirrored at once (the guest is untrusted).
+const MAX_WINDOWS: usize = 128;
+/// Most memory held for window contents, all windows together.
+const MAX_FRAME_BYTES: usize = 768 << 20;
+/// Guest updates queued between the backend and the Wayland thread.
+const UPDATE_QUEUE: usize = 16;
+
 /// Linux input button codes (`linux/input-event-codes.h`).
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
@@ -118,6 +125,9 @@ struct App {
     reported: Option<u32>,
     /// Ctrl and Super are held (LSW's own shortcuts).
     lsw_modifiers: bool,
+    /// Keys pressed in Windows and not yet released (released on focus
+    /// loss so nothing stays held down).
+    held: std::collections::BTreeSet<u32>,
     vm: String,
     pending: Option<PendingPress>,
     next_hit: u32,
@@ -149,6 +159,13 @@ impl App {
             info.rect.width,
             info.rect.height
         );
+        if self.windows.len() >= MAX_WINDOWS {
+            tracing::warn!(
+                "more than {MAX_WINDOWS} windows: not mirroring {:#x}",
+                info.id
+            );
+            return;
+        }
         let surface = self.compositor.create_surface(&self.qh);
         let size = (info.rect.width.max(1), info.rect.height.max(1));
         let owner = info.owner.and_then(|o| self.windows.get(&o));
@@ -157,8 +174,9 @@ impl App {
                 let Ok(positioner) = XdgPositioner::new(&self.xdg) else {
                     return;
                 };
-                let dx = info.rect.x - parent.info.rect.x;
-                let dy = info.rect.y - parent.info.rect.y;
+                // Coordinates are bounded by validation; saturate anyway.
+                let dx = info.rect.x.saturating_sub(parent.info.rect.x);
+                let dy = info.rect.y.saturating_sub(parent.info.rect.y);
                 positioner.set_size(size.0 as i32, size.1 as i32);
                 positioner.set_anchor_rect(dx, dy, 1, 1);
                 positioner.set_anchor(Anchor::TopLeft);
@@ -237,10 +255,16 @@ impl App {
     }
 
     fn frame(&mut self, id: u64, width: u32, height: u32, tiles: Vec<lsw_proto::coherence::Tile>) {
+        let held: usize = self.windows.values().map(|w| w.frame.len()).sum();
         let Some(w) = self.windows.get_mut(&id) else {
             return;
         };
         if w.size != (width, height) {
+            let needed = width as usize * height as usize * 4;
+            if held - w.frame.len() + needed > MAX_FRAME_BYTES {
+                tracing::warn!("window {id:#x}: frame budget exhausted; frame dropped");
+                return;
+            }
             w.size = (width, height);
             w.frame = vec![0u8; width as usize * height as usize * 4];
             if w.requested == Some((width, height)) {
@@ -314,6 +338,13 @@ impl App {
         }
     }
 
+    /// Release every key still held in Windows (focus left, view closed).
+    fn release_held_keys(&mut self) {
+        for qnum in std::mem::take(&mut self.held) {
+            self.send(Request::Key { qnum, down: false });
+        }
+    }
+
     /// Tell the supervisor how many windows are visible, when it changes.
     fn report_count(&mut self) {
         let visible = self
@@ -355,6 +386,7 @@ impl App {
             },
             Update::Disconnected(reason) => {
                 tracing::info!("Coherence ended: {reason}");
+                self.held.clear();
                 self.windows.clear();
             }
         }
@@ -442,7 +474,7 @@ fn main() -> anyhow::Result<()> {
     let mut event_loop: EventLoop<App> = EventLoop::try_new()?;
     WaylandSource::new(conn.clone(), queue).insert(event_loop.handle())?;
 
-    let (update_tx, update_rx) = cchannel::channel::<Update>();
+    let (update_tx, update_rx) = cchannel::sync_channel::<Update>(UPDATE_QUEUE);
     let to_backend = backend::spawn(paths, update_tx);
     event_loop
         .handle()
@@ -474,6 +506,7 @@ fn main() -> anyhow::Result<()> {
         guest_foreground: None,
         reported: None,
         lsw_modifiers: false,
+        held: Default::default(),
         vm: name.clone(),
         pending: None,
         next_hit: 1,
@@ -777,6 +810,7 @@ impl KeyboardHandler for App {
         _: u32,
     ) {
         self.focused = None;
+        self.release_held_keys();
     }
     fn press_key(
         &mut self,
@@ -792,6 +826,7 @@ impl KeyboardHandler for App {
             return;
         }
         if let Some(qnum) = keymap::evdev_to_qnum(event.raw_code) {
+            self.held.insert(qnum);
             self.send(Request::Key { qnum, down: true });
         }
     }
@@ -804,6 +839,7 @@ impl KeyboardHandler for App {
         event: KeyEvent,
     ) {
         if let Some(qnum) = keymap::evdev_to_qnum(event.raw_code) {
+            self.held.remove(&qnum);
             self.send(Request::Key { qnum, down: false });
         }
     }

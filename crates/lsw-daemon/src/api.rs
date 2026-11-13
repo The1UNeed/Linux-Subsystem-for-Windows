@@ -25,6 +25,9 @@ pub enum Request {
     Windows {
         count: u32,
     },
+    /// A view needs Windows running now (attach, activating or restoring a
+    /// window): resume if paused.
+    Wake,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

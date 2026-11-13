@@ -29,6 +29,30 @@ const EVAL_PAGE: &str = "https://www.microsoft.com/en-us/evalcenter/download-win
 const PROFILE: &str = "606624d44113";
 const MAX_PAGE: usize = 2 << 20;
 
+/// Make sure `dest` holds the file with `sha256` (pinned): a cached copy is
+/// re-hashed on every use and replaced if it does not match.
+pub async fn ensure_pinned(
+    client: &reqwest::Client,
+    url: &str,
+    dest: &Path,
+    sha256: &str,
+    progress: impl FnMut(u64, Option<u64>),
+) -> Result<(), DownloadError> {
+    if dest.exists() {
+        if sha256_file(dest).await?.eq_ignore_ascii_case(sha256) {
+            return Ok(());
+        }
+        tracing::warn!(
+            "{} does not match its pinned SHA-256; downloading again",
+            dest.display()
+        );
+        tokio::fs::remove_file(dest).await?;
+    }
+    download(client, url, dest, Some(sha256), progress)
+        .await
+        .map(|_| ())
+}
+
 /// Pinned WinFsp release (GPLv3 with FLOSS exception), installed in the
 /// guest for virtio-fs shared folders. Downloaded from upstream, never
 /// bundled.

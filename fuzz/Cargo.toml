@@ -1,0 +1,30 @@
+# Coverage-guided fuzzing of every decoder of guest data (cargo-fuzz,
+# nightly): `cargo +nightly fuzz run control_decoder` from this directory.
+# Not a workspace member; the deterministic counterpart runs in the normal
+# test suite (crates/lsw-proto/tests/hostile_input.rs).
+[package]
+name = "lsw-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+lsw-proto = { path = "../crates/lsw-proto" }
+
+[workspace]
+
+[[bin]]
+name = "control_decoder"
+path = "fuzz_targets/control_decoder.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "coherence_decoder"
+path = "fuzz_targets/coherence_decoder.rs"
+test = false
+doc = false

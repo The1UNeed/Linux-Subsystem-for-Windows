@@ -24,6 +24,13 @@ pub const MAX_WINDOW_PIXELS: u64 = 64 << 20;
 /// Most tiles in one frame.
 pub const MAX_TILES: usize = 8192;
 
+/// Largest window edge (virtio-gpu's own limit).
+pub const MAX_EDGE: u32 = 16384;
+
+/// Window positions must lie within this distance of the desktop origin
+/// (multi-monitor desktops may extend to negative coordinates).
+pub const MAX_COORD: i32 = 1 << 16;
+
 /// Tile edge length used by the guest encoder.
 pub const TILE: u32 = 64;
 
@@ -168,7 +175,10 @@ pub enum CoMessage {
 }
 
 fn check_window(width: u32, height: u32) -> Result<(), ProtoError> {
-    if width == 0 || height == 0 || u64::from(width) * u64::from(height) > MAX_WINDOW_PIXELS {
+    if !(1..=MAX_EDGE).contains(&width)
+        || !(1..=MAX_EDGE).contains(&height)
+        || u64::from(width) * u64::from(height) > MAX_WINDOW_PIXELS
+    {
         return Err(ProtoError::BadRange);
     }
     Ok(())
@@ -188,11 +198,16 @@ fn check_info(info: &WindowInfo) -> Result<(), ProtoError> {
             });
         }
     }
-    // Minimized windows report a tiny or empty rectangle; only bound it.
-    if u64::from(info.rect.width) * u64::from(info.rect.height) > MAX_WINDOW_PIXELS {
+    let r = info.rect;
+    if r.x.unsigned_abs() > MAX_COORD as u32 || r.y.unsigned_abs() > MAX_COORD as u32 {
         return Err(ProtoError::BadRange);
     }
-    Ok(())
+    match info.state {
+        // Minimized windows may report an empty rectangle.
+        WindowState::Minimized if r.width <= MAX_EDGE && r.height <= MAX_EDGE => Ok(()),
+        WindowState::Minimized => Err(ProtoError::BadRange),
+        _ => check_window(r.width, r.height),
+    }
 }
 
 impl Wire for CoMessage {
@@ -420,5 +435,30 @@ mod tests {
             long_title.validate(),
             Err(ProtoError::FieldTooLong { .. })
         ));
+        let geometry = |x, y, width, height, state| {
+            CoMessage::Opened(WindowInfo {
+                id: 1,
+                owner: None,
+                kind: WindowKind::Normal,
+                title: String::new(),
+                exe: String::new(),
+                app: String::new(),
+                rect: Rect {
+                    x,
+                    y,
+                    width,
+                    height,
+                },
+                state,
+            })
+            .validate()
+        };
+        let bad = Err(ProtoError::BadRange);
+        assert_eq!(geometry(0, 0, u32::MAX, 0, WindowState::Normal), bad);
+        assert_eq!(geometry(0, 0, 100, 0, WindowState::Normal), bad);
+        assert_eq!(geometry(i32::MIN, 0, 100, 100, WindowState::Normal), bad);
+        assert!(geometry(-1920, 0, 100, 100, WindowState::Normal).is_ok());
+        assert!(geometry(0, 0, 0, 0, WindowState::Minimized).is_ok());
+        assert_eq!(geometry(0, 0, u32::MAX, 1, WindowState::Minimized), bad);
     }
 }

@@ -2,13 +2,14 @@
 //! (the Window/Full Screen app now, the Coherence client in M2): clipboard
 //! in both directions and display size hints.
 
-use crate::channel::{Channel, ChannelError};
+use crate::channel::ChannelError;
 use lsw_proto::{
-    ClipFormat, ClipboardAssembler, Envelope, Message, PROTOCOL_VERSION, clipboard_chunks,
-    negotiate,
+    ClipFormat, ClipboardAssembler, Envelope, FrameDecoder, Message, PROTOCOL_VERSION,
+    clipboard_chunks, encode, negotiate,
 };
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::mpsc;
 
 /// Something the UI should react to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,8 +32,19 @@ pub enum SessionEvent {
     AgentError { detail: String },
 }
 
+/// The UI end of the session channel.
+///
+/// Cancel-safe: [`Self::next_event`] may be dropped mid-way (it runs in a
+/// `select!` with input handling). Its only await point is a socket read
+/// whose bytes go straight into the decoder; replies are queued as whole
+/// frames to a writer task that owns the write half, so a cancelled future
+/// can never leave half a frame on the wire.
 pub struct SessionClient<S> {
-    channel: Channel<S>,
+    reader: tokio::io::ReadHalf<S>,
+    decoder: FrameDecoder,
+    buf: Box<[u8]>,
+    out: mpsc::UnboundedSender<Vec<u8>>,
+    next_seq: u64,
     attached: bool,
     /// Host clipboard content offered to the guest, by serial.
     host_serial: u64,
@@ -40,11 +52,24 @@ pub struct SessionClient<S> {
     assembler: ClipboardAssembler,
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin> SessionClient<S> {
-    /// Wrap a connected channel and send `Attach`.
-    pub async fn new(channel: Channel<S>) -> Result<Self, ChannelError> {
+impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> SessionClient<S> {
+    /// Wrap a connected stream and send `Attach`.
+    pub async fn new(stream: S) -> Result<Self, ChannelError> {
+        let (reader, mut writer) = tokio::io::split(stream);
+        let (out, mut frames) = mpsc::unbounded_channel::<Vec<u8>>();
+        tokio::spawn(async move {
+            while let Some(frame) = frames.recv().await {
+                if writer.write_all(&frame).await.is_err() {
+                    break;
+                }
+            }
+        });
         let mut c = Self {
-            channel,
+            reader,
+            decoder: FrameDecoder::new(),
+            buf: vec![0u8; 64 * 1024].into_boxed_slice(),
+            out,
+            next_seq: 1,
             attached: false,
             host_serial: 0,
             host_items: Vec::new(),
@@ -54,16 +79,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin> SessionClient<S> {
         Ok(c)
     }
 
+    /// Queue one whole frame.
+    fn queue(&mut self, reply_to: Option<u64>, msg: Message) -> Result<(), ChannelError> {
+        let env = Envelope {
+            seq: self.next_seq,
+            reply_to,
+            msg,
+        };
+        self.next_seq += 1;
+        let frame = encode(&env)?;
+        self.out.send(frame).map_err(|_| ChannelError::Closed)
+    }
+
     /// Ask the agent to introduce itself (on connect and whenever the guest
     /// reopens its port).
     pub async fn attach(&mut self) -> Result<(), ChannelError> {
         self.attached = false;
-        self.channel
-            .send(Message::Attach {
+        self.queue(
+            None,
+            Message::Attach {
                 protocol: PROTOCOL_VERSION,
-            })
-            .await
-            .map(|_| ())
+            },
+        )
     }
 
     pub fn attached(&self) -> bool {
@@ -77,12 +114,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> SessionClient<S> {
         let formats = items.iter().map(|(f, _)| *f).collect();
         self.host_items = items;
         if self.attached {
-            self.channel
-                .send(Message::ClipboardOffer {
-                    serial: self.host_serial,
-                    formats,
-                })
-                .await?;
+            let serial = self.host_serial;
+            self.queue(None, Message::ClipboardOffer { serial, formats })?;
         }
         Ok(())
     }
@@ -90,10 +123,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> SessionClient<S> {
     /// Request the guest clipboard `serial` in `format`; the data arrives as
     /// [`SessionEvent::GuestClipboardData`].
     pub async fn fetch(&mut self, serial: u64, format: ClipFormat) -> Result<(), ChannelError> {
-        self.channel
-            .send(Message::ClipboardRequest { serial, format })
-            .await
-            .map(|_| ())
+        self.queue(None, Message::ClipboardRequest { serial, format })
     }
 
     /// Resize the Windows display.
@@ -103,28 +133,35 @@ impl<S: AsyncRead + AsyncWrite + Unpin> SessionClient<S> {
         height: u32,
         scale_percent: u16,
     ) -> Result<(), ChannelError> {
-        self.channel
-            .send(Message::DisplayHint {
+        self.queue(
+            None,
+            Message::DisplayHint {
                 width,
                 height,
                 scale_percent,
-            })
-            .await
-            .map(|_| ())
+            },
+        )
     }
 
     /// Process guest messages until something the UI cares about happens.
     /// Handshake replies, pings and clipboard requests are answered here.
+    /// Cancel-safe (see the type documentation).
     pub async fn next_event(&mut self) -> Result<SessionEvent, ChannelError> {
         loop {
-            let env = self.channel.recv().await?;
-            if let Some(event) = self.handle(env).await? {
-                return Ok(event);
+            while let Some(env) = self.decoder.next_envelope()? {
+                if let Some(event) = self.handle(env)? {
+                    return Ok(event);
+                }
             }
+            let n = self.reader.read(&mut self.buf).await?;
+            if n == 0 {
+                return Err(ChannelError::Closed);
+            }
+            self.decoder.push(&self.buf[..n])?;
         }
     }
 
-    async fn handle(&mut self, env: Envelope) -> Result<Option<SessionEvent>, ChannelError> {
+    fn handle(&mut self, env: Envelope) -> Result<Option<SessionEvent>, ChannelError> {
         match env.msg {
             Message::Hello {
                 protocol,
@@ -132,19 +169,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> SessionClient<S> {
                 ..
             } => match negotiate(protocol) {
                 Ok(v) => {
-                    self.channel
-                        .reply(env.seq, Message::Welcome { protocol: v })
-                        .await?;
+                    self.queue(Some(env.seq), Message::Welcome { protocol: v })?;
                     self.attached = true;
                     // Bring Windows up to date with the host clipboard.
                     if !self.host_items.is_empty() {
                         let formats = self.host_items.iter().map(|(f, _)| *f).collect();
-                        self.channel
-                            .send(Message::ClipboardOffer {
-                                serial: self.host_serial,
-                                formats,
-                            })
-                            .await?;
+                        let serial = self.host_serial;
+                        self.queue(None, Message::ClipboardOffer { serial, formats })?;
                     }
                     Ok(Some(SessionEvent::Attached { agent_version }))
                 }
@@ -154,7 +185,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> SessionClient<S> {
             },
             _ if !self.attached => Ok(None),
             Message::Ping { nonce } => {
-                self.channel.reply(env.seq, Message::Pong { nonce }).await?;
+                self.queue(Some(env.seq), Message::Pong { nonce })?;
                 Ok(None)
             }
             Message::ClipboardOffer { serial, formats } => {
@@ -173,7 +204,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> SessionClient<S> {
                 let frames = clipboard_chunks(serial, format, &data)
                     .unwrap_or_else(|_| clipboard_chunks(serial, format, &[]).unwrap_or_default());
                 for frame in frames {
-                    self.channel.reply(env.seq, frame).await?;
+                    self.queue(Some(env.seq), frame)?;
                 }
                 Ok(None)
             }
@@ -202,12 +233,23 @@ impl<S: AsyncRead + AsyncWrite + Unpin> SessionClient<S> {
 pub async fn connect(
     path: &std::path::Path,
 ) -> Result<SessionClient<tokio::net::UnixStream>, ChannelError> {
-    SessionClient::new(Channel::connect(path, Duration::from_secs(5)).await?).await
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let stream = loop {
+        match tokio::net::UnixStream::connect(path).await {
+            Ok(s) => break s,
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
+    SessionClient::new(stream).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channel::Channel;
 
     /// A guest that answers Attach, offers its clipboard, and serves a
     /// request; then accepts the host's offer by requesting it.
@@ -271,7 +313,7 @@ mod tests {
     async fn clipboard_both_ways_and_display_hint() {
         let (host, guest) = tokio::io::duplex(1 << 16);
         let guest = tokio::spawn(fake_guest(guest));
-        let mut s = SessionClient::new(Channel::new(host)).await.unwrap();
+        let mut s = SessionClient::new(host).await.unwrap();
         assert!(matches!(
             s.next_event().await.unwrap(),
             SessionEvent::Attached { .. }
@@ -299,6 +341,77 @@ mod tests {
             s.display_hint(1600, 900, 100).await.unwrap();
         };
         pump.await;
+        guest.await.unwrap();
+    }
+
+    /// Regression: cancelling `next_event` while it answers a large
+    /// clipboard request (input arriving in a `select!`) used to leave half
+    /// a frame on the wire.
+    #[tokio::test]
+    async fn cancelling_next_event_never_splits_a_frame() {
+        let (host, guest) = tokio::io::duplex(1024); // small: writes block
+        let guest = tokio::spawn(async move {
+            let mut g = Channel::new(guest);
+            let attach = g.recv().await.unwrap();
+            g.reply(
+                attach.seq,
+                Message::Hello {
+                    protocol: PROTOCOL_VERSION,
+                    agent_version: "t".into(),
+                    os_build: "b".into(),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                g.recv().await.unwrap().msg,
+                Message::Welcome { .. }
+            ));
+            let Message::ClipboardOffer { serial, .. } = g.recv().await.unwrap().msg else {
+                panic!()
+            };
+            g.send(Message::ClipboardRequest {
+                serial,
+                format: ClipFormat::Text,
+            })
+            .await
+            .unwrap();
+            // Every frame decodes: the data arrives whole, then the hint.
+            let mut asm = ClipboardAssembler::default();
+            let data = loop {
+                let Message::ClipboardData {
+                    serial,
+                    format,
+                    total,
+                    offset,
+                    chunk,
+                } = g.recv().await.unwrap().msg
+                else {
+                    panic!("frame boundary lost")
+                };
+                if let Some((_, _, d)) = asm.push(serial, format, total, offset, &chunk).unwrap() {
+                    break d;
+                }
+            };
+            assert_eq!(data.len(), 700_000);
+            assert!(matches!(
+                g.recv().await.unwrap().msg,
+                Message::DisplayHint { .. }
+            ));
+        });
+        let mut s = SessionClient::new(host).await.unwrap();
+        s.offer(vec![(ClipFormat::Text, vec![b'x'; 700_000])])
+            .await
+            .unwrap();
+        // Keep cancelling next_event, as input handling does.
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_millis(500) {
+            tokio::select! {
+                _ = s.next_event() => {}
+                _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+            }
+        }
+        s.display_hint(800, 600, 100).await.unwrap();
         guest.await.unwrap();
     }
 }

@@ -31,14 +31,25 @@ impl Sys {
     }
 
     fn bind_vfio(&self, gpu: &PciAddr, user: Option<u32>) -> Result<(), String> {
+        // Never take the GPU that drives the Linux console/desktop.
+        let boot_vga = std::fs::read_to_string(self.devices().join(gpu.as_str()).join("boot_vga"))
+            .is_ok_and(|v| v.trim() == "1");
+        if boot_vga {
+            return Err(format!(
+                "{gpu} drives the Linux display; assign a second GPU"
+            ));
+        }
         let set = passthrough_set(&self.devices(), gpu)?;
+        let mut done: Vec<&PciAddr> = Vec::new();
         for f in &set {
-            let dev = self.devices().join(f.addr.as_str());
-            self.write(&dev.join("driver_override"), "vfio-pci")?;
-            if f.driver.is_some() && f.driver.as_deref() != Some("vfio-pci") {
-                self.write(&dev.join("driver/unbind"), f.addr.as_str())?;
+            if let Err(e) = self.bind_one(f) {
+                // Give back what was already changed.
+                for addr in done {
+                    let _ = self.release_one(addr, true);
+                }
+                return Err(e);
             }
-            self.write(&self.pci.join("drivers_probe"), f.addr.as_str())?;
+            done.push(&f.addr);
         }
         if let (Some(uid), Some(group)) = (user, set[0].iommu_group.as_deref()) {
             // Only a numeric group name can come from sysfs; never a path.
@@ -52,15 +63,28 @@ impl Sys {
         Ok(())
     }
 
+    fn bind_one(&self, f: &lsw_daemon::gpu::PciFunction) -> Result<(), String> {
+        let dev = self.devices().join(f.addr.as_str());
+        self.write(&dev.join("driver_override"), "vfio-pci")?;
+        if f.driver.is_some() && f.driver.as_deref() != Some("vfio-pci") {
+            self.write(&dev.join("driver/unbind"), f.addr.as_str())?;
+        }
+        self.write(&self.pci.join("drivers_probe"), f.addr.as_str())
+    }
+
+    fn release_one(&self, addr: &PciAddr, on_vfio: bool) -> Result<(), String> {
+        let dev = self.devices().join(addr.as_str());
+        self.write(&dev.join("driver_override"), "\n")?;
+        if on_vfio {
+            self.write(&dev.join("driver/unbind"), addr.as_str())?;
+        }
+        self.write(&self.pci.join("drivers_probe"), addr.as_str())
+    }
+
     fn release(&self, gpu: &PciAddr) -> Result<(), String> {
         let set = passthrough_set(&self.devices(), gpu)?;
         for f in &set {
-            let dev = self.devices().join(f.addr.as_str());
-            self.write(&dev.join("driver_override"), "\n")?;
-            if f.driver.as_deref() == Some("vfio-pci") {
-                self.write(&dev.join("driver/unbind"), f.addr.as_str())?;
-            }
-            self.write(&self.pci.join("drivers_probe"), f.addr.as_str())?;
+            self.release_one(&f.addr, f.driver.as_deref() == Some("vfio-pci"))?;
         }
         Ok(())
     }
@@ -145,6 +169,7 @@ mod tests {
         mk("0000:01:00.0", "0x10de", "0x030000", "14", "nouveau");
         mk("0000:01:00.1", "0x10de", "0x040300", "14", "snd_hda_intel");
         mk("0000:00:02.0", "0x8086", "0x030000", "0", "i915");
+        std::fs::write(pci.join("devices/0000:00:02.0/boot_vga"), "1\n").unwrap();
         std::fs::write(pci.join("devices/0000:00:02.0/sriov_totalvfs"), "7\n").unwrap();
         std::fs::write(pci.join("drivers_probe"), "").unwrap();
         let vfio = tmp.path().join("vfio");
@@ -180,6 +205,8 @@ mod tests {
         assert!(run(&s(&["bind-vfio", "../../etc"]), &sys, None).is_err());
         assert!(run(&s(&["bind-vfio"]), &sys, None).is_err());
         assert!(run(&s(&["rm", "-rf"]), &sys, None).is_err());
+        let e = run(&s(&["bind-vfio", "0000:00:02.0"]), &sys, None).unwrap_err();
+        assert!(e.contains("drives the Linux display"), "{e}");
         assert!(
             run(&s(&["create-vfs", "0000:01:00.0", "2"]), &sys, None).is_err(),
             "not Intel"

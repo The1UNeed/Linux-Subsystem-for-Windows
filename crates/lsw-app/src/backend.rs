@@ -256,6 +256,9 @@ async fn session_loop(
     let mut guest_clip: Vec<(ClipFormat, Vec<u8>)> = Vec::new();
     let mut guest_pending: Vec<ClipFormat> = Vec::new();
     let mut last_size = (0u32, 0u32);
+    // The session channel is optional and may come and go (agent restart,
+    // update): retry it independently of the display.
+    let mut session_retry = tokio::time::interval(Duration::from_secs(3));
 
     loop {
         tokio::select! {
@@ -298,7 +301,19 @@ async fn session_loop(
             }
             // QMP closes when QEMU exits: that ends this connection.
             event = qmp.next_event() => {
-                event?;
+                let event = event?;
+                // The agent reopened its session port (restart, update):
+                // it waits for Attach before it speaks.
+                let session_port = event.name == "VSERPORT_CHANGE"
+                    && event.data.get("id").and_then(|v| v.as_str())
+                        == Some(lsw_daemon::qemu::SESSION_PORT_ID)
+                    && event.data.get("open").and_then(|v| v.as_bool()) == Some(true);
+                if session_port && let Some(s) = session.as_mut() {
+                    s.attach().await?;
+                }
+            }
+            _ = session_retry.tick(), if session.is_none() => {
+                session = session::connect(&paths.session_socket()).await.ok();
             }
             event = async {
                 match session.as_mut() {

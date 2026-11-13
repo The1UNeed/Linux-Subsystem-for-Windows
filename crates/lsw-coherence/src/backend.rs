@@ -6,7 +6,7 @@ use lsw_daemon::display::{KeyboardProxy, MouseProxy};
 use lsw_daemon::paths::VmPaths;
 use lsw_daemon::qmp::Qmp;
 use lsw_proto::coherence::CoMessage;
-use smithay_client_toolkit::reexports::calloop::channel::Sender;
+use smithay_client_toolkit::reexports::calloop::channel::SyncSender as Sender;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -76,6 +76,16 @@ async fn run(
     }
 }
 
+/// Ask the supervisor to resume Windows if it is idle-paused.
+async fn wake(paths: &VmPaths) {
+    let _ = lsw_daemon::api::call(
+        &paths.api_socket(),
+        &lsw_daemon::api::Request::Wake,
+        Duration::from_secs(2),
+    )
+    .await;
+}
+
 async fn connection(
     paths: &VmPaths,
     updates: &Sender<Update>,
@@ -89,12 +99,17 @@ async fn connection(
     let mouse = MouseProxy::new(&display).await?;
     let (mut reader, mut writer) =
         lsw_daemon::coherence::connect(&paths.coherence_socket(), Duration::from_secs(5)).await?;
+    wake(paths).await;
     writer.send(&CoMessage::Start { max_fps: MAX_FPS }).await?;
     tracing::info!("Coherence started");
     loop {
         tokio::select! {
             msg = reader.recv() => {
-                if updates.send(Update::Guest(msg?)).is_err() {
+                // Bounded queue: when the Wayland side falls behind, this
+                // blocks, the socket stops being read and the guest is
+                // slowed down instead of filling host memory.
+                let msg = msg?;
+                if tokio::task::block_in_place(|| updates.send(Update::Guest(msg))).is_err() {
                     return Ok(());
                 }
             }
@@ -104,7 +119,14 @@ async fn connection(
                     return Ok(());
                 };
                 match req {
-                    Request::Guest(msg) => writer.send(&msg).await?,
+                    Request::Guest(msg) => {
+                        // Windows may be idle-paused (all windows were
+                        // minimized): it must run to restore a window.
+                        if matches!(msg, CoMessage::Activate { .. } | CoMessage::Restore { .. }) {
+                            wake(paths).await;
+                        }
+                        writer.send(&msg).await?
+                    }
                     Request::Motion { x, y } => mouse.set_abs_position(x, y).await?,
                     Request::Button { button, down } => {
                         tracing::debug!("button {button} {}", if down { "down" } else { "up" });

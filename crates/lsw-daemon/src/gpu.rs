@@ -144,28 +144,34 @@ pub fn passthrough_set(sysfs: &Path, gpu: &PciAddr) -> Result<Vec<PciFunction>, 
 /// QEMU arguments passing `functions` through on fixed slots, keeping the
 /// multi-function layout (GPU at .0, its audio at .1 …).
 pub fn qemu_args(functions: &[PciAddr]) -> Vec<String> {
-    let mut slots: Vec<&str> = Vec::new();
-    let mut args = Vec::new();
+    // Group by host slot; each group gets one guest slot.
+    let mut groups: Vec<(&str, Vec<&PciAddr>)> = Vec::new();
     for f in functions {
-        let idx = match slots.iter().position(|s| *s == f.slot()) {
-            Some(i) => i,
-            None => {
-                slots.push(f.slot());
-                slots.len() - 1
-            }
-        };
+        match groups.iter_mut().find(|(s, _)| *s == f.slot()) {
+            Some((_, g)) => g.push(f),
+            None => groups.push((f.slot(), vec![f])),
+        }
+    }
+    let mut args = Vec::new();
+    for (idx, (_, group)) in groups.iter().enumerate() {
         let slot = PASSTHROUGH_SLOT + idx as u8;
-        let multi = if f.function() == 0 {
-            ",multifunction=on"
-        } else {
-            ""
-        };
-        args.push("-device".into());
-        args.push(format!(
-            "vfio-pci,host={},bus=pcie.0,addr={slot:#04x}.{}{multi}",
-            f.as_str(),
-            f.function()
-        ));
+        // A GPU with its audio keeps its layout (.0 + .1). A group without
+        // a function 0 (e.g. an SR-IOV VF at 00:02.1) is renumbered from
+        // .0, or the guest's PCI scan would never find it.
+        let keep = group.iter().any(|f| f.function() == 0);
+        for (i, f) in group.iter().enumerate() {
+            let func = if keep { f.function() } else { i as u8 };
+            let multi = if func == 0 && group.len() > 1 {
+                ",multifunction=on"
+            } else {
+                ""
+            };
+            args.push("-device".into());
+            args.push(format!(
+                "vfio-pci,host={},bus=pcie.0,addr={slot:#04x}.{func}{multi}",
+                f.as_str()
+            ));
+        }
     }
     args
 }
@@ -231,6 +237,12 @@ mod tests {
             args,
             "-device vfio-pci,host=0000:01:00.0,bus=pcie.0,addr=0x08.0,multifunction=on \
              -device vfio-pci,host=0000:01:00.1,bus=pcie.0,addr=0x08.1"
+        );
+        // An isolated SR-IOV VF lands on function 0 of its own slot.
+        let vf = qemu_args(&[PciAddr::parse("0000:00:02.1").unwrap()]).join(" ");
+        assert_eq!(
+            vf,
+            "-device vfio-pci,host=0000:00:02.1,bus=pcie.0,addr=0x08.0"
         );
         // Audio in a different group cannot be passed through safely.
         func(&sys, "0000:02:00.0", "0x1002", "0x030000", "20", "amdgpu");

@@ -69,6 +69,15 @@ enum Input {
     Lost,
 }
 
+/// Why the engine stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EngineEnd {
+    /// A write failed: the host client left. Wait for the next `Start`.
+    HostGone,
+    /// The port failed and its reader exited: reopen it.
+    PortLost,
+}
+
 /// Start the Coherence port and engine threads.
 pub fn spawn() {
     std::thread::Builder::new()
@@ -87,9 +96,13 @@ fn run() {
                 continue;
             }
         };
+        // One port and one reader for the port's whole life. A host that
+        // goes away only stops the engine until the next Start; the port is
+        // reopened only when the port itself fails (its reader then exits).
         let (tx, rx) = channel();
         reader(port.clone(), tx);
-        engine(&port, &rx);
+        while engine(&port, &rx) == EngineEnd::HostGone {}
+        drop(port);
         std::thread::sleep(Duration::from_secs(1));
     }
 }
@@ -579,7 +592,7 @@ fn is_tracked_window(windows: &HashMap<u64, Tracked>, id: u64) -> Option<HWND> {
 
 // ---------------------------------------------------------------- engine
 
-fn engine(port: &Port, rx: &Receiver<Input>) {
+fn engine(port: &Port, rx: &Receiver<Input>) -> EngineEnd {
     // SAFETY: per-thread WinRT initialization.
     let _ = unsafe { RoInitialize(RO_INIT_MULTITHREADED) };
     let writer = Writer {
@@ -664,7 +677,7 @@ fn engine(port: &Port, rx: &Receiver<Input>) {
                 }
                 _ => {} // guest-to-host messages are ignored
             },
-            Ok(Input::Lost) | Err(RecvTimeoutError::Disconnected) => return,
+            Ok(Input::Lost) | Err(RecvTimeoutError::Disconnected) => return EngineEnd::PortLost,
             Err(RecvTimeoutError::Timeout) => {}
         }
         if !enabled || Instant::now() < next_tick {
@@ -678,7 +691,7 @@ fn engine(port: &Port, rx: &Receiver<Input>) {
             &mut captures,
             &mut foreground,
         ) {
-            return; // the host stopped reading
+            return EngineEnd::HostGone; // the host stopped reading
         }
     }
 }

@@ -282,6 +282,8 @@ mod tests {
     #[test]
     fn firstboot_reports_completion_marker() {
         assert!(FIRSTBOOT_PS1.contains(crate::unattend::INSTALL_DONE_MARKER));
+        assert!(FIRSTBOOT_PS1.contains(crate::unattend::INSTALL_FAILED_MARKER));
+        assert!(INSTALL_AGENT_PS1.contains("exit 1"));
         assert!(FIRSTBOOT_PS1.is_ascii());
         assert!(INSTALL_AGENT_PS1.is_ascii());
         assert!(FIRSTBOOT_PS1.contains("install-agent.ps1"));

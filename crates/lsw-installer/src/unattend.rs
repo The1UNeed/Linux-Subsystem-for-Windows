@@ -32,6 +32,12 @@ pub const PE_DRIVE_LETTERS: &[char] = &['D', 'E', 'F', 'G', 'H'];
 /// Name of the serial-console line the first-boot script prints when done.
 pub const INSTALL_DONE_MARKER: &str = "LSW_INSTALL_DONE";
 
+/// Serial-console marker for a first boot whose required steps failed.
+pub const INSTALL_FAILED_MARKER: &str = "LSW_INSTALL_FAILED";
+
+/// Prefix shared by both outcome markers.
+pub const INSTALL_OUTCOME_PREFIX: &str = "LSW_INSTALL_";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnattendOptions {
     /// Local account name (Windows rules: 1-20 chars, no `"/\[]:;|=,+*?<>@`).

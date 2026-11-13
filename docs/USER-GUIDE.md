@@ -24,11 +24,17 @@ lsw create [--profile productivity|development|games] [--source consumer|evaluat
 ```
 
 prepares the VM. By default it downloads Windows 11 from Microsoft and
-checks it against the SHA-256 Microsoft publishes. Some networks (VPNs,
+refuses it unless it matches the SHA-256 Microsoft publishes
+(`--source evaluation` downloads the 90-day Enterprise Evaluation, for which
+Microsoft publishes no checksum). Some networks (VPNs,
 cloud machines) are refused by Microsoft; then download the ISO in a browser
 and use `--source iso --iso Win11.iso`. The Windows account is named after
 your Linux user; its password is stored in the VM directory
 (`credentials.json`, readable only by you).
+
+Secure Boot needs UEFI firmware with Microsoft's keys enrolled (Ubuntu's
+`ovmf` package). Where it is missing (Arch's `edk2-ovmf`), `lsw create` stops
+and explains; `--no-secure-boot` creates the VM with Secure Boot off.
 
 Profiles: Productivity 8 GB / 4 cores / 128 GB, Development and Games
 16 GB / 8 cores / 256 GB, never more than half of your machine. The disk is a
@@ -58,7 +64,7 @@ or run it in a terminal with `lsw run` (Ctrl+C shuts Windows down cleanly).
   the same folders on both sides. Turn this off at creation with
   `--no-shared-folders`.
 * **Clipboard**: copy on one side, paste on the other (text, formatted text,
-  images).
+  images) while the Window or Full Screen view is open; not yet in Coherence.
 * **USB**: `lsw usb list`, then `lsw usb attach 1-4` (or `VID:PID`);
   `lsw usb detach …` gives it back. Your user needs access to the device
   node; the error message says how.

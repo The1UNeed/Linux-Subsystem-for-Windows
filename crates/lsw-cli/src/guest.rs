@@ -123,17 +123,14 @@ pub fn cache_dir(paths: &VmPaths) -> anyhow::Result<PathBuf> {
 /// The pinned WinFsp MSI, downloaded once into the cache.
 pub async fn winfsp_msi(cache: &Path) -> anyhow::Result<PathBuf> {
     let dest = cache.join(format!("winfsp-{}.msi", download::WINFSP_VERSION));
-    if !dest.exists() {
-        eprintln!("Downloading WinFsp {}…", download::WINFSP_VERSION);
-        download::download(
-            &download::client()?,
-            download::WINFSP_URL,
-            &dest,
-            Some(download::WINFSP_SHA256),
-            |_, _| {},
-        )
-        .await?;
-    }
+    download::ensure_pinned(
+        &download::client()?,
+        download::WINFSP_URL,
+        &dest,
+        download::WINFSP_SHA256,
+        |_, _| {},
+    )
+    .await?;
     Ok(dest)
 }
 

@@ -741,7 +741,7 @@ mod tests {
         let mut c = cfg(Path::new("/d"));
         c.passthrough = vec![crate::gpu::PciAddr::parse("0000:01:00.0").unwrap()];
         let s = joined(&build_args(&c, &paths, &LaunchOptions::default()));
-        assert!(s.contains("vfio-pci,host=0000:01:00.0,bus=pcie.0,addr=0x08.0,multifunction=on"));
+        assert!(s.contains("vfio-pci,host=0000:01:00.0,bus=pcie.0,addr=0x08.0"));
         assert!(s.contains("free-page-reporting=off"));
     }
 

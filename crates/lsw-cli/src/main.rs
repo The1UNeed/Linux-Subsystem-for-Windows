@@ -370,6 +370,10 @@ struct CreateArgs {
     /// folders with Windows.
     #[arg(long)]
     no_shared_folders: bool,
+    /// Create the VM with Secure Boot off (when no firmware with Microsoft's
+    /// keys is installed).
+    #[arg(long)]
+    no_secure_boot: bool,
 }
 
 async fn create(name: &str, paths: &VmPaths, a: CreateArgs) -> anyhow::Result<()> {
@@ -413,31 +417,41 @@ async fn create(name: &str, paths: &VmPaths, a: CreateArgs) -> anyhow::Result<()
     // Tier A's test-signed driver needs Secure Boot off (alpha decision);
     // never without the driver itself.
     let test_signing = tier == GpuTier::A && lsw_daemon::gpu::TIER_A_DRIVER_READY;
-    let fw = firmware::find(Path::new("/"), !test_signing)
-        .or_else(|| firmware::find(Path::new("/"), false))
-        .context(
-            "no OVMF firmware found; install the 'ovmf' (Ubuntu) or 'edk2-ovmf' (Arch) package",
-        )?;
+    // Secure Boot with Microsoft's keys, or an explicit decision not to:
+    // never a silent downgrade.
+    let want_secure_boot = !test_signing && !a.no_secure_boot;
+    let fw = match firmware::find(Path::new("/"), want_secure_boot) {
+        Some(fw) => fw,
+        None if want_secure_boot && firmware::find(Path::new("/"), false).is_some() => bail!(
+            "no UEFI firmware with Microsoft's Secure Boot keys enrolled was found (Ubuntu's \
+             'ovmf' package has one; Arch's 'edk2-ovmf' does not). Install one, or run \
+             `lsw create --no-secure-boot` to create a VM with Secure Boot off."
+        ),
+        None => bail!(
+            "no OVMF firmware found; install the 'ovmf' (Ubuntu) or 'edk2-ovmf' (Arch) package"
+        ),
+    };
+    if !fw.ms_keys_enrolled {
+        eprintln!("note: Secure Boot is off for this VM (--no-secure-boot).");
+    }
     let vars = paths.data.join("OVMF_VARS.fd");
     firmware::instantiate_vars(&fw, &vars)?;
 
     let client = download::client()?;
     let virtio_iso = cache.join(format!("virtio-win-{}.iso", download::VIRTIO_WIN_VERSION));
-    if !virtio_iso.exists() {
-        eprintln!(
-            "Downloading virtio-win {} drivers…",
-            download::VIRTIO_WIN_VERSION
-        );
-        download::download(
-            &client,
-            download::VIRTIO_WIN_URL,
-            &virtio_iso,
-            Some(download::VIRTIO_WIN_SHA256),
-            progress_printer(),
-        )
-        .await?;
-        eprintln!();
-    }
+    eprintln!(
+        "Checking virtio-win {} drivers (pinned SHA-256)…",
+        download::VIRTIO_WIN_VERSION
+    );
+    download::ensure_pinned(
+        &client,
+        download::VIRTIO_WIN_URL,
+        &virtio_iso,
+        download::VIRTIO_WIN_SHA256,
+        progress_printer(),
+    )
+    .await?;
+    eprintln!();
 
     let (windows_iso, image_name, image_index) = match a.source {
         Source::Iso => {
@@ -451,6 +465,14 @@ async fn create(name: &str, paths: &VmPaths, a: CreateArgs) -> anyhow::Result<()
                 a.language
             );
             let r = download::resolve_consumer(&client, &a.language).await?;
+            // The consumer ISO is promised to match Microsoft's published
+            // SHA-256: no hash, no download.
+            anyhow::ensure!(
+                r.sha256.is_some(),
+                "Microsoft's download page did not list a SHA-256 for {}; refusing an \
+                 unverified download (use --source iso with an ISO you checked)",
+                r.file_name
+            );
             let dest = cache.join(&r.file_name);
             fetch_cached(&client, &r, &dest).await?;
             (dest, "Windows 11 Pro".to_owned(), None)
@@ -691,6 +713,7 @@ async fn install(
     screenshot: Option<PathBuf>,
     l: &LaunchArgs,
 ) -> anyhow::Result<()> {
+    let _lock = vm::lock_vm(paths)?;
     let mut cfg = VmConfig::load(&paths.data)?;
     let install = cfg
         .install
@@ -708,7 +731,8 @@ async fn install(
         .press_key_repeatedly("ret", Duration::from_millis(500), Duration::from_secs(20))
         .await;
     eprintln!("Windows Setup is running unattended. Progress (from the guest's serial console):");
-    let marker = unattend::INSTALL_DONE_MARKER;
+    // Either outcome marker ends the wait: DONE or FAILED <steps>.
+    let marker = unattend::INSTALL_OUTCOME_PREFIX;
     let serial = paths.serial_log();
     let wait = vm::wait_for_serial_marker(
         &serial,
@@ -723,11 +747,28 @@ async fn install(
             }
         },
     );
-    tokio::select! {
-        r = wait => { r?; }
+    let outcome = tokio::select! {
+        r = wait => r?,
         status = running.wait() => {
             bail!("QEMU exited during installation ({:?}); see {}\n{}", status?, paths.qemu_log().display(), vm::tail(&paths.qemu_log(), 30));
         }
+    };
+    if outcome.contains(unattend::INSTALL_FAILED_MARKER) {
+        let steps = outcome
+            .split(unattend::INSTALL_FAILED_MARKER)
+            .nth(1)
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        let status = running.shutdown(Duration::from_secs(180)).await?;
+        eprintln!("VM powered off ({status}).");
+        bail!(
+            "Windows installed, but these LSW steps failed: {steps}. The VM is not marked \
+             installed. The reasons are logged inside Windows in \
+             C:\\ProgramData\\LSW\\firstboot.log; the setup files are kept in {}. To \
+             start over, delete that directory and run `lsw create` again.",
+            paths.data.display()
+        );
     }
     eprintln!(
         "Installation finished in {:.1} minutes.",
@@ -754,6 +795,7 @@ async fn install(
 }
 
 async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
+    let _lock = vm::lock_vm(paths)?;
     let cfg = VmConfig::load(&paths.data)?;
     if cfg.install.is_some() {
         bail!("Windows is not installed yet; run `lsw install` first");
@@ -840,6 +882,14 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
                         let _ = call.reply.send(api::Response::ok());
                         continue;
                     }
+                    api::Request::Wake => {
+                        if idle.wake(std::time::Instant::now()) == lsw_daemon::idle::Action::Resume {
+                            running.resume().await?;
+                            println!("Resumed for a view.");
+                        }
+                        let _ = call.reply.send(api::Response::ok());
+                        continue;
+                    }
                     api::Request::Status => {
                         let _ = call.reply.send(api::Response {
                             agent: Some(connected.load(Ordering::Acquire)),
@@ -919,7 +969,7 @@ fn handle_api_call(
 ) {
     let api::Call { request, reply } = call;
     match request {
-        api::Request::Status | api::Request::Windows { .. } => {
+        api::Request::Status | api::Request::Windows { .. } | api::Request::Wake => {
             let _ = reply.send(api::Response {
                 agent: Some(connected.load(Ordering::Acquire)),
                 ..api::Response::ok()
@@ -1202,6 +1252,9 @@ fn gpu(paths: &VmPaths, action: GpuAction) -> anyhow::Result<()> {
             }
         }
         GpuAction::Assign { pci } => {
+            // The VM must exist and be stopped before anything changes.
+            let mut cfg = VmConfig::load(&paths.data)?;
+            let _lock = vm::lock_vm(paths)?;
             let addr = PciAddr::parse(&pci).context("expected a PCI address like 0000:01:00.0")?;
             let set = passthrough_set(sysfs, &addr).map_err(|e| anyhow::anyhow!(e))?;
             let helper = ["/usr/lib/lsw/lsw-helper", "/usr/libexec/lsw-helper"]
@@ -1213,7 +1266,6 @@ fn gpu(paths: &VmPaths, action: GpuAction) -> anyhow::Result<()> {
                 .status()
                 .context("pkexec")?;
             anyhow::ensure!(status.success(), "lsw-helper failed");
-            let mut cfg = VmConfig::load(&paths.data)?;
             cfg.passthrough = set.into_iter().map(|f| f.addr).collect();
             cfg.gpu_tier = GpuTier::B;
             cfg.save(&paths.data)?;
@@ -1221,6 +1273,7 @@ fn gpu(paths: &VmPaths, action: GpuAction) -> anyhow::Result<()> {
         }
         GpuAction::Release => {
             let mut cfg = VmConfig::load(&paths.data)?;
+            let _lock = vm::lock_vm(paths)?;
             if let Some(first) = cfg.passthrough.first().cloned() {
                 let helper = ["/usr/lib/lsw/lsw-helper", "/usr/libexec/lsw-helper"]
                     .into_iter()

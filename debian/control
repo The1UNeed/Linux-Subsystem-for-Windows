@@ -16,7 +16,7 @@ Package: lsw
 Architecture: amd64
 Depends: ${shlibs:Depends}, ${misc:Depends},
          qemu-system-x86 (>= 1:8.2), qemu-system-modules-opengl, ovmf, swtpm,
-         swtpm-tools, passt, virtiofsd, uidmap, policykit-1 | polkitd
+         swtpm-tools, passt, virtiofsd, uidmap, pkexec, polkitd
 Recommends: pipewire
 Description: Linux Subsystem for Windows: Windows 11 apps on the Linux desktop
  LSW runs Windows 11 in a KVM virtual machine and shows its apps as native

@@ -91,6 +91,8 @@ struct View {
     frame: Arc<Frame>,
     cmds: UnboundedSender<Cmd>,
     full_screen: Cell<bool>,
+    /// Keys pressed in Windows and not yet released.
+    held: std::cell::RefCell<std::collections::BTreeSet<u32>>,
 }
 
 impl View {
@@ -242,6 +244,7 @@ fn build_window(app: &adw::Application, options: Options) {
         frame,
         cmds,
         full_screen: Cell::new(false),
+        held: Default::default(),
     });
 
     // --- actions
@@ -314,6 +317,7 @@ fn build_window(app: &adw::Application, options: Options) {
             }
             match keymap::evdev_to_qnum(keycode.saturating_sub(8)) {
                 Some(qnum) => {
+                    view.held.borrow_mut().insert(qnum);
                     view.send(Cmd::Key { qnum, down: true });
                     glib::Propagation::Stop
                 }
@@ -326,11 +330,24 @@ fn build_window(app: &adw::Application, options: Options) {
         view,
         move |_, _, keycode, _| {
             if let Some(qnum) = keymap::evdev_to_qnum(keycode.saturating_sub(8)) {
+                view.held.borrow_mut().remove(&qnum);
                 view.send(Cmd::Key { qnum, down: false });
             }
         }
     ));
     window.add_controller(keys);
+    // Focus left the window: release everything still held in Windows.
+    window.connect_is_active_notify(glib::clone!(
+        #[weak]
+        view,
+        move |w| {
+            if !w.is_active() {
+                for qnum in std::mem::take(&mut *view.held.borrow_mut()) {
+                    view.send(Cmd::Key { qnum, down: false });
+                }
+            }
+        }
+    ));
 
     let motion = gtk::EventControllerMotion::new();
     motion.connect_motion(glib::clone!(

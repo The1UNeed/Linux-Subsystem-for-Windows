@@ -143,7 +143,7 @@ B/C.
 
 | Crate | Role |
 |---|---|
-| `lsw-proto` | Versioned guest↔host protocol. Length-prefixed frames with strict size limits; every decoder is fuzzed. |
+| `lsw-proto` | Versioned guest↔host protocol. Length-prefixed frames with strict size limits; decoders have fuzz targets (`fuzz/`) and a randomized test. |
 | `lsw-daemon` | Host user service: VM lifecycle, QEMU command line, QMP client, swtpm/virtiofsd/passt supervision, idle/suspend, GPU tier detection, guest channel. |
 | `lsw-installer` | Windows ISO acquisition (Microsoft download or user ISO), `autounattend.xml` generation, driver + agent injection. |
 | `lsw-cli` | `lsw` command for headless use and tests. |
@@ -209,7 +209,7 @@ signing.
 ### Security model
 
 - The guest is **untrusted**. Every guest message is validated, sizes are
-  bounded, decoders are fuzzed, shared memory is bounds-checked.
+  bounded, decoders have fuzz targets, shared memory is bounds-checked.
 - File access only within shared folders; drag-out writes only to the drop
   target.
 - Only `http`/`https` URLs are opened on the host.
@@ -235,6 +235,11 @@ from running it.
 | swtpm, passt, virtiofsd sockets under `$HOME/.cache/lsw/sock`. | Ubuntu's AppArmor profiles for swtpm and passt deny `/run/user`. |
 | Shared folders: virtiofsd in an unprivileged user namespace (identity uid/gid map, needs `newuidmap`); WinFsp directory mount points under `%USERPROFILE%\Linux\`, redirected as known folders. | Verified both ways; files keep the Linux user's ownership. |
 | **LSW Tools CD** on every boot; the agent updates itself from it. | Same path installs and updates; no network or store needed. |
+| The Windows password is stored in the VM directory (`credentials.json`, 0600), not the Secret Service. | The supervisor runs headless (systemd user unit) and must not depend on an unlocked keyring; Secret Service storage is planned. |
+| No read-only view of Windows' `C:` on Linux yet. | Needs a guest-side file server; not in this release. |
+| The keyboard follows Windows' own layout setting (scancodes are forwarded), not the Linux layout. | Synchronizing layouts needs a mapping from XKB layouts to Windows keyboard layouts; planned. |
+| One virtual display, sized to the first monitor. | Multi-monitor needs one virtio-gpu head per monitor in Coherence and the views; planned. |
+| Full Screen is toggled with **Ctrl+Super+F** (not released with Ctrl+Alt). | Ctrl+Alt is a common Windows chord (AltGr on many layouts); Ctrl+Super is free on both systems. |
 | Alpha Coherence frames go over a third virtio-serial port (LZ4, damaged regions only). | virtio-win 0.1.302 ships no IVSHMEM driver and the only other build (2021 "prewhql") cannot be relied on to load on current Windows 11. The transport is behind an interface; ivshmem (or tier A blob memory) replaces it when a signed driver is available. |
 
 ## 4. Delivery
@@ -256,16 +261,22 @@ Evaluation, with screenshots or recordings as evidence.
 |---|---|---|---|
 | M0 | Host check, media download and verification, unattended install (20.8 min), Secure Boot + TPM, virtio drivers. | — | Graphical setup wizard (CLI only). |
 | M1 | Agent over virtio-serial, Window view, dynamic resolution, native Full Screen resolution, clipboard both ways, PipeWire audio, shared folders both ways, USB hot-plug (emulated device; the test host has no USB bus). | Passthrough of a physical USB device. | — |
-| M2 | Coherence (separate native windows, input, native move/resize via hit test), app launchers with icons (70 written), launch from Linux. | — | Start menu window, tray icons, notifications, links to the Linux browser, file associations, drag and drop, Picture-in-Picture. |
+| M2 | Coherence (separate native windows, input, native move/resize via hit test), app launchers with icons (70 written), launch from Linux. | — | Clipboard in Coherence (the Window view has it), Start menu window, tray icons, notifications, links to the Linux browser, file associations, drag and drop, Picture-in-Picture. |
 | M3 | — | Tier B (VFIO) and tier C (SR-IOV) host side: helper, polkit, QEMU arguments (unit-tested on fake sysfs; no IOMMU/GPU on the test host). | Tier A: the paravirtualized 3D guest driver (C/C++ fork) is not ready, so tier A is disabled and never turns Secure Boot off. |
 | M4 | Idle pause (0 % CPU), LSW Tools auto-update, Debian package, PKGBUILD, CI, docs. | — | Save state to disk when idle (QEMU 8.2 blocks migration with virtiofs), PPA publication, EV signing pipeline (nothing to sign until tier A), bundled pinned QEMU. |
 
 ### Testing
 
-- Rust unit tests; fuzzing for every parser of guest data.
-- Headless Windows boot tests on x86-64 KVM hosts (boat.dev sandboxes, GitHub
-  runners) with the Windows 11 Enterprise Evaluation image.
-- GPU tiers and latency on hardware with GPUs; a frame-timestamp latency rig.
+- Rust unit tests for protocol, configuration, QEMU arguments, policies and
+  parsers (CI on every push).
+- Decoders of guest data: cargo-fuzz targets in `fuzz/` (coverage-guided,
+  nightly) and a deterministic randomized test over 100,000 mutated inputs
+  in the normal test suite.
+- Windows boot and integration tests are run on x86-64 KVM hosts (boat.dev
+  sandboxes) with the Windows 11 Enterprise Evaluation image, driven by
+  scripts and `lsw ctl`; they are not yet automated in CI.
+- GPU tiers and latency on hardware with GPUs; a frame-timestamp latency rig
+  (planned).
 
 ### Release gate
 

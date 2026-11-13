@@ -25,6 +25,8 @@ function Stage([string]$name) {
 }
 
 Stage 'start'
+# Required steps that failed; any failure is reported instead of DONE.
+$failed = @()
 
 $config = @{ test_signing = $false }
 $configPath = Join-Path $Media 'lsw\config.json'
@@ -42,8 +44,10 @@ if ($msi) {
     Stage 'virtio-drivers'
     $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart /l*v `"$logDir\virtio-win.log`"" -Wait -PassThru
     Stage "virtio-drivers-exit-$($p.ExitCode)"
+    if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { $failed += 'virtio-drivers' }
 } else {
     Stage 'virtio-drivers-missing'
+    $failed += 'virtio-drivers-missing'
 }
 
 # 2. Keep autologon permanently (Windows decrements AutoLogonCount).
@@ -76,11 +80,17 @@ if (Test-Path $installer) {
     Stage 'agent'
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer -Media $Media
     Stage "agent-exit-$LASTEXITCODE"
+    if ($LASTEXITCODE -ne 0) { $failed += 'agent' }
 }
 
 # 7. The answer file contained the account password; remove every copy.
 Stage 'cleanup'
 Remove-Item -Force -ErrorAction SilentlyContinue 'C:\Windows\Panther\unattend.xml', 'C:\Windows\Panther\Unattend\unattend.xml'
 
-Stage 'done'
-Send-Serial 'LSW_INSTALL_DONE'
+if ($failed.Count -gt 0) {
+    Stage ("failed: " + ($failed -join ','))
+    Send-Serial ("LSW_INSTALL_FAILED " + ($failed -join ','))
+} else {
+    Stage 'done'
+    Send-Serial 'LSW_INSTALL_DONE'
+}

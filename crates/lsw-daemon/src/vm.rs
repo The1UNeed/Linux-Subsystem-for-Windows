@@ -15,6 +15,25 @@ use tokio::process::{Child, Command};
 const HELPER_SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
 const QMP_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Exclusive lock on a VM, held by its supervisor (`lsw run`, `lsw install`)
+/// for its whole lifetime: a second supervisor must not touch the sockets
+/// or disk of a running VM.
+pub fn lock_vm(paths: &VmPaths) -> anyhow::Result<std::fs::File> {
+    paths.create()?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(paths.data.join("supervisor.lock"))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            bail!("this VM is already running (another `lsw run` or `lsw install` owns it)")
+        }
+        Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+    }
+}
+
 /// Create the raw system disk as a sparse file (no space used until Windows
 /// writes). An existing disk is never touched.
 pub fn create_sparse_disk(path: &Path, size_gib: u64) -> std::io::Result<bool> {
@@ -172,15 +191,19 @@ impl Vm {
             // Index in the *active* list: it names the socket and the device.
             let socket = self.paths.virtiofs_socket(active.len());
             let _ = std::fs::remove_file(&socket);
-            if !share.host_path.is_dir() {
-                tracing::warn!(
-                    "share {}: {} is not a directory",
-                    share.tag,
-                    share.host_path.display()
-                );
-                continue;
-            }
-            let args = qemu::virtiofsd_args(&share.host_path, &socket, uid, gid);
+            // Checked again at every start: the folder may have become a
+            // symlink to the home directory since the VM was created.
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_default();
+            let root = match crate::config::share_root(&share.host_path, &home) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!("share {}: not exported: {e}", share.tag);
+                    continue;
+                }
+            };
+            let args = qemu::virtiofsd_args(&root, &socket, uid, gid);
             let log = self.paths.data.join(format!("virtiofsd-{}.log", share.tag));
             let child = match spawn_logged(bin, &args, &log) {
                 Ok(c) => c,
@@ -273,6 +296,10 @@ impl Running {
     /// Ask Windows to shut down (ACPI power button); force-quit QEMU if it
     /// has not exited after `grace`.
     pub async fn shutdown(mut self, grace: Duration) -> anyhow::Result<ExitStatus> {
+        // A paused guest (idle) cannot react to the power button: run it.
+        if let Err(e) = self.qmp.execute("cont", None).await {
+            tracing::warn!("cont before shutdown failed: {e}");
+        }
         if let Err(e) = self.qmp.execute("system_powerdown", None).await {
             tracing::warn!("system_powerdown failed: {e}");
         }
@@ -431,6 +458,21 @@ pub fn sanitize_console_line(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_one_supervisor_per_vm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = VmPaths::with_bases(
+            &tmp.path().join("d"),
+            &tmp.path().join("r"),
+            &tmp.path().join("h"),
+            "win",
+        );
+        let first = lock_vm(&paths).unwrap();
+        assert!(lock_vm(&paths).is_err());
+        drop(first);
+        assert!(lock_vm(&paths).is_ok());
+    }
 
     #[test]
     fn sparse_disk_is_created_once() {

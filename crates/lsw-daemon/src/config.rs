@@ -94,6 +94,32 @@ pub struct Share {
     pub folder: KnownFolder,
 }
 
+/// Resolve a share root and check it may be exported: symlinks resolved,
+/// never the home directory or one of its ancestors (`/`, `/home`), never
+/// inside a hidden directory (dotfiles such as `~/.ssh`).
+pub fn share_root(path: &Path, home: &Path) -> Result<PathBuf, String> {
+    let real = std::fs::canonicalize(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if !real.is_dir() {
+        return Err(format!("{} is not a directory", real.display()));
+    }
+    let home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    if home.starts_with(&real) {
+        return Err(format!(
+            "{} resolves to {}, which contains your home directory",
+            path.display(),
+            real.display()
+        ));
+    }
+    if let Ok(below_home) = real.strip_prefix(&home)
+        && below_home
+            .components()
+            .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
+    {
+        return Err(format!("{} is inside a hidden directory", real.display()));
+    }
+    Ok(real)
+}
+
 impl Share {
     /// The default pairing: Linux XDG user folders ↔ Windows known folders.
     /// Folders that do not exist on the host are skipped; the home directory
@@ -110,9 +136,10 @@ impl Share {
         .into_iter()
         .filter_map(|(key, fallback, folder)| {
             let dir = xdg(key).unwrap_or_else(|| home.join(fallback));
-            (dir.is_dir() && dir.is_absolute() && dir != home).then(|| Share {
+            let root = share_root(&dir, home).ok()?;
+            Some(Share {
                 tag: format!("lsw-{}", fallback.to_ascii_lowercase()),
-                host_path: dir,
+                host_path: root,
                 folder,
             })
         })
@@ -339,8 +366,35 @@ mod tests {
         });
         let tags: Vec<_> = shares.iter().map(|s| s.tag.as_str()).collect();
         assert_eq!(tags, ["lsw-documents", "lsw-pictures"]);
-        assert_eq!(shares[1].host_path, h.join("Bilder"));
+        let real = std::fs::canonicalize(h).unwrap();
+        assert_eq!(shares[1].host_path, real.join("Bilder"));
         assert_eq!(shares[1].folder, KnownFolder::Pictures);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn share_roots_cannot_reach_home_or_dotfiles_through_symlinks() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        std::fs::create_dir(h.join("Documents")).unwrap();
+        std::fs::create_dir(h.join(".ssh")).unwrap();
+        std::os::unix::fs::symlink(h, h.join("Downloads")).unwrap();
+        std::os::unix::fs::symlink(h.join(".ssh"), h.join("Music")).unwrap();
+        std::os::unix::fs::symlink("/", h.join("Videos")).unwrap();
+        assert!(share_root(&h.join("Documents"), h).is_ok());
+        assert!(
+            share_root(&h.join("Downloads"), h).is_err(),
+            "symlink to home"
+        );
+        assert!(
+            share_root(&h.join("Music"), h).is_err(),
+            "symlink to a dotfile dir"
+        );
+        assert!(share_root(&h.join("Videos"), h).is_err(), "symlink to /");
+        assert!(share_root(h, h).is_err());
+        let shares = Share::defaults(h, |_| None);
+        let tags: Vec<_> = shares.iter().map(|s| s.tag.as_str()).collect();
+        assert_eq!(tags, ["lsw-documents"]);
     }
 
     #[test]
