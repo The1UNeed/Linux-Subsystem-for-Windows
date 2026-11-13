@@ -885,6 +885,13 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
                         && event.data.get("id").and_then(|v| v.as_str()) == Some(CONTROL_PORT_ID)
                     {
                         let open = event.data.get("open").and_then(|v| v.as_bool()).unwrap_or(false);
+                        if !open {
+                            // Agent stopped or Windows is rebooting: the
+                            // socket stays up, so this is the only sign.
+                            // Until it says hello again, Windows is not
+                            // idle-paused.
+                            connected.store(false, Ordering::Release);
+                        }
                         let _ = port_tx.send(open);
                     }
                 }
