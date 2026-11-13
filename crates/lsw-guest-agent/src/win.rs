@@ -500,6 +500,45 @@ fn drive_letters() -> Vec<char> {
         .collect()
 }
 
+/// Whether `dir` is a mount (a reparse point), not a plain folder.
+fn is_mount_point(dir: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    std::fs::symlink_metadata(dir)
+        .is_ok_and(|m| m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+}
+
+/// WinFsp creates the mount directory itself. Remove a stale mount point or
+/// an empty folder; move a plain folder with files aside (they were written
+/// while the share was missing) instead of hiding or deleting them.
+fn clear_mount_dir(dir: &Path) {
+    if !dir.exists() && !is_mount_point(dir) {
+        return;
+    }
+    if is_mount_point(dir) || std::fs::remove_dir(dir).is_ok() {
+        let _ = std::fs::remove_dir(dir);
+        return;
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let name = dir
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    let aside = dir.with_file_name(format!("{name} (local copy {stamp})"));
+    match std::fs::rename(dir, &aside) {
+        Ok(()) => log(format!(
+            "{}: kept files written while the share was missing in {}",
+            dir.display(),
+            aside.display()
+        )),
+        Err(e) => log(format!(
+            "{}: cannot move a stale folder aside: {e}",
+            dir.display()
+        )),
+    }
+}
+
 pub(crate) fn wait_until(timeout: Duration, mut ready: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -532,17 +571,35 @@ impl Windows {
         {
             return Ok(path.clone());
         }
+        // Mounts left by a previous agent (restart, update) belong to no one
+        // now: stop their virtiofs.exe once, so every share is mounted anew.
+        static STALE_STOPPED: std::sync::Once = std::sync::Once::new();
+        STALE_STOPPED.call_once(|| {
+            let stopped = Command::new("taskkill")
+                .args(["/f", "/im", "virtiofs.exe"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+                .is_ok_and(|o| o.status.success());
+            if stopped {
+                log("stopped the previous agent's shared-folder mounts");
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        });
         let profile = std::env::var_os("USERPROFILE").ok_or("USERPROFILE is not set")?;
         let parent = Path::new(&profile).join("Linux");
         std::fs::create_dir_all(&parent).map_err(|e| e.to_string())?;
         let dir = parent.join(known_folder_name(share.folder));
-        // WinFsp creates the mount directory itself; clear a stale one.
-        let _ = std::fs::remove_dir(&dir);
+        clear_mount_dir(&dir);
         let dir_str = dir.to_string_lossy().into_owned();
 
-        // Directory mount point first, then a free drive letter.
+        // Directory mount point first, then a free drive letter. Mounted
+        // means WinFsp's reparse point is there and virtiofs.exe still runs:
+        // a plain folder of that name is not the share.
         let mut child = Self::spawn_virtiofs(&share.tag, &dir_str)?;
-        if wait_until(Duration::from_secs(10), || std::fs::read_dir(&dir).is_ok()) {
+        if wait_until(Duration::from_secs(10), || {
+            child.try_wait().ok().flatten().is_none() && is_mount_point(&dir)
+        }) && std::fs::read_dir(&dir).is_ok()
+        {
             return Ok(self.finish(share, child, dir_str));
         }
         let _ = child.kill();
