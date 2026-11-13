@@ -8,7 +8,7 @@ use lsw_proto::{
     clipboard_chunks, encode, negotiate,
 };
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -111,6 +111,9 @@ pub struct SessionClient<S> {
     out: mpsc::UnboundedSender<Vec<u8>>,
     /// Bytes queued but not yet written (shared with the writer task).
     queued: Arc<AtomicUsize>,
+    /// A write failed (set before its bytes leave `queued`, so a flush that
+    /// sees nothing queued also sees the failure).
+    failed: Arc<AtomicBool>,
     /// The writer task, stopped with the client: a guest that stopped
     /// reading would otherwise keep it blocked in a write forever, holding
     /// the socket and every queued frame.
@@ -136,9 +139,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> SessionClient<S> {
         let (out, mut frames) = mpsc::unbounded_channel::<Vec<u8>>();
         let queued = Arc::new(AtomicUsize::new(0));
         let written = queued.clone();
+        let failed = Arc::new(AtomicBool::new(false));
+        let write_failed = failed.clone();
         let writer_task = tokio::spawn(async move {
             while let Some(frame) = frames.recv().await {
                 let ok = writer.write_all(&frame).await.is_ok();
+                if !ok {
+                    write_failed.store(true, Ordering::Release);
+                }
                 written.fetch_sub(frame.len(), Ordering::AcqRel);
                 if !ok {
                     break;
@@ -152,6 +160,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> SessionClient<S> {
             buf: vec![0u8; 64 * 1024].into_boxed_slice(),
             out,
             queued,
+            failed,
             writer_task,
             next_seq: 1,
             attached: false,
@@ -171,6 +180,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> SessionClient<S> {
             msg,
         };
         self.next_seq += 1;
+        if self.failed.load(Ordering::Acquire) {
+            return Err(ChannelError::Closed);
+        }
         let frame = encode(&env)?;
         let len = frame.len();
         if self.queued.fetch_add(len, Ordering::AcqRel) + len > MAX_QUEUED_BYTES {
@@ -220,7 +232,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> SessionClient<S> {
     /// and exits): dropping the client stops its writer at once.
     pub async fn flush(&self, timeout: Duration) -> Result<(), ChannelError> {
         let deadline = tokio::time::Instant::now() + timeout;
-        while self.queued.load(Ordering::Acquire) > 0 {
+        loop {
+            let queued = self.queued.load(Ordering::Acquire);
+            if self.failed.load(Ordering::Acquire) {
+                return Err(ChannelError::Closed);
+            }
+            if queued == 0 {
+                return Ok(());
+            }
             if self.writer_task.is_finished() {
                 return Err(ChannelError::Closed);
             }
@@ -232,7 +251,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> SessionClient<S> {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        Ok(())
     }
 
     /// Resize the Windows display.
@@ -594,6 +612,20 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn flush_reports_a_failed_last_write() {
+        let (host, guest) = tokio::io::duplex(64 * 1024);
+        let mut s = SessionClient::new(host).await.unwrap();
+        s.flush(Duration::from_secs(5)).await.unwrap();
+        drop(guest); // the guest end goes away
+        s.display_hint(1280, 800, 100).await.unwrap();
+        assert!(s.flush(Duration::from_secs(5)).await.is_err());
+        assert!(
+            s.display_hint(1, 1, 100).await.is_err(),
+            "later requests fail too"
+        );
     }
 
     #[tokio::test]

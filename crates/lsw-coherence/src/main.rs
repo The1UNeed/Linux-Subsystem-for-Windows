@@ -81,6 +81,19 @@ fn pick_buffer<B>(
     }
 }
 
+/// Forget retired buffers the compositor has released (SCTK destroyed
+/// them when they were dropped while free).
+fn prune_retired<B>(retired: &mut Vec<B>, mut free: impl FnMut(&B) -> bool) {
+    retired.retain(|b| !free(b));
+}
+
+/// How long the event loop may sleep: briefly while work waits for the
+/// compositor to release a buffer (SCTK reports releases to no one), else
+/// until the next event.
+fn dispatch_timeout(pending: bool) -> Option<std::time::Duration> {
+    pending.then_some(std::time::Duration::from_millis(30))
+}
+
 /// Upper bound of the memory a window can hold: its frame plus
 /// [`MAX_BUFFERS`] buffers no larger than the largest one alive or needed.
 fn held_bound(frame: usize, buffers: impl Iterator<Item = usize>) -> usize {
@@ -195,6 +208,9 @@ struct App {
     pool: SlotPool,
     qh: QueueHandle<App>,
     windows: HashMap<u64, Mirrored>,
+    /// Buffers of windows that are gone, still held by the compositor:
+    /// charged against [`MAX_FRAME_BYTES`] until released.
+    retired: Vec<smithay_client_toolkit::shm::slot::Buffer>,
     to_backend: UnboundedSender<Request>,
     seat: Option<wl_seat::WlSeat>,
     pointer: Option<wl_pointer::WlPointer>,
@@ -311,13 +327,13 @@ impl App {
         // capture), but it must still exist on Linux (in the dock) so the
         // user can restore it: show a neutral placeholder until it does.
         let (frame, size) = if info.state == WindowState::Minimized {
-            let held = self.windows.values().map(Mirrored::held).sum();
+            let held = self.held_total();
             let size = placeholder_within_budget(&info, held);
             (vec![0xf0; size.0 as usize * size.1 as usize * 4], size)
         } else {
             (Vec::new(), (0, 0))
         };
-        self.windows.insert(
+        let replaced = self.windows.insert(
             info.id,
             Mirrored {
                 info,
@@ -331,6 +347,46 @@ impl App {
                 dirty: false,
             },
         );
+        if let Some(old) = replaced {
+            self.retire(old);
+        }
+    }
+
+    /// A window is gone: its buffers stay charged until released.
+    fn retire(&mut self, w: Mirrored) {
+        self.retired.extend(w.buffers);
+    }
+
+    /// Memory charged against [`MAX_FRAME_BYTES`]: live windows and the
+    /// retired buffers the compositor still holds.
+    fn held_total(&self) -> usize {
+        let retired: usize = self
+            .retired
+            .iter()
+            .map(|b| b.height() as usize * b.stride() as usize)
+            .sum();
+        self.windows.values().map(Mirrored::held).sum::<usize>() + retired
+    }
+
+    /// Something waits for the compositor to release a buffer.
+    fn has_pending(&self) -> bool {
+        !self.retired.is_empty() || self.windows.values().any(|w| w.dirty)
+    }
+
+    /// After any event or a short wait: forget released retired buffers and
+    /// show updates that were waiting for a free buffer (a release comes
+    /// without a frame callback, and the guest sends nothing new for an
+    /// unchanged window).
+    fn retry_pending(&mut self) {
+        let pool = &mut self.pool;
+        prune_retired(&mut self.retired, |b| b.canvas(pool).is_some());
+        for w in self
+            .windows
+            .values_mut()
+            .filter(|w| w.dirty && w.configured)
+        {
+            Self::draw(&mut self.pool, &self.qh, w, None);
+        }
     }
 
     fn changed(&mut self, info: WindowInfo) {
@@ -353,7 +409,7 @@ impl App {
     }
 
     fn frame(&mut self, id: u64, width: u32, height: u32, tiles: Vec<lsw_proto::coherence::Tile>) {
-        let held: usize = self.windows.values().map(Mirrored::held).sum();
+        let held = self.held_total();
         let Some(w) = self.windows.get_mut(&id) else {
             return;
         };
@@ -506,7 +562,9 @@ impl App {
                 CoMessage::Opened(info) => self.open(info),
                 CoMessage::Changed(info) => self.changed(info),
                 CoMessage::Closed { id } => {
-                    self.windows.remove(&id);
+                    if let Some(w) = self.windows.remove(&id) {
+                        self.retire(w);
+                    }
                 }
                 CoMessage::Frame {
                     id,
@@ -524,7 +582,9 @@ impl App {
             Update::Disconnected(reason) => {
                 tracing::info!("Coherence ended: {reason}");
                 self.held.clear();
-                self.windows.clear();
+                for (_, w) in std::mem::take(&mut self.windows) {
+                    self.retire(w);
+                }
             }
         }
     }
@@ -634,6 +694,7 @@ fn main() -> anyhow::Result<()> {
         pool,
         qh,
         windows: HashMap::new(),
+        retired: Vec::new(),
         to_backend,
         seat: None,
         pointer: None,
@@ -650,7 +711,8 @@ fn main() -> anyhow::Result<()> {
         exit: false,
     };
     while !app.exit {
-        event_loop.dispatch(None, &mut app)?;
+        event_loop.dispatch(dispatch_timeout(app.has_pending()), &mut app)?;
+        app.retry_pending();
     }
     Ok(())
 }
@@ -773,8 +835,10 @@ impl PopupHandler for App {
     fn done(&mut self, _: &Connection, _: &QueueHandle<Self>, popup: &Popup) {
         // The compositor dismissed the popup: Windows closes the menu when
         // it loses focus anyway.
-        if let Some(id) = self.id_of(popup.wl_surface()) {
-            self.windows.remove(&id);
+        if let Some(id) = self.id_of(popup.wl_surface())
+            && let Some(w) = self.windows.remove(&id)
+        {
+            self.retire(w);
         }
     }
 }
@@ -1142,6 +1206,79 @@ mod tests {
         assert_eq!(
             pick_buffer(&mut bufs, (800, 4800), size, |b| !b.busy),
             Pick::Reuse(0)
+        );
+    }
+
+    #[test]
+    fn closed_windows_stay_charged_until_the_compositor_releases_them() {
+        // Ten windows close while the compositor still holds a 1 MiB
+        // buffer of each: they stay in the retired list (and the budget).
+        let mut retired: Vec<FakeBuf> = (0..10)
+            .map(|_| FakeBuf {
+                size: (512, 2048),
+                busy: true,
+            })
+            .collect();
+        prune_retired(&mut retired, |b| !b.busy);
+        let charged: usize = retired
+            .iter()
+            .map(|b| b.size.0 as usize * b.size.1 as usize)
+            .sum();
+        assert_eq!(charged, 10 << 20);
+        assert!(
+            dispatch_timeout(!retired.is_empty()).is_some(),
+            "keeps checking"
+        );
+        // Releases arrive for some: only those leave the budget.
+        for b in retired.iter_mut().take(4) {
+            b.busy = false;
+        }
+        prune_retired(&mut retired, |b| !b.busy);
+        assert_eq!(retired.len(), 6);
+        for b in &mut retired {
+            b.busy = false;
+        }
+        prune_retired(&mut retired, |b| !b.busy);
+        assert!(retired.is_empty());
+        assert_eq!(
+            dispatch_timeout(false),
+            None,
+            "idle: sleep until the next event"
+        );
+    }
+
+    #[test]
+    fn a_release_after_the_frame_callbacks_still_presents_the_last_update() {
+        let want = (600, 3200);
+        let size = |b: &FakeBuf| b.size;
+        let mut bufs = vec![
+            FakeBuf {
+                size: want,
+                busy: true,
+            },
+            FakeBuf {
+                size: want,
+                busy: true,
+            },
+        ];
+        // The final guest update finds both buffers busy: it waits.
+        let mut dirty = pick_buffer(&mut bufs, want, size, |b| !b.busy) == Pick::Wait;
+        assert!(dirty);
+        // Both frame callbacks come before any release: still waiting.
+        for _ in 0..2 {
+            assert_eq!(pick_buffer(&mut bufs, want, size, |b| !b.busy), Pick::Wait);
+        }
+        // Pending work keeps the loop waking up although nothing arrives.
+        assert!(dispatch_timeout(dirty).is_some());
+        // The release comes later; the next retry draws.
+        bufs[1].busy = false;
+        if let Pick::Reuse(i) = pick_buffer(&mut bufs, want, size, |b| !b.busy) {
+            assert_eq!(i, 1);
+            dirty = false;
+        }
+        assert!(
+            !dirty,
+            "the last update is shown without another guest frame"
         );
     }
 
