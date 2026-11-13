@@ -768,8 +768,7 @@ async fn install(
             .unwrap_or("")
             .trim()
             .to_owned();
-        let status = running.shutdown(Duration::from_secs(180)).await?;
-        eprintln!("VM powered off ({status}).");
+        eprintln!("{}", running.shutdown(Duration::from_secs(180)).await?);
         bail!(
             "Windows installed, but these LSW steps failed: {steps}. The VM is not marked \
              installed. The reasons are logged inside Windows in \
@@ -791,8 +790,7 @@ async fn install(
         .await
         .context("screenshot")?;
     eprintln!("Screenshot: {}", shot.display());
-    let status = running.shutdown(Duration::from_secs(180)).await?;
-    eprintln!("VM powered off ({status}).");
+    eprintln!("{}", running.shutdown(Duration::from_secs(180)).await?);
 
     cfg.install = None;
     cfg.save(&paths.data)?;
@@ -898,8 +896,7 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
                 }
             } => {
                 println!("Shutting Windows down…");
-                let status = running.shutdown(Duration::from_secs(120)).await?;
-                println!("VM powered off ({status}).");
+                println!("{}", running.shutdown(Duration::from_secs(120)).await?);
                 break Ok(());
             }
             call = call_rx.recv() => {

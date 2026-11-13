@@ -45,6 +45,13 @@ pub async fn connect(path: &Path, timeout: Duration) -> Result<(CoReader, CoWrit
 }
 
 impl CoReader {
+    /// Drop any partial frame: the guest's Coherence port closed or
+    /// reopened (agent restart, Windows reboot), so the next byte starts a
+    /// new stream.
+    pub fn reset(&mut self) {
+        self.decoder = Decoder::new();
+    }
+
     /// Next validated message. Cancel-safe.
     pub async fn recv(&mut self) -> Result<CoMessage, ChannelError> {
         loop {

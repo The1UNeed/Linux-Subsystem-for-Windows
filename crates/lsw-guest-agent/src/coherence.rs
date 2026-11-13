@@ -119,6 +119,8 @@ fn reader(port: Arc<Port>, tx: Sender<Input>) {
                 }
                 Ok(n) => n,
                 Err(e) if is_host_absent(&e) => {
+                    // A new host starts a new stream.
+                    decoder = Decoder::new();
                     std::thread::sleep(Duration::from_millis(500));
                     continue;
                 }

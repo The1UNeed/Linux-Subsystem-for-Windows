@@ -244,6 +244,28 @@ impl Vm {
     }
 }
 
+/// How a shutdown ended.
+#[derive(Debug, Clone, Copy)]
+pub enum PowerOff {
+    /// Windows shut down and QEMU exited.
+    Clean(ExitStatus),
+    /// Windows did not shut down within the grace period; QEMU was stopped.
+    Forced(Duration, ExitStatus),
+}
+
+impl std::fmt::Display for PowerOff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PowerOff::Clean(s) => write!(f, "VM powered off ({s})."),
+            PowerOff::Forced(grace, _) => write!(
+                f,
+                "Windows did not shut down within {} s; the VM was stopped.",
+                grace.as_secs()
+            ),
+        }
+    }
+}
+
 /// Something happened to a running VM.
 pub enum Activity {
     /// QEMU exited.
@@ -295,7 +317,7 @@ impl Running {
 
     /// Ask Windows to shut down (ACPI power button); force-quit QEMU if it
     /// has not exited after `grace`.
-    pub async fn shutdown(mut self, grace: Duration) -> anyhow::Result<ExitStatus> {
+    pub async fn shutdown(mut self, grace: Duration) -> anyhow::Result<PowerOff> {
         // A paused guest (idle) cannot react to the power button: run it.
         if let Err(e) = self.qmp.execute("cont", None).await {
             tracing::warn!("cont before shutdown failed: {e}");
@@ -306,11 +328,11 @@ impl Running {
         match tokio::time::timeout(grace, self.qemu.wait()).await {
             Ok(status) => {
                 self.reap_helpers().await;
-                Ok(status?)
+                Ok(PowerOff::Clean(status?))
             }
             Err(_) => {
                 tracing::warn!("guest did not power off within {grace:?}; quitting QEMU");
-                self.kill().await
+                Ok(PowerOff::Forced(grace, self.kill().await?))
             }
         }
     }
