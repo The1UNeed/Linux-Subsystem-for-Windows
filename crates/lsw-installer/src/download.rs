@@ -20,6 +20,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Browser user agent expected by Microsoft's download endpoints.
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:100.0) Gecko/20100101 Firefox/100.0";
+/// Honest user agent for every other host. fedorapeople.org answers browser
+/// user agents with an anti-bot challenge page instead of the file.
+const LSW_USER_AGENT: &str = concat!("lsw/", env!("CARGO_PKG_VERSION"));
+const MAX_REDIRECTS: usize = 10;
 const WIN11_PAGE: &str = "https://www.microsoft.com/en-us/software-download/windows11";
 const EVAL_PAGE: &str = "https://www.microsoft.com/en-us/evalcenter/download-windows-11-enterprise";
 const PROFILE: &str = "606624d44113";
@@ -38,7 +42,7 @@ pub enum DownloadError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error(
-        "Microsoft blocked the automated download from this network; download the ISO in a browser from {WIN11_PAGE} and choose \"use my own ISO\""
+        "Microsoft refused the automated download from this network (common on VPNs and cloud machines). Download the ISO in a browser from {WIN11_PAGE}, then run `lsw create --source iso --iso <file>`"
     )]
     Blocked,
     #[error("unexpected response from {what}: {detail}")]
@@ -62,14 +66,33 @@ pub struct ResolvedIso {
 pub type Client = reqwest::Client;
 
 pub fn client() -> Result<Client, DownloadError> {
+    // Every redirect hop must stay on a trusted host, not just the first URL.
+    let redirects = reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= MAX_REDIRECTS {
+            attempt.error("too many redirects")
+        } else if check_trusted(attempt.url().as_str()).is_ok() {
+            attempt.follow()
+        } else {
+            let url = attempt.url().to_string();
+            attempt.error(DownloadError::UntrustedUrl(url))
+        }
+    });
     Ok(reqwest::Client::builder()
         .user_agent(USER_AGENT)
+        .redirect(redirects)
         .https_only(true)
         .connect_timeout(std::time::Duration::from_secs(20))
         .build()?)
 }
 
 /// Only HTTPS URLs on Microsoft or Fedora hosts are accepted.
+fn is_microsoft(url: &str) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|u| {
+        u.host_str()
+            .is_some_and(|h| h == "microsoft.com" || h.ends_with(".microsoft.com"))
+    })
+}
+
 pub fn check_trusted(url: &str) -> Result<(), DownloadError> {
     let parsed = reqwest::Url::parse(url).map_err(|_| DownloadError::UntrustedUrl(url.into()))?;
     let host = parsed.host_str().unwrap_or_default();
@@ -110,7 +133,9 @@ async fn get_text(
 }
 
 fn url_label(url: &str) -> &'static str {
-    if url.contains("evalcenter") {
+    if url.contains("fedorapeople.org") {
+        "virtio-win download"
+    } else if url.contains("evalcenter") {
         "Evaluation Center"
     } else if url.contains("software-download-connector") {
         "Microsoft download API"
@@ -297,10 +322,25 @@ pub async fn download(
     }
 
     let mut req = client.get(url);
+    if !is_microsoft(url) {
+        req = req.header(reqwest::header::USER_AGENT, LSW_USER_AGENT);
+    }
     if have > 0 {
         req = req.header(reqwest::header::RANGE, format!("bytes={have}-"));
     }
     let resp = req.send().await?.error_for_status()?;
+    // Disk images are never HTML; an HTML 200 is a bot check or error page.
+    let is_html = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim_start().to_ascii_lowercase().starts_with("text/html"));
+    if is_html {
+        return Err(DownloadError::Unexpected {
+            what: url_label(url),
+            detail: "the server returned a web page instead of the file".into(),
+        });
+    }
     let resumed = have > 0 && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
     if have > 0 && !resumed {
         // Server ignored the range: start over.
@@ -329,13 +369,14 @@ pub async fn download(
 
     let actual = hex::encode_upper(hasher.finalize());
     if let Some(expected) = expected_sha256
-        && !expected.eq_ignore_ascii_case(&actual) {
-            let _ = tokio::fs::remove_file(&part).await;
-            return Err(DownloadError::Checksum {
-                expected: expected.to_ascii_uppercase(),
-                actual,
-            });
-        }
+        && !expected.eq_ignore_ascii_case(&actual)
+    {
+        let _ = tokio::fs::remove_file(&part).await;
+        return Err(DownloadError::Checksum {
+            expected: expected.to_ascii_uppercase(),
+            actual,
+        });
+    }
     tokio::fs::rename(&part, dest).await?;
     Ok(actual)
 }
@@ -419,6 +460,11 @@ mod tests {
         assert!(check_trusted(VIRTIO_WIN_URL).is_ok());
         assert!(check_trusted("http://software.download.prss.microsoft.com/x.iso").is_err());
         assert!(check_trusted("https://microsoft.com.evil.example/x.iso").is_err());
+        assert!(is_microsoft(
+            "https://software.download.prss.microsoft.com/x.iso"
+        ));
+        assert!(!is_microsoft(VIRTIO_WIN_URL));
+        assert!(!is_microsoft("https://microsoft.com.evil.example/x.iso"));
         assert!(check_trusted("https://evilmicrosoft.com/x.iso").is_err());
         assert!(check_trusted("not a url").is_err());
     }

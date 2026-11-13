@@ -414,14 +414,14 @@ async fn create(name: &str, paths: &VmPaths, a: CreateArgs) -> anyhow::Result<()
         image_index,
         product_key: None,
     })?;
-    let unattend_img = paths.data.join("setup.img");
+    let setup_iso = paths.data.join("setup.iso");
     media::build_setup_media(
-        &unattend_img,
+        &setup_iso,
         &xml,
         &media::FirstBootConfig { test_signing },
         None,
     )?;
-    restrict_file(&unattend_img)?;
+    restrict_file(&setup_iso)?;
 
     let cfg = VmConfig {
         name: name.to_owned(),
@@ -441,7 +441,7 @@ async fn create(name: &str, paths: &VmPaths, a: CreateArgs) -> anyhow::Result<()
         install: Some(InstallMedia {
             windows_iso,
             virtio_win_iso: virtio_iso,
-            unattend_img,
+            setup_iso,
         }),
     };
     cfg.save(&paths.data)?;
@@ -606,10 +606,12 @@ async fn install(
         marker,
         Duration::from_secs(timeout_min * 60),
         |line| {
-            eprintln!(
-                "  [{:>5.1} min] {line}",
-                started.elapsed().as_secs_f64() / 60.0
-            );
+            if !line.trim().is_empty() {
+                eprintln!(
+                    "  [{:>5.1} min] {line}",
+                    started.elapsed().as_secs_f64() / 60.0
+                );
+            }
         },
     );
     tokio::select! {
@@ -637,7 +639,7 @@ async fn install(
     cfg.install = None;
     cfg.save(&paths.data)?;
     // The setup image contains the account password.
-    let _ = std::fs::remove_file(&install.unattend_img);
+    let _ = std::fs::remove_file(&install.setup_iso);
     println!("Windows is installed. Start it with: lsw run");
     Ok(())
 }

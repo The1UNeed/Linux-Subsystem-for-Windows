@@ -74,8 +74,8 @@ pub struct Firmware {
 pub struct InstallMedia {
     pub windows_iso: PathBuf,
     pub virtio_win_iso: PathBuf,
-    /// FAT image carrying `autounattend.xml` and LSW's first-boot scripts.
-    pub unattend_img: PathBuf,
+    /// CD image carrying `autounattend.xml` and LSW's first-boot scripts.
+    pub setup_iso: PathBuf,
 }
 
 /// Persistent configuration of the single Windows VM.

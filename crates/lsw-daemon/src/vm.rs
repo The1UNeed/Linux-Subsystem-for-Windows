@@ -264,7 +264,7 @@ pub async fn wait_for_serial_marker(
                 lines.len().saturating_sub(1)
             };
             for line in &lines[seen.min(complete)..complete] {
-                let clean: String = line.chars().filter(|c| !c.is_control()).take(512).collect();
+                let clean = sanitize_console_line(line);
                 on_line(&clean);
                 if clean.contains(marker) {
                     return Ok(clean);
@@ -277,6 +277,35 @@ pub async fn wait_for_serial_marker(
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+}
+
+/// Make one guest console line safe to print: drop ANSI/VT escape sequences
+/// (the firmware clears the screen with them) and other control characters,
+/// and cap the length.
+pub fn sanitize_console_line(line: &str) -> String {
+    let mut out = String::new();
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                // CSI: parameters/intermediates up to a final byte @..~.
+                chars.next();
+                for f in chars.by_ref() {
+                    if ('@'..='~').contains(&f) {
+                        break;
+                    }
+                }
+            } else {
+                chars.next();
+            }
+        } else if !c.is_control() {
+            out.push(c);
+            if out.chars().count() >= 512 {
+                break;
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -319,7 +348,7 @@ mod tests {
         .await
         .unwrap();
         writer.await.unwrap();
-        assert_eq!(hit, "[2JLSW_INSTALL_DONE ok");
+        assert_eq!(hit, "LSW_INSTALL_DONE ok");
         assert_eq!(lines[0], "LSW_STAGE drivers");
     }
 
@@ -334,6 +363,15 @@ mod tests {
         )
         .await;
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn console_lines_are_sanitized() {
+        assert_eq!(
+            sanitize_console_line("\u{1b}[2J\u{1b}[01;01H\u{1b}[=3hBdsDxe: boot\u{7}"),
+            "BdsDxe: boot"
+        );
+        assert_eq!(sanitize_console_line(&"x".repeat(2000)).len(), 512);
     }
 
     #[test]

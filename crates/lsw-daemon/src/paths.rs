@@ -2,9 +2,14 @@
 //!
 //! * Persistent data: `$XDG_DATA_HOME/lsw/vms/<name>/` (config, disk, NVRAM,
 //!   TPM state, logs).
-//! * Runtime sockets: `$XDG_RUNTIME_DIR/lsw/<name>/` (QMP, swtpm, passt).
-//!   Unix socket paths are limited to 107 bytes, so they never live under a
-//!   potentially deep data directory.
+//! * QEMU runtime files: `$XDG_RUNTIME_DIR/lsw/<name>/` (QMP sockets, pid).
+//! * Helper sockets: `$HOME/.cache/lsw/sock/<name>/` (swtpm, passt). Ubuntu
+//!   confines `/usr/bin/swtpm` and `/usr/bin/passt` with AppArmor profiles
+//!   that may only create sockets under `/tmp` or `@{HOME}`; `/run/user` is
+//!   denied. The directory is derived from `$HOME` itself, not an XDG
+//!   variable, because the profiles match `@{HOME}`.
+//!
+//! Unix socket paths are limited to 107 bytes; [`VmPaths::create`] checks.
 
 use std::path::{Path, PathBuf};
 
@@ -16,12 +21,16 @@ pub const MAX_SOCKET_PATH: usize = 107;
 pub struct VmPaths {
     pub data: PathBuf,
     pub run: PathBuf,
+    /// Socket directory for the AppArmor-confined helpers (swtpm, passt).
+    pub helper_run: PathBuf,
 }
 
 impl VmPaths {
     /// Resolve from the environment.
     pub fn resolve(name: &str) -> anyhow::Result<Self> {
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|h| h.is_absolute());
         let data_home = std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
             .or_else(|| home.as_ref().map(|h| h.join(".local/share")))
@@ -30,13 +39,18 @@ impl VmPaths {
             Some(dir) => PathBuf::from(dir),
             None => std::env::temp_dir().join(format!("lsw-{}", user_id())),
         };
-        Ok(Self::with_bases(&data_home, &run_base, name))
+        let helper_base = match &home {
+            Some(h) => h.join(".cache/lsw/sock"),
+            None => run_base.join("lsw/sock"),
+        };
+        Ok(Self::with_bases(&data_home, &run_base, &helper_base, name))
     }
 
-    pub fn with_bases(data_home: &Path, run_base: &Path, name: &str) -> Self {
+    pub fn with_bases(data_home: &Path, run_base: &Path, helper_base: &Path, name: &str) -> Self {
         Self {
             data: data_home.join("lsw/vms").join(name),
             run: run_base.join("lsw").join(name),
+            helper_run: helper_base.join(name),
         }
     }
 
@@ -48,10 +62,10 @@ impl VmPaths {
         self.run.join("ctl.sock")
     }
     pub fn tpm_socket(&self) -> PathBuf {
-        self.run.join("tpm.sock")
+        self.helper_run.join("tpm.sock")
     }
     pub fn passt_socket(&self) -> PathBuf {
-        self.run.join("passt.sock")
+        self.helper_run.join("passt.sock")
     }
     pub fn qemu_pidfile(&self) -> PathBuf {
         self.run.join("qemu.pid")
@@ -66,9 +80,9 @@ impl VmPaths {
         self.data.join("saved-state.bin")
     }
 
-    /// Create both directories with owner-only permissions.
+    /// Create the directories with owner-only permissions.
     pub fn create(&self) -> anyhow::Result<()> {
-        for dir in [&self.data, &self.run] {
+        for dir in [&self.data, &self.run, &self.helper_run] {
             std::fs::create_dir_all(dir)?;
             restrict(dir)?;
         }
@@ -123,15 +137,24 @@ mod tests {
     #[test]
     fn layout_and_permissions() {
         let tmp = tempfile::tempdir().unwrap();
-        let p = VmPaths::with_bases(&tmp.path().join("data"), &tmp.path().join("run"), "win");
+        let p = VmPaths::with_bases(
+            &tmp.path().join("data"),
+            &tmp.path().join("run"),
+            &tmp.path().join("home/.cache/lsw/sock"),
+            "win",
+        );
         p.create().unwrap();
         assert!(p.data.ends_with("lsw/vms/win"));
         assert!(p.qmp_socket().starts_with(&p.run));
+        assert!(p.tpm_socket().starts_with(tmp.path().join("home")));
+        assert!(p.passt_socket().starts_with(tmp.path().join("home")));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&p.run).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o700);
+            for dir in [&p.data, &p.run, &p.helper_run] {
+                let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o700);
+            }
         }
     }
 
@@ -139,7 +162,12 @@ mod tests {
     fn rejects_overlong_socket_paths() {
         let tmp = tempfile::tempdir().unwrap();
         let deep = tmp.path().join("x".repeat(120));
-        let p = VmPaths::with_bases(&tmp.path().join("data"), &deep, "win");
+        let p = VmPaths::with_bases(
+            &tmp.path().join("data"),
+            &deep,
+            &tmp.path().join("h"),
+            "win",
+        );
         assert!(p.create().is_err());
     }
 }

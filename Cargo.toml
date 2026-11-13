@@ -8,7 +8,6 @@ edition = "2024"
 rust-version = "1.90"
 license = "Apache-2.0"
 repository = "https://github.com/The1UNeed/Linux-Subsystem-for-Windows"
-authors = ["LSW contributors"]
 
 [workspace.dependencies]
 lsw-proto = { path = "crates/lsw-proto" }
@@ -29,7 +28,7 @@ uuid = { version = "1.29.2", features = ["v4"] }
 regex = "1.13.1"
 sha2 = "0.11.1"
 hex = "0.4.3"
-fatfs = "0.3.6"
+hadris-iso = { version = "2.5", features = ["joliet"] }
 tempfile = "3.27.0"
 
 [workspace.lints.rust]

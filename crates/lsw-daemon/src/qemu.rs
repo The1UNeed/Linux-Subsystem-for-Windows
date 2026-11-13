@@ -188,17 +188,16 @@ pub fn build_args(cfg: &VmConfig, paths: &VmPaths, opts: &LaunchOptions) -> Vec<
             ),
         ]);
         push(&["-device", "ide-cd,drive=cdvirtio,bus=ide.1"]);
+        // Answer file + first-boot payload on a CD, never a disk: see
+        // `lsw_installer::media` for why.
         push(&[
             "-drive",
             &format!(
-                "file={},if=none,id=unattend,format=raw,readonly=on",
-                p(&install.unattend_img)
+                "file={},if=none,id=cdsetup,media=cdrom,readonly=on",
+                p(&install.setup_iso)
             ),
         ]);
-        push(&[
-            "-device",
-            "usb-storage,drive=unattend,removable=on,bus=xhci.0",
-        ]);
+        push(&["-device", "ide-cd,drive=cdsetup,bus=ide.2"]);
     }
 
     // Network.
@@ -234,12 +233,13 @@ pub fn build_args(cfg: &VmConfig, paths: &VmPaths, opts: &LaunchOptions) -> Vec<
 
     // Guest agent channel.
     if opts.vsock
-        && let Some(cid) = cfg.vsock_cid {
-            push(&[
-                "-device",
-                &format!("vhost-vsock-pci,id=vsock0,guest-cid={cid}"),
-            ]);
-        }
+        && let Some(cid) = cfg.vsock_cid
+    {
+        push(&[
+            "-device",
+            &format!("vhost-vsock-pci,id=vsock0,guest-cid={cid}"),
+        ]);
+    }
 
     // Display (tier D baseline; higher tiers add their devices in M3).
     push(&["-device", "virtio-vga,id=video0"]);
@@ -342,7 +342,12 @@ mod tests {
     #[test]
     fn baseline_windows_11_machine() {
         let dir = Path::new("/data/win");
-        let paths = VmPaths::with_bases(Path::new("/data"), Path::new("/run/user/1000"), "win");
+        let paths = VmPaths::with_bases(
+            Path::new("/data"),
+            Path::new("/run/user/1000"),
+            Path::new("/home/u/.cache/lsw/sock"),
+            "win",
+        );
         let args = build_args(&cfg(dir), &paths, &LaunchOptions::default());
         let s = joined(&args);
         assert!(s.contains("-machine q35,accel=kvm,smm=on"));
@@ -357,7 +362,7 @@ mod tests {
         assert!(s.contains("vhost-vsock-pci,id=vsock0,guest-cid=42"));
         assert!(s.contains("virtio-balloon-pci,id=balloon0,free-page-reporting=on"));
         assert!(s.contains("path=/run/user/1000/lsw/win/qmp.sock,server=on,wait=off"));
-        assert!(s.contains("addr.path=/run/user/1000/lsw/win/passt.sock"));
+        assert!(s.contains("addr.path=/home/u/.cache/lsw/sock/win/passt.sock"));
         assert!(s.contains("-display none"));
         assert!(s.contains("-sandbox on,"));
         assert!(!s.contains("ide-cd"), "no install media after setup");
@@ -366,23 +371,36 @@ mod tests {
     #[test]
     fn install_media_attached_and_cd_boots_first() {
         let dir = Path::new("/data/win");
-        let paths = VmPaths::with_bases(Path::new("/data"), Path::new("/run"), "win");
+        let paths = VmPaths::with_bases(
+            Path::new("/data"),
+            Path::new("/run"),
+            Path::new("/home/u/.cache/lsw/sock"),
+            "win",
+        );
         let mut c = cfg(dir);
         c.install = Some(InstallMedia {
             windows_iso: "/isos/win11.iso".into(),
             virtio_win_iso: "/isos/virtio-win.iso".into(),
-            unattend_img: "/data/win/unattend.img".into(),
+            setup_iso: "/data/win/setup.iso".into(),
         });
         let s = joined(&build_args(&c, &paths, &LaunchOptions::default()));
         assert!(s.contains("file=/isos/win11.iso,if=none,id=cdwin,media=cdrom,readonly=on"));
         assert!(s.contains("ide-cd,drive=cdwin,bus=ide.0,bootindex=0"));
         assert!(s.contains("ide-cd,drive=cdvirtio,bus=ide.1"));
-        assert!(s.contains("usb-storage,drive=unattend,removable=on,bus=xhci.0"));
+        assert!(s.contains("file=/data/win/setup.iso,if=none,id=cdsetup,media=cdrom,readonly=on"));
+        assert!(s.contains("ide-cd,drive=cdsetup,bus=ide.2"));
+        // The only disk in the VM is the system disk.
+        assert!(!s.contains("usb-storage"));
     }
 
     #[test]
     fn commas_in_paths_are_escaped() {
-        let paths = VmPaths::with_bases(Path::new("/d"), Path::new("/r"), "win");
+        let paths = VmPaths::with_bases(
+            Path::new("/d"),
+            Path::new("/r"),
+            Path::new("/home/u/.cache/lsw/sock"),
+            "win",
+        );
         let mut c = cfg(Path::new("/d"));
         c.disk_path = "/home/me/odd,name/disk.raw".into();
         let s = joined(&build_args(&c, &paths, &LaunchOptions::default()));
@@ -391,7 +409,12 @@ mod tests {
 
     #[test]
     fn optional_devices_follow_options() {
-        let paths = VmPaths::with_bases(Path::new("/d"), Path::new("/r"), "win");
+        let paths = VmPaths::with_bases(
+            Path::new("/d"),
+            Path::new("/r"),
+            Path::new("/home/u/.cache/lsw/sock"),
+            "win",
+        );
         let mut c = cfg(Path::new("/d"));
         c.network = Network::None;
         let opts = LaunchOptions {
@@ -417,11 +440,18 @@ mod tests {
 
     #[test]
     fn helper_args() {
-        let paths = VmPaths::with_bases(Path::new("/d"), Path::new("/r"), "win");
+        let paths = VmPaths::with_bases(
+            Path::new("/d"),
+            Path::new("/r"),
+            Path::new("/home/u/.cache/lsw/sock"),
+            "win",
+        );
         let c = cfg(Path::new("/d/lsw/vms/win"));
         let t = joined(&swtpm_args(&c, &paths));
         assert!(t.starts_with("socket --tpm2 --tpmstate dir=/d/lsw/vms/win/tpm"));
-        assert!(t.contains("type=unixio,path=/r/lsw/win/tpm.sock"));
-        assert!(joined(&passt_args(&paths)).contains("--socket /r/lsw/win/passt.sock"));
+        assert!(t.contains("type=unixio,path=/home/u/.cache/lsw/sock/win/tpm.sock"));
+        assert!(
+            joined(&passt_args(&paths)).contains("--socket /home/u/.cache/lsw/sock/win/passt.sock")
+        );
     }
 }
