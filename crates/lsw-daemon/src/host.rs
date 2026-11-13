@@ -155,13 +155,14 @@ impl HostReport {
 
     /// Default tier for a profile: Games prefers passthrough, everything
     /// else prefers paravirtualized 3D, and 2D is the universal fallback.
-    pub fn recommended_tier(&self, profile: Profile) -> GpuTier {
-        let has = |t| self.tiers.contains(&t);
-        match profile {
-            Profile::Games if has(GpuTier::B) => GpuTier::B,
-            _ if has(GpuTier::A) => GpuTier::A,
-            _ if has(GpuTier::C) => GpuTier::C,
-            _ => GpuTier::D,
+    /// The tier `lsw create` uses without `--tier`. Tiers B and C need a
+    /// device assigned with `lsw gpu assign`, so they are never automatic;
+    /// tier A waits for its guest driver ([`crate::gpu::TIER_A_DRIVER_READY`]).
+    pub fn recommended_tier(&self, _profile: Profile) -> GpuTier {
+        if crate::gpu::TIER_A_DRIVER_READY && self.tiers.contains(&GpuTier::A) {
+            GpuTier::A
+        } else {
+            GpuTier::D
         }
     }
 
@@ -465,14 +466,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn single_gpu_gets_tier_a_not_b() {
+    fn single_gpu_offers_tier_a_not_b() {
         let f = Fake::new();
         f.gpu("0000:00:02.0", "0x1002", true, 1, Some("renderD128"));
         let r = HostReport::probe_root(f.root(), &[]);
         assert_eq!(r.gpus.len(), 1);
         assert_eq!(r.gpus[0].render_node.as_deref(), Some("renderD128"));
         assert_eq!(r.tiers, vec![GpuTier::A, GpuTier::D]);
-        assert_eq!(r.recommended_tier(Profile::Games), GpuTier::A);
+        // Detected, but not chosen until its guest driver ships.
+        const { assert!(!crate::gpu::TIER_A_DRIVER_READY) };
+        assert_eq!(r.recommended_tier(Profile::Games), GpuTier::D);
     }
 
     #[cfg(unix)]
@@ -484,8 +487,9 @@ mod tests {
         let r = HostReport::probe_root(f.root(), &[]);
         assert_eq!(r.tiers, vec![GpuTier::A, GpuTier::B, GpuTier::D]);
         assert_eq!(r.passthrough_candidate().unwrap().pci_addr, "0000:01:00.0");
-        assert_eq!(r.recommended_tier(Profile::Games), GpuTier::B);
-        assert_eq!(r.recommended_tier(Profile::Productivity), GpuTier::A);
+        // Passthrough needs an explicit `lsw gpu assign`.
+        assert_eq!(r.recommended_tier(Profile::Games), GpuTier::D);
+        assert_eq!(r.recommended_tier(Profile::Productivity), GpuTier::D);
     }
 
     #[cfg(unix)]

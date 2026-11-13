@@ -195,6 +195,10 @@ pub struct VmConfig {
     /// Give Windows a microphone (off by default, as in Parallels).
     #[serde(default)]
     pub microphone: bool,
+    /// PCI functions passed through (tier B GPU and its audio, or a tier C
+    /// virtual function). Bound to vfio-pci by `lsw-helper`.
+    #[serde(default)]
+    pub passthrough: Vec<crate::gpu::PciAddr>,
     /// Present until the unattended installation finished.
     pub install: Option<InstallMedia>,
 }
@@ -282,6 +286,7 @@ mod tests {
             gpu_tier: GpuTier::D,
             shares: vec![],
             microphone: false,
+            passthrough: vec![],
             install: None,
         }
     }

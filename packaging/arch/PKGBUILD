@@ -1,0 +1,43 @@
+# Maintainer: LSW contributors
+pkgname=lsw
+pkgver=0.0.1alpha
+pkgrel=1
+pkgdesc="Linux Subsystem for Windows: Windows 11 apps on the Linux desktop"
+arch=('x86_64')
+url="https://github.com/The1UNeed/Linux-Subsystem-for-Windows"
+license=('Apache-2.0')
+depends=('qemu-base' 'qemu-ui-dbus' 'qemu-audio-pipewire' 'qemu-hw-usb-host' 'edk2-ovmf'
+         'swtpm' 'passt' 'virtiofsd' 'shadow' 'polkit' 'gtk4' 'libadwaita' 'libxkbcommon')
+makedepends=('rustup' 'mingw-w64-gcc' 'git')
+optdepends=('pipewire: Windows sound')
+source=("$pkgname::git+$url#tag=v0.0.1-alpha")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$pkgname"
+  rustup target add x86_64-pc-windows-gnu
+}
+
+build() {
+  cd "$pkgname"
+  cargo build --release --locked --workspace
+  cargo build --release --locked --target x86_64-pc-windows-gnu -p lsw-guest-agent
+}
+
+check() {
+  cd "$pkgname"
+  cargo test --release --locked --workspace
+}
+
+package() {
+  cd "$pkgname"
+  install -Dm755 target/release/lsw "$pkgdir/usr/bin/lsw"
+  install -Dm755 target/release/lsw-app "$pkgdir/usr/bin/lsw-app"
+  install -Dm755 target/release/lsw-coherence "$pkgdir/usr/bin/lsw-coherence"
+  install -Dm755 target/release/lsw-helper "$pkgdir/usr/lib/lsw/lsw-helper"
+  install -Dm644 target/x86_64-pc-windows-gnu/release/lsw-agent.exe "$pkgdir/usr/lib/lsw/guest/lsw-agent.exe"
+  install -Dm644 packaging/systemd/lsw@.service "$pkgdir/usr/lib/systemd/user/lsw@.service"
+  install -Dm644 packaging/polkit/dev.lsw.helper.policy "$pkgdir/usr/share/polkit-1/actions/dev.lsw.helper.policy"
+  install -Dm644 packaging/desktop/dev.lsw.Lsw.desktop "$pkgdir/usr/share/applications/dev.lsw.Lsw.desktop"
+  install -Dm644 packaging/desktop/dev.lsw.Lsw.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/dev.lsw.Lsw.svg"
+}

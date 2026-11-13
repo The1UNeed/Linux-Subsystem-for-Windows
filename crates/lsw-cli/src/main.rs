@@ -120,6 +120,11 @@ enum Cmd {
         #[command(subcommand)]
         action: UsbAction,
     },
+    /// GPU passthrough (tier B: a second GPU; tier C: an Intel SR-IOV VF).
+    Gpu {
+        #[command(subcommand)]
+        action: GpuAction,
+    },
     /// Windows apps as Linux launchers.
     Apps {
         #[command(subcommand)]
@@ -149,6 +154,17 @@ struct LaunchArgs {
     /// No display for the LSW app (screenshots through `lsw ctl` still work).
     #[arg(long)]
     headless: bool,
+}
+
+#[derive(Subcommand)]
+enum GpuAction {
+    /// List display controllers and their IOMMU groups.
+    List,
+    /// Give a GPU (and its HDMI/DP audio) to Windows; takes effect at the
+    /// next start. Asks for an administrator password (polkit).
+    Assign { pci: String },
+    /// Give the GPU back to Linux.
+    Release,
 }
 
 #[derive(Subcommand)]
@@ -229,6 +245,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Launch { app } => launch(&cli.name, &paths, &app).await,
+        Cmd::Gpu { action } => gpu(&paths, action),
         Cmd::Display { width, height } => {
             let mut s = attach_session(&paths).await?;
             s.display_hint(width, height, 100).await?;
@@ -371,6 +388,10 @@ async fn create(name: &str, paths: &VmPaths, a: CreateArgs) -> anyhow::Result<()
     let (mem, cpus, disk) = profile.capped(host.mem_total_mib, host.logical_cpus.max(2));
     let tier = match a.tier {
         TierArg::Auto => host.recommended_tier(profile),
+        TierArg::A if !lsw_daemon::gpu::TIER_A_DRIVER_READY => bail!(
+            "GPU tier A (paravirtualized 3D) is not available in this release: its Windows driver \
+             is not ready. Use tier D now; tier B/C need `lsw gpu assign` after creating the VM."
+        ),
         TierArg::A => GpuTier::A,
         TierArg::B => GpuTier::B,
         TierArg::C => GpuTier::C,
@@ -389,8 +410,9 @@ async fn create(name: &str, paths: &VmPaths, a: CreateArgs) -> anyhow::Result<()
         NetArg::None => Network::None,
     };
 
-    // Tier A's test-signed driver needs Secure Boot off (alpha decision).
-    let test_signing = tier == GpuTier::A;
+    // Tier A's test-signed driver needs Secure Boot off (alpha decision);
+    // never without the driver itself.
+    let test_signing = tier == GpuTier::A && lsw_daemon::gpu::TIER_A_DRIVER_READY;
     let fw = firmware::find(Path::new("/"), !test_signing)
         .or_else(|| firmware::find(Path::new("/"), false))
         .context(
@@ -501,6 +523,7 @@ async fn create(name: &str, paths: &VmPaths, a: CreateArgs) -> anyhow::Result<()
             default_shares()
         },
         microphone: false,
+        passthrough: Vec::new(),
         install: Some(InstallMedia {
             windows_iso,
             virtio_win_iso: virtio_iso,
@@ -777,6 +800,9 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
         },
     ));
     let (call_tx, mut call_rx) = tokio::sync::mpsc::unbounded_channel::<api::Call>();
+    let mut idle = lsw_daemon::idle::IdlePolicy::new(std::time::Instant::now());
+    let mut idle_tick = tokio::time::interval(Duration::from_secs(2));
+    let mut coherence_windows = 0u32;
     let api_path = paths.api_socket();
     let api_server = tokio::spawn(async move {
         if let Err(e) = api::serve(&api_path, call_tx).await {
@@ -807,8 +833,46 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
                 break Ok(());
             }
             call = call_rx.recv() => {
-                if let Some(call) = call {
-                    handle_api_call(call, &connected, &cmd_tx, paths);
+                let Some(call) = call else { continue };
+                match &call.request {
+                    api::Request::Windows { count } => {
+                        coherence_windows = *count;
+                        let _ = call.reply.send(api::Response::ok());
+                        continue;
+                    }
+                    api::Request::Status => {
+                        let _ = call.reply.send(api::Response {
+                            agent: Some(connected.load(Ordering::Acquire)),
+                            paused: Some(idle.paused()),
+                            ..api::Response::ok()
+                        });
+                        continue;
+                    }
+                    api::Request::Launch { .. } | api::Request::SyncApps => {
+                        // The agent must run to answer.
+                        if idle.wake(std::time::Instant::now()) == lsw_daemon::idle::Action::Resume {
+                            running.resume().await?;
+                            println!("Resumed for a request.");
+                        }
+                    }
+                }
+                handle_api_call(call, &connected, &cmd_tx, paths);
+            }
+            _ = idle_tick.tick() => {
+                let obs = observe_views(&mut running, coherence_windows).await;
+                if !obs.coherence_view {
+                    coherence_windows = 0;
+                }
+                match idle.observe(obs, std::time::Instant::now()) {
+                    lsw_daemon::idle::Action::Pause => {
+                        running.pause().await?;
+                        println!("Nothing of Windows is visible: paused (0% CPU).");
+                    }
+                    lsw_daemon::idle::Action::Resume => {
+                        running.resume().await?;
+                        println!("Resumed.");
+                    }
+                    lsw_daemon::idle::Action::None => {}
                 }
             }
         }
@@ -817,6 +881,33 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
     api_server.abort();
     let _ = std::fs::remove_file(paths.api_socket());
     result
+}
+
+/// Which LSW views are attached, from QEMU's chardev state.
+async fn observe_views(
+    running: &mut vm::Running,
+    coherence_windows: u32,
+) -> lsw_daemon::idle::Observation {
+    let mut obs = lsw_daemon::idle::Observation {
+        coherence_windows,
+        ..Default::default()
+    };
+    // On error, report everything visible: never pause on bad information.
+    let Ok(list) = running.qmp.execute("query-chardev", None).await else {
+        obs.window_view = true;
+        return obs;
+    };
+    for c in list.as_array().into_iter().flatten() {
+        let label = c.get("label").and_then(|v| v.as_str()).unwrap_or("");
+        let file = c.get("filename").and_then(|v| v.as_str()).unwrap_or("");
+        let up = lsw_daemon::idle::chardev_connected(file);
+        match label {
+            "session" => obs.window_view = up,
+            "coherence" => obs.coherence_view = up,
+            _ => {}
+        }
+    }
+    obs
 }
 
 /// Answer one API request without blocking the supervisor loop.
@@ -828,7 +919,7 @@ fn handle_api_call(
 ) {
     let api::Call { request, reply } = call;
     match request {
-        api::Request::Status => {
+        api::Request::Status | api::Request::Windows { .. } => {
             let _ = reply.send(api::Response {
                 agent: Some(connected.load(Ordering::Acquire)),
                 ..api::Response::ok()
@@ -1083,6 +1174,69 @@ async fn launch(name: &str, paths: &VmPaths, app: &str) -> anyhow::Result<()> {
         Duration::from_secs(10),
     )
     .await?;
+    Ok(())
+}
+
+fn gpu(paths: &VmPaths, action: GpuAction) -> anyhow::Result<()> {
+    use lsw_daemon::gpu::{PciAddr, passthrough_set};
+    let sysfs = Path::new("/sys/bus/pci/devices");
+    match action {
+        GpuAction::List => {
+            let report = HostReport::probe();
+            for g in &report.gpus {
+                let set = PciAddr::parse(&g.pci_addr).map(|a| passthrough_set(sysfs, &a));
+                let note = match set {
+                    Some(Ok(_)) if g.boot_vga => "drives the Linux desktop".to_owned(),
+                    Some(Ok(_)) => "can be assigned (tier B)".to_owned(),
+                    Some(Err(e)) => e,
+                    None => "invalid address".to_owned(),
+                };
+                println!(
+                    "{}  {:04x}:{:04x}  driver={}  vfs={}  {note}",
+                    g.pci_addr,
+                    g.vendor,
+                    g.device,
+                    g.driver.as_deref().unwrap_or("-"),
+                    g.sriov_total_vfs
+                );
+            }
+        }
+        GpuAction::Assign { pci } => {
+            let addr = PciAddr::parse(&pci).context("expected a PCI address like 0000:01:00.0")?;
+            let set = passthrough_set(sysfs, &addr).map_err(|e| anyhow::anyhow!(e))?;
+            let helper = ["/usr/lib/lsw/lsw-helper", "/usr/libexec/lsw-helper"]
+                .into_iter()
+                .find(|p| Path::new(p).is_file())
+                .context("lsw-helper is not installed (it ships with the LSW package)")?;
+            let status = std::process::Command::new("pkexec")
+                .args([helper, "bind-vfio", addr.as_str()])
+                .status()
+                .context("pkexec")?;
+            anyhow::ensure!(status.success(), "lsw-helper failed");
+            let mut cfg = VmConfig::load(&paths.data)?;
+            cfg.passthrough = set.into_iter().map(|f| f.addr).collect();
+            cfg.gpu_tier = GpuTier::B;
+            cfg.save(&paths.data)?;
+            println!("{addr} is assigned to Windows from the next start (tier B).");
+        }
+        GpuAction::Release => {
+            let mut cfg = VmConfig::load(&paths.data)?;
+            if let Some(first) = cfg.passthrough.first().cloned() {
+                let helper = ["/usr/lib/lsw/lsw-helper", "/usr/libexec/lsw-helper"]
+                    .into_iter()
+                    .find(|p| Path::new(p).is_file())
+                    .context("lsw-helper is not installed")?;
+                let status = std::process::Command::new("pkexec")
+                    .args([helper, "release", first.as_str()])
+                    .status()?;
+                anyhow::ensure!(status.success(), "lsw-helper failed");
+            }
+            cfg.passthrough.clear();
+            cfg.gpu_tier = GpuTier::D;
+            cfg.save(&paths.data)?;
+            println!("The GPU is back on Linux.");
+        }
+    }
     Ok(())
 }
 

@@ -1642,6 +1642,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lsw-helper"
+version = "0.0.1-alpha"
+dependencies = [
+ "lsw-daemon",
+ "tempfile",
+]
+
+[[package]]
 name = "lsw-installer"
 version = "0.0.1-alpha"
 dependencies = [

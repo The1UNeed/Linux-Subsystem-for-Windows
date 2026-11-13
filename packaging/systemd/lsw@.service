@@ -1,0 +1,17 @@
+# LSW VM supervisor, one instance per VM: systemctl --user start lsw@windows
+[Unit]
+Description=LSW Windows VM (%i)
+Documentation=https://github.com/The1UNeed/Linux-Subsystem-for-Windows
+
+[Service]
+ExecStart=/usr/bin/lsw --name %i run
+# Ctrl+C equivalent: lsw shuts Windows down cleanly (ACPI) on SIGINT.
+KillSignal=SIGINT
+TimeoutStopSec=150
+Restart=on-failure
+RestartSec=5
+# GPU passthrough (tier B/C) pins guest memory.
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=default.target

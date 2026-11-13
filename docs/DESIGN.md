@@ -247,6 +247,19 @@ from running it.
 | M3 GPU | Tier B, tier C, tier A (virgl, then Venus). GPU driver work runs in parallel from M0. |
 | M4 Release | Idle/suspend lifecycle, power tuning, packages, signing pipeline, guest auto-update, docs → v0.0.1-alpha. |
 
+### Status of v0.0.1-alpha
+
+Verified means: run on Ubuntu 24.04 (KVM) with Windows 11 26H2 Enterprise
+Evaluation, with screenshots or recordings as evidence.
+
+| Milestone | Delivered and verified | Delivered, not verified on hardware | Not in this release |
+|---|---|---|---|
+| M0 | Host check, media download and verification, unattended install (20.8 min), Secure Boot + TPM, virtio drivers. | — | Graphical setup wizard (CLI only). |
+| M1 | Agent over virtio-serial, Window view, dynamic resolution, native Full Screen resolution, clipboard both ways, PipeWire audio, shared folders both ways, USB hot-plug (emulated device; the test host has no USB bus). | Passthrough of a physical USB device. | — |
+| M2 | Coherence (separate native windows, input, native move/resize via hit test), app launchers with icons (70 written), launch from Linux. | — | Start menu window, tray icons, notifications, links to the Linux browser, file associations, drag and drop, Picture-in-Picture. |
+| M3 | — | Tier B (VFIO) and tier C (SR-IOV) host side: helper, polkit, QEMU arguments (unit-tested on fake sysfs; no IOMMU/GPU on the test host). | Tier A: the paravirtualized 3D guest driver (C/C++ fork) is not ready, so tier A is disabled and never turns Secure Boot off. |
+| M4 | Idle pause (0 % CPU), LSW Tools auto-update, Debian package, PKGBUILD, CI, docs. | — | Save state to disk when idle (QEMU 8.2 blocks migration with virtiofs), PPA publication, EV signing pipeline (nothing to sign until tier A), bundled pinned QEMU. |
+
 ### Testing
 
 - Rust unit tests; fuzzing for every parser of guest data.

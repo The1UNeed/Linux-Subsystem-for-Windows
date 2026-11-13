@@ -114,6 +114,8 @@ struct App {
     focused: Option<u64>,
     /// Windows' foreground window, as the guest reports it.
     guest_foreground: Option<u64>,
+    /// Window count last reported to the supervisor.
+    reported: Option<u32>,
     pending: Option<PendingPress>,
     next_hit: u32,
     exit: bool,
@@ -284,7 +286,25 @@ impl App {
         }
     }
 
+    /// Tell the supervisor how many windows are visible, when it changes.
+    fn report_count(&mut self) {
+        let visible = self
+            .windows
+            .values()
+            .filter(|w| w.info.state != WindowState::Minimized && w.info.kind != WindowKind::Popup)
+            .count() as u32;
+        if self.reported != Some(visible) {
+            self.reported = Some(visible);
+            self.send(Request::WindowCount(visible));
+        }
+    }
+
     fn handle(&mut self, update: Update) {
+        self.handle_inner(update);
+        self.report_count();
+    }
+
+    fn handle_inner(&mut self, update: Update) {
         match update {
             Update::Guest(msg) => match msg {
                 CoMessage::Opened(info) => self.open(info),
@@ -424,6 +444,7 @@ fn main() -> anyhow::Result<()> {
         pointer_window: None,
         focused: None,
         guest_foreground: None,
+        reported: None,
         pending: None,
         next_hit: 1,
         exit: false,

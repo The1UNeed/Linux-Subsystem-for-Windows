@@ -296,7 +296,13 @@ pub fn build_args(cfg: &VmConfig, paths: &VmPaths, opts: &LaunchOptions) -> Vec<
     push(&[
         "-device",
         &format!(
-            "virtio-balloon-pci,id=balloon0,free-page-reporting=on,bus=pcie.0,addr={}",
+            // VFIO pins guest memory, so pages cannot be returned.
+            "virtio-balloon-pci,id=balloon0,free-page-reporting={},bus=pcie.0,addr={}",
+            if cfg.passthrough.is_empty() {
+                "on"
+            } else {
+                "off"
+            },
             slot::BALLOON
         ),
     ]);
@@ -382,6 +388,11 @@ pub fn build_args(cfg: &VmConfig, paths: &VmPaths, opts: &LaunchOptions) -> Vec<
             "hda-output"
         };
         push(&["-device", &format!("{codec},bus=hda0.0,audiodev=snd0")]);
+    }
+
+    // GPU tiers B/C: passed-through PCI functions.
+    for arg in crate::gpu::qemu_args(&cfg.passthrough) {
+        push(&[&arg]);
     }
 
     // Display (tier D baseline; higher tiers add their devices in M3).
@@ -510,6 +521,7 @@ mod tests {
             gpu_tier: GpuTier::D,
             shares: vec![],
             microphone: false,
+            passthrough: vec![],
             install: None,
         }
     }
@@ -716,6 +728,21 @@ mod tests {
         slots.dedup();
         assert_eq!(slots.len(), n, "duplicate slots");
         assert!(n >= 7);
+    }
+
+    #[test]
+    fn passthrough_devices_and_balloon() {
+        let paths = VmPaths::with_bases(
+            Path::new("/d"),
+            Path::new("/r"),
+            Path::new("/home/u/.cache/lsw/sock"),
+            "win",
+        );
+        let mut c = cfg(Path::new("/d"));
+        c.passthrough = vec![crate::gpu::PciAddr::parse("0000:01:00.0").unwrap()];
+        let s = joined(&build_args(&c, &paths, &LaunchOptions::default()));
+        assert!(s.contains("vfio-pci,host=0000:01:00.0,bus=pcie.0,addr=0x08.0,multifunction=on"));
+        assert!(s.contains("free-page-reporting=off"));
     }
 
     #[test]

@@ -28,6 +28,9 @@ pub enum Request {
         qnum: u32,
         down: bool,
     },
+    /// Number of mirrored windows changed (the supervisor pauses Windows
+    /// when nothing is visible).
+    WindowCount(u32),
 }
 
 /// To the Wayland side.
@@ -106,6 +109,17 @@ async fn connection(
                     Request::Button { button, down } => {
                         tracing::debug!("button {button} {}", if down { "down" } else { "up" });
                         if down { mouse.press(button).await? } else { mouse.release(button).await? }
+                    }
+                    Request::WindowCount(count) => {
+                        let api = paths.api_socket();
+                        tokio::spawn(async move {
+                            let _ = lsw_daemon::api::call(
+                                &api,
+                                &lsw_daemon::api::Request::Windows { count },
+                                Duration::from_secs(2),
+                            )
+                            .await;
+                        });
                     }
                     Request::Key { qnum, down } => {
                         if down { keyboard.press(qnum).await? } else { keyboard.release(qnum).await? }

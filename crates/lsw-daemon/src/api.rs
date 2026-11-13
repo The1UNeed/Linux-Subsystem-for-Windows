@@ -17,7 +17,14 @@ const MAX_REQUEST: usize = 16 * 1024;
 pub enum Request {
     Status,
     SyncApps,
-    Launch { launch: String },
+    Launch {
+        launch: String,
+    },
+    /// From the Coherence client: how many windows it mirrors (idle
+    /// detection).
+    Windows {
+        count: u32,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -31,6 +38,9 @@ pub struct Response {
     /// `sync-apps`: number of launchers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub apps: Option<usize>,
+    /// `status`: whether the VM is paused because nothing is visible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused: Option<bool>,
 }
 
 impl Response {
@@ -40,6 +50,7 @@ impl Response {
             error: None,
             agent: None,
             apps: None,
+            paused: None,
         }
     }
     pub fn err(e: impl Into<String>) -> Self {
