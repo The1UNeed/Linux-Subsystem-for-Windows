@@ -113,15 +113,15 @@ fn placeholder_size(info: &WindowInfo) -> (u32, u32) {
     }
 }
 
-/// Placeholder size charged against [`MAX_FRAME_BYTES`]: once the budget is
-/// spent, a 64×32 one (8 KiB; at most `MAX_WINDOWS` of them beyond it).
-fn placeholder_within_budget(info: &WindowInfo, held: usize) -> (u32, u32) {
-    let size = placeholder_size(info);
-    if held + size.0 as usize * size.1 as usize * 4 * HELD_COPIES > MAX_FRAME_BYTES {
-        (64, 32)
-    } else {
-        size
-    }
+/// The placeholder that fits in what is left of [`MAX_FRAME_BYTES`] (with
+/// its buffers): the usual size, else 64×32, else none yet (the window
+/// waits until released buffers make room).
+fn placeholder_within_budget(info: &WindowInfo, held: usize) -> Option<(u32, u32)> {
+    let fits =
+        |(w, h): (u32, u32)| held + w as usize * h as usize * 4 * HELD_COPIES <= MAX_FRAME_BYTES;
+    [placeholder_size(info), (64, 32)]
+        .into_iter()
+        .find(|&size| fits(size))
 }
 
 /// Linux input button codes (`linux/input-event-codes.h`).
@@ -174,6 +174,8 @@ struct Mirrored {
     /// An update could not be shown (every buffer busy): show it on the
     /// next frame callback or update, with full damage.
     dirty: bool,
+    /// Minimized in Windows, and no room for a placeholder yet.
+    placeholder_pending: bool,
 }
 
 impl Mirrored {
@@ -326,13 +328,17 @@ impl App {
         // A window minimized in Windows sends no frames (nothing to
         // capture), but it must still exist on Linux (in the dock) so the
         // user can restore it: show a neutral placeholder until it does.
-        let (frame, size) = if info.state == WindowState::Minimized {
-            let held = self.held_total();
-            let size = placeholder_within_budget(&info, held);
-            (vec![0xf0; size.0 as usize * size.1 as usize * 4], size)
+        let minimized = info.state == WindowState::Minimized;
+        let placeholder = if minimized {
+            placeholder_within_budget(&info, self.held_total())
         } else {
-            (Vec::new(), (0, 0))
+            None
         };
+        let (frame, size) = match placeholder {
+            Some(size) => (vec![0xf0; size.0 as usize * size.1 as usize * 4], size),
+            None => (Vec::new(), (0, 0)),
+        };
+        let placeholder_pending = minimized && placeholder.is_none();
         let replaced = self.windows.insert(
             info.id,
             Mirrored {
@@ -345,6 +351,7 @@ impl App {
                 requested: None,
                 buffers: Vec::new(),
                 dirty: false,
+                placeholder_pending,
             },
         );
         if let Some(old) = replaced {
@@ -370,7 +377,11 @@ impl App {
 
     /// Something waits for the compositor to release a buffer.
     fn has_pending(&self) -> bool {
-        !self.retired.is_empty() || self.windows.values().any(|w| w.dirty)
+        !self.retired.is_empty()
+            || self
+                .windows
+                .values()
+                .any(|w| w.dirty || w.placeholder_pending)
     }
 
     /// After any event or a short wait: forget released retired buffers and
@@ -380,6 +391,28 @@ impl App {
     fn retry_pending(&mut self) {
         let pool = &mut self.pool;
         prune_retired(&mut self.retired, |b| b.canvas(pool).is_some());
+        // Placeholders that had to wait for room.
+        let waiting: Vec<u64> = self
+            .windows
+            .iter()
+            .filter(|(_, w)| w.placeholder_pending)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in waiting {
+            let held = self.held_total();
+            let Some(w) = self.windows.get_mut(&id) else {
+                continue;
+            };
+            let Some(size) = placeholder_within_budget(&w.info, held) else {
+                break; // still no room
+            };
+            w.frame = vec![0xf0; size.0 as usize * size.1 as usize * 4];
+            w.size = size;
+            w.placeholder_pending = false;
+            if w.configured {
+                Self::draw(&mut self.pool, &self.qh, w, None);
+            }
+        }
         for w in self
             .windows
             .values_mut()
@@ -422,6 +455,7 @@ impl App {
             }
             w.size = (width, height);
             w.frame = vec![0u8; width as usize * height as usize * 4];
+            w.placeholder_pending = false;
             if w.requested == Some((width, height)) {
                 w.requested = None;
             }
@@ -1144,14 +1178,23 @@ mod tests {
         // Charged against the frame budget.
         // Charged with its buffers: HELD_COPIES copies of the contents.
         let cost = 900 * 700 * 4 * HELD_COPIES;
-        assert_eq!(placeholder_within_budget(&info(900, 700), 0), (900, 700));
+        let small = 64 * 32 * 4 * HELD_COPIES;
+        assert_eq!(
+            placeholder_within_budget(&info(900, 700), 0),
+            Some((900, 700))
+        );
         assert_eq!(
             placeholder_within_budget(&info(900, 700), MAX_FRAME_BYTES - cost),
-            (900, 700)
+            Some((900, 700))
         );
         assert_eq!(
             placeholder_within_budget(&info(900, 700), MAX_FRAME_BYTES - cost + 1),
-            (64, 32)
+            Some((64, 32))
+        );
+        assert_eq!(
+            placeholder_within_budget(&info(900, 700), MAX_FRAME_BYTES - small + 1),
+            None,
+            "not even the smallest one fits: none yet"
         );
     }
 
@@ -1207,6 +1250,44 @@ mod tests {
             pick_buffer(&mut bufs, (800, 4800), size, |b| !b.busy),
             Pick::Reuse(0)
         );
+    }
+
+    #[test]
+    fn placeholder_churn_with_delayed_releases_never_exceeds_the_budget() {
+        let info = WindowInfo {
+            id: 1,
+            owner: None,
+            kind: WindowKind::Normal,
+            title: String::new(),
+            exe: String::new(),
+            app: String::new(),
+            rect: lsw_proto::coherence::Rect {
+                x: 0,
+                y: 0,
+                width: 1280,
+                height: 800,
+            },
+            state: WindowState::Minimized,
+        };
+        // A guest opens a minimized window, lets it draw and closes it,
+        // 10,000 times (far beyond MAX_WINDOWS); the compositor releases
+        // nothing, so every placeholder's charge stays (retired).
+        let mut retired = 0usize;
+        let mut admitted = 0;
+        for _ in 0..10_000 {
+            // None: the window waits until releases make room.
+            if let Some((w, h)) = placeholder_within_budget(&info, retired) {
+                retired += w as usize * h as usize * 4 * HELD_COPIES;
+                admitted += 1;
+            }
+            assert!(
+                retired <= MAX_FRAME_BYTES,
+                "budget exceeded after {admitted}"
+            );
+        }
+        assert!(admitted < 10_000, "admission stopped at the budget");
+        // Releases make room again.
+        assert!(placeholder_within_budget(&info, 0).is_some());
     }
 
     #[test]
