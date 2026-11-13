@@ -94,6 +94,11 @@ impl VmPaths {
     pub fn qemu_log(&self) -> PathBuf {
         self.data.join("qemu.log")
     }
+    /// Preferred display size (`{"width":…,"height":…}`), written by the
+    /// app from the monitor size; used as virtio-gpu's preferred mode.
+    pub fn display_size_file(&self) -> PathBuf {
+        self.data.join("display.json")
+    }
     /// The LSW Tools CD, rebuilt at every start.
     pub fn tools_iso(&self) -> PathBuf {
         self.data.join("tools.iso")

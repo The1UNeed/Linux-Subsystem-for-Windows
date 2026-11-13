@@ -630,6 +630,7 @@ fn launch_options(host: &HostReport, l: &LaunchArgs) -> LaunchOptions {
             Audio::None
         },
         tools_iso: None,
+        display_size: (1280, 800),
         sandbox: !l.no_sandbox,
     }
 }
@@ -709,6 +710,7 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
     }
     let host = HostReport::probe();
     let mut opts = launch_options(&host, l);
+    opts.display_size = lsw_daemon::config::DisplaySize::load(&paths.display_size_file());
     opts.tools_iso = match guest::prepare_tools(paths).await {
         Ok(t) => t,
         Err(e) => {

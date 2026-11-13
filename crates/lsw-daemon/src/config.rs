@@ -120,6 +120,37 @@ impl Share {
     }
 }
 
+/// Preferred display size, persisted by the app (see
+/// [`crate::paths::VmPaths::display_size_file`]).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplaySize {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl DisplaySize {
+    /// Read the stored size; falls back to 1280×800 and rejects sizes
+    /// virtio-gpu would not accept.
+    pub fn load(path: &Path) -> (u32, u32) {
+        let stored = std::fs::read(path)
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<DisplaySize>(&raw).ok());
+        match stored {
+            Some(d) if (640..=16384).contains(&d.width) && (480..=16384).contains(&d.height) => {
+                (d.width, d.height)
+            }
+            _ => (1280, 800),
+        }
+    }
+
+    /// Store atomically.
+    pub fn save(self, path: &Path) -> std::io::Result<()> {
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec(&self)?)?;
+        std::fs::rename(tmp, path)
+    }
+}
+
 /// Parse `user-dirs.dirs` (`XDG_DOCUMENTS_DIR="$HOME/Dokumente"`) into
 /// `("DOCUMENTS", path)` pairs. Only `$HOME/…` and absolute values are
 /// accepted, as the xdg-user-dirs format specifies.
@@ -305,6 +336,22 @@ mod tests {
         assert_eq!(tags, ["lsw-documents", "lsw-pictures"]);
         assert_eq!(shares[1].host_path, h.join("Bilder"));
         assert_eq!(shares[1].folder, KnownFolder::Pictures);
+    }
+
+    #[test]
+    fn display_size_roundtrip_and_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("display.json");
+        assert_eq!(DisplaySize::load(&f), (1280, 800));
+        DisplaySize {
+            width: 2560,
+            height: 1440,
+        }
+        .save(&f)
+        .unwrap();
+        assert_eq!(DisplaySize::load(&f), (2560, 1440));
+        std::fs::write(&f, br#"{"width":99999,"height":10}"#).unwrap();
+        assert_eq!(DisplaySize::load(&f), (1280, 800));
     }
 
     #[test]

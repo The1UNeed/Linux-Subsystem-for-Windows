@@ -21,6 +21,15 @@ pub fn should_update(own_build: &str, cd_build: &str, last_attempt: Option<&str>
     !cd_build.is_empty() && cd_build != own_build && last_attempt.map(str::trim) != Some(cd_build)
 }
 
+/// The largest of `modes` that fits inside `width`×`height`.
+pub fn best_fitting_mode(modes: &[(u32, u32)], width: u32, height: u32) -> Option<(u32, u32)> {
+    modes
+        .iter()
+        .copied()
+        .filter(|&(w, h)| w <= width && h <= height)
+        .max_by_key(|&(w, h)| u64::from(w) * u64::from(h))
+}
+
 /// The two virtio-serial ports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortId {
@@ -366,6 +375,14 @@ mod tests {
         assert!(matches!(out[0].msg, Message::Hello { .. }));
         assert_eq!(out[0].reply_to, Some(1));
         agent.on_message(port, env(2, Message::Welcome { protocol: 1 }));
+    }
+
+    #[test]
+    fn best_fitting_mode_picks_largest_that_fits() {
+        let modes = [(1024, 768), (1280, 800), (1600, 900), (1920, 1080)];
+        assert_eq!(best_fitting_mode(&modes, 1600, 1000), Some((1600, 900)));
+        assert_eq!(best_fitting_mode(&modes, 1300, 2000), Some((1280, 800)));
+        assert_eq!(best_fitting_mode(&modes, 800, 600), None);
     }
 
     #[test]

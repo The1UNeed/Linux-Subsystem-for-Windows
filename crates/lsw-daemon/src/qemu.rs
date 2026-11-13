@@ -88,6 +88,9 @@ pub struct LaunchOptions {
     pub audio: Audio,
     /// LSW Tools CD to attach (agent install and auto-update).
     pub tools_iso: Option<PathBuf>,
+    /// virtio-gpu preferred mode (EDID), normally the host monitor size;
+    /// viogpudo reads it at boot.
+    pub display_size: (u32, u32),
     /// Enable QEMU's seccomp sandbox.
     pub sandbox: bool,
 }
@@ -99,6 +102,7 @@ impl Default for LaunchOptions {
             disk_io: DiskIo::IoUring,
             audio: Audio::None,
             tools_iso: None,
+            display_size: (1280, 800),
             sandbox: true,
         }
     }
@@ -369,7 +373,9 @@ pub fn build_args(cfg: &VmConfig, paths: &VmPaths, opts: &LaunchOptions) -> Vec<
     push(&[
         "-device",
         &format!(
-            "virtio-vga,id=video0,xres=1280,yres=800,edid=on,bus=pcie.0,addr={}",
+            "virtio-vga,id=video0,xres={},yres={},edid=on,bus=pcie.0,addr={}",
+            opts.display_size.0,
+            opts.display_size.1,
             slot::VGA
         ),
     ]);
@@ -593,6 +599,7 @@ mod tests {
         let opts = LaunchOptions {
             audio: Audio::None,
             tools_iso: Some("/d/tools.iso".into()),
+            display_size: (2560, 1440),
             sandbox: false,
             disk_io: DiskIo::Threads,
             display: Display::VncUnix("/r/vnc.sock".into()),
@@ -604,6 +611,7 @@ mod tests {
         assert!(s.contains("-vnc unix:/r/vnc.sock"));
         assert!(s.contains("file=/d/tools.iso,if=none,id=cdtools,media=cdrom,readonly=on"));
         assert!(s.contains("ide-cd,drive=cdtools,bus=ide.3"));
+        assert!(s.contains("virtio-vga,id=video0,xres=2560,yres=1440,edid=on"));
     }
 
     #[test]

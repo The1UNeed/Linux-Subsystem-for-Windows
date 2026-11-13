@@ -589,14 +589,19 @@ impl Windows {
 
 impl Windows {
     fn change_display(&self, width: u32, height: u32, scale_percent: u16) -> Result<(), String> {
-        // The host first announces the size through virtio-gpu (new EDID
-        // and display-info event); viogpudo then lists it as a mode. Give
-        // the driver a moment to pick it up, then switch to it.
-        if !wait_until(Duration::from_secs(3), || {
+        // The host announces the size through virtio-gpu (EDID + display
+        // event); give the driver a moment to list it as a mode. viogpudo
+        // reads the EDID at boot, so the boot size is always available.
+        let exact = wait_until(Duration::from_secs(3), || {
             display_modes().contains(&(width, height))
-        }) {
-            return Err(format!("{width}x{height} is not a mode of this display"));
-        }
+        });
+        let (width, height) = if exact {
+            (width, height)
+        } else {
+            // Not listed: the largest mode that fits (the host letterboxes).
+            crate::core::best_fitting_mode(&display_modes(), width, height)
+                .ok_or_else(|| format!("no display mode fits {width}x{height}"))?
+        };
         let mode = DEVMODEW {
             dmSize: std::mem::size_of::<DEVMODEW>() as u16,
             dmFields: DM_PELSWIDTH | DM_PELSHEIGHT,

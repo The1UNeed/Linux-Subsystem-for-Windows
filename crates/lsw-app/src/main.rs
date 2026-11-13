@@ -158,6 +158,7 @@ fn build_window(app: &adw::Application, options: Options) {
             return;
         }
     };
+    let paths_for_size = paths.clone();
     let frame = Arc::new(Frame::default());
     let (ui_tx, ui_rx) = async_channel::bounded::<UiMsg>(64);
     let cmds = backend::spawn(paths, frame.clone(), ui_tx);
@@ -495,8 +496,34 @@ fn build_window(app: &adw::Application, options: Options) {
         });
     }
     window.present();
+    remember_monitor_size(&window, &paths_for_size);
     if options.full_screen {
         view.set_full_screen(true);
+    }
+}
+
+/// Record the monitor size (device pixels) so the next boot gives Windows
+/// that resolution natively (virtio-gpu preferred mode).
+fn remember_monitor_size(window: &adw::ApplicationWindow, paths: &VmPaths) {
+    let display = gtk::prelude::WidgetExt::display(window);
+    let Some(monitor) = display
+        .monitors()
+        .item(0)
+        .and_then(|m| m.downcast::<gdk::Monitor>().ok())
+    else {
+        return;
+    };
+    let g = monitor.geometry();
+    let s = monitor.scale_factor().max(1);
+    let size = lsw_daemon::config::DisplaySize {
+        width: (g.width() * s) as u32,
+        height: (g.height() * s) as u32,
+    };
+    let file = paths.display_size_file();
+    if lsw_daemon::config::DisplaySize::load(&file) != (size.width, size.height)
+        && let Err(e) = size.save(&file)
+    {
+        tracing::warn!("could not store the display size: {e}");
     }
 }
 
