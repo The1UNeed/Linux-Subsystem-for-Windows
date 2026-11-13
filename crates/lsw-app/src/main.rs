@@ -498,6 +498,7 @@ fn build_window(app: &adw::Application, options: Options) {
                         }
                     }
                     UiMsg::AgentAttached(version) => {
+                        tracing::info!("guest agent attached ({version})");
                         view.title
                             .set_subtitle(&format!("Running · LSW agent {version}"));
                     }
