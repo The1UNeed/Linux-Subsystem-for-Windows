@@ -47,6 +47,17 @@ const MAX_FRAME_BYTES: usize = 768 << 20;
 /// Guest updates queued between the backend and the Wayland thread.
 const UPDATE_QUEUE: usize = 16;
 
+/// Size of the placeholder shown for a window that is minimized in Windows:
+/// its last size if Windows reports one, else a modest default.
+fn placeholder_size(info: &WindowInfo) -> (u32, u32) {
+    let (w, h) = (info.rect.width, info.rect.height);
+    if w >= 64 && h >= 32 {
+        (w.min(1280), h.min(800))
+    } else {
+        (640, 400)
+    }
+}
+
 /// Linux input button codes (`linux/input-event-codes.h`).
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
@@ -214,20 +225,31 @@ impl App {
                 {
                     w.set_parent(Some(pw));
                 }
-                if info.state == WindowState::Maximized {
-                    w.set_maximized();
+                match info.state {
+                    WindowState::Maximized => w.set_maximized(),
+                    WindowState::Minimized => w.set_minimized(),
+                    WindowState::Normal => {}
                 }
                 w.commit();
                 Shell::Toplevel(w)
             }
+        };
+        // A window minimized in Windows sends no frames (nothing to
+        // capture), but it must still exist on Linux (in the dock) so the
+        // user can restore it: show a neutral placeholder until it does.
+        let (frame, size) = if info.state == WindowState::Minimized {
+            let size = placeholder_size(&info);
+            (vec![0xf0; size.0 as usize * size.1 as usize * 4], size)
+        } else {
+            (Vec::new(), (0, 0))
         };
         self.windows.insert(
             info.id,
             Mirrored {
                 info,
                 shell,
-                frame: Vec::new(),
-                size: (0, 0),
+                frame,
+                size,
                 configured: false,
                 mapped: false,
                 requested: None,
@@ -886,6 +908,28 @@ delegate_registry!(App);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn placeholders_have_a_usable_size() {
+        let info = |w, h| WindowInfo {
+            id: 1,
+            owner: None,
+            kind: WindowKind::Normal,
+            title: String::new(),
+            exe: String::new(),
+            app: String::new(),
+            rect: lsw_proto::coherence::Rect {
+                x: 0,
+                y: 0,
+                width: w,
+                height: h,
+            },
+            state: WindowState::Minimized,
+        };
+        assert_eq!(placeholder_size(&info(0, 0)), (640, 400));
+        assert_eq!(placeholder_size(&info(900, 700)), (900, 700));
+        assert_eq!(placeholder_size(&info(5000, 3000)), (1280, 800));
+    }
 
     #[test]
     fn buttons_map() {
