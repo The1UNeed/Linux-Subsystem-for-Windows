@@ -42,8 +42,14 @@ use wayland_client::{Connection, QueueHandle};
 
 /// Most windows mirrored at once (the guest is untrusted).
 const MAX_WINDOWS: usize = 128;
-/// Most memory held for window contents, all windows together.
+/// Most memory held for window contents, all windows together: each
+/// window's frame plus its Wayland buffers.
 const MAX_FRAME_BYTES: usize = 768 << 20;
+/// Wayland buffers per window (double buffering). When both are still held
+/// by the compositor, updates are coalesced until one is released.
+const MAX_BUFFERS: usize = 2;
+/// Copies of a window's contents charged against [`MAX_FRAME_BYTES`].
+const HELD_COPIES: usize = 1 + MAX_BUFFERS;
 /// Guest updates queued between the backend and the Wayland thread.
 const UPDATE_QUEUE: usize = 16;
 
@@ -62,7 +68,7 @@ fn placeholder_size(info: &WindowInfo) -> (u32, u32) {
 /// spent, a 64×32 one (8 KiB; at most `MAX_WINDOWS` of them beyond it).
 fn placeholder_within_budget(info: &WindowInfo, held: usize) -> (u32, u32) {
     let size = placeholder_size(info);
-    if held + size.0 as usize * size.1 as usize * 4 > MAX_FRAME_BYTES {
+    if held + size.0 as usize * size.1 as usize * 4 * HELD_COPIES > MAX_FRAME_BYTES {
         (64, 32)
     } else {
         size
@@ -114,6 +120,18 @@ struct Mirrored {
     mapped: bool,
     /// Size the compositor asked for that the guest has not matched yet.
     requested: Option<(u32, u32)>,
+    /// Reused Wayland buffers, at most [`MAX_BUFFERS`].
+    buffers: Vec<smithay_client_toolkit::shm::slot::Buffer>,
+    /// An update could not be shown (every buffer busy): show it on the
+    /// next frame callback or update, with full damage.
+    dirty: bool,
+}
+
+impl Mirrored {
+    /// Bytes charged against [`MAX_FRAME_BYTES`].
+    fn held(&self) -> usize {
+        self.frame.len() * HELD_COPIES
+    }
 }
 
 /// A press waiting for the guest's hit test.
@@ -251,7 +269,7 @@ impl App {
         // capture), but it must still exist on Linux (in the dock) so the
         // user can restore it: show a neutral placeholder until it does.
         let (frame, size) = if info.state == WindowState::Minimized {
-            let held = self.windows.values().map(|w| w.frame.len()).sum();
+            let held = self.windows.values().map(Mirrored::held).sum();
             let size = placeholder_within_budget(&info, held);
             (vec![0xf0; size.0 as usize * size.1 as usize * 4], size)
         } else {
@@ -267,6 +285,8 @@ impl App {
                 configured: false,
                 mapped: false,
                 requested: None,
+                buffers: Vec::new(),
+                dirty: false,
             },
         );
     }
@@ -291,13 +311,13 @@ impl App {
     }
 
     fn frame(&mut self, id: u64, width: u32, height: u32, tiles: Vec<lsw_proto::coherence::Tile>) {
-        let held: usize = self.windows.values().map(|w| w.frame.len()).sum();
+        let held: usize = self.windows.values().map(Mirrored::held).sum();
         let Some(w) = self.windows.get_mut(&id) else {
             return;
         };
         if w.size != (width, height) {
-            let needed = width as usize * height as usize * 4;
-            if held - w.frame.len() + needed > MAX_FRAME_BYTES {
+            let needed = width as usize * height as usize * 4 * HELD_COPIES;
+            if held - w.held() + needed > MAX_FRAME_BYTES {
                 tracing::warn!("window {id:#x}: frame budget exhausted; frame dropped");
                 return;
             }
@@ -316,33 +336,69 @@ impl App {
         if !w.configured {
             return; // drawn on the first configure
         }
-        Self::draw(&mut self.pool, w, Some(&tiles));
+        if tiles.is_empty() && !w.dirty {
+            return; // nothing changed
+        }
+        Self::draw(&mut self.pool, &self.qh, w, Some(&tiles));
     }
 
-    fn draw(pool: &mut SlotPool, w: &mut Mirrored, tiles: Option<&[lsw_proto::coherence::Tile]>) {
+    /// Show the window's frame in one of its reused buffers. With every
+    /// buffer still held by the compositor, the update waits (coalesced)
+    /// for the next frame callback, so buffers never pile up.
+    fn draw(
+        pool: &mut SlotPool,
+        qh: &QueueHandle<Self>,
+        w: &mut Mirrored,
+        tiles: Option<&[lsw_proto::coherence::Tile]>,
+    ) {
         let (width, height) = w.size;
         if width == 0 || w.frame.is_empty() {
             return;
         }
         let stride = width as i32 * 4;
-        let Ok((buffer, canvas)) = pool.create_buffer(
-            width as i32,
-            height as i32,
-            stride,
-            wl_shm::Format::Argb8888,
-        ) else {
+        // Buffers of an old size go (a busy one is destroyed on release).
+        w.buffers
+            .retain(|b| b.height() == height as i32 && b.stride() == stride);
+        let free = w.buffers.iter().position(|b| b.canvas(pool).is_some());
+        let index = match free {
+            Some(i) => i,
+            None if w.buffers.len() < MAX_BUFFERS => {
+                let Ok((buffer, _)) = pool.create_buffer(
+                    width as i32,
+                    height as i32,
+                    stride,
+                    wl_shm::Format::Argb8888,
+                ) else {
+                    return;
+                };
+                w.buffers.push(buffer);
+                w.buffers.len() - 1
+            }
+            None => {
+                w.dirty = true;
+                return;
+            }
+        };
+        let buffer = &w.buffers[index];
+        let Some(canvas) = buffer.canvas(pool) else {
             return;
         };
         canvas[..w.frame.len()].copy_from_slice(&w.frame);
         let surface = w.shell.surface();
         match tiles {
-            Some(tiles) => {
+            // Updates skipped while coalescing changed more than `tiles`.
+            Some(tiles) if !w.dirty => {
                 for t in tiles {
                     surface.damage_buffer(t.x as i32, t.y as i32, t.width as i32, t.height as i32);
                 }
             }
-            None => surface.damage_buffer(0, 0, width as i32, height as i32),
+            _ => surface.damage_buffer(0, 0, width as i32, height as i32),
         }
+        w.dirty = false;
+        surface.frame(
+            qh,
+            smithay_client_toolkit::compositor::FrameCallbackData(surface.clone()),
+        );
         if buffer.attach_to(surface).is_ok() {
             surface.commit();
             w.mapped = true;
@@ -573,7 +629,23 @@ impl CompositorHandler for App {
         _: wl_output::Transform,
     ) {
     }
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
+    fn frame(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        surface: &wl_surface::WlSurface,
+        _: u32,
+    ) {
+        // The compositor showed the last buffer: an update that waited for
+        // a free buffer can go now.
+        if let Some(w) = self
+            .windows
+            .values_mut()
+            .find(|w| w.dirty && w.shell.surface() == surface)
+        {
+            Self::draw(&mut self.pool, &self.qh, w, None);
+        }
+    }
     fn surface_enter(
         &mut self,
         _: &Connection,
@@ -629,7 +701,7 @@ impl WindowHandler for App {
                     resize = Some(want);
                 }
             }
-            Self::draw(&mut self.pool, w, None);
+            Self::draw(&mut self.pool, &self.qh, w, None);
         }
         if let Some((width, height)) = resize {
             self.send(Request::Guest(CoMessage::Resize { id, width, height }));
@@ -649,7 +721,7 @@ impl PopupHandler for App {
             && let Some(w) = self.windows.get_mut(&id)
         {
             w.configured = true;
-            Self::draw(&mut self.pool, w, None);
+            Self::draw(&mut self.pool, &self.qh, w, None);
         }
     }
 
@@ -961,13 +1033,15 @@ mod tests {
         assert_eq!(placeholder_size(&info(900, 700)), (900, 700));
         assert_eq!(placeholder_size(&info(5000, 3000)), (1280, 800));
         // Charged against the frame budget.
+        // Charged with its buffers: HELD_COPIES copies of the contents.
+        let cost = 900 * 700 * 4 * HELD_COPIES;
         assert_eq!(placeholder_within_budget(&info(900, 700), 0), (900, 700));
         assert_eq!(
-            placeholder_within_budget(&info(900, 700), MAX_FRAME_BYTES - 900 * 700 * 4),
+            placeholder_within_budget(&info(900, 700), MAX_FRAME_BYTES - cost),
             (900, 700)
         );
         assert_eq!(
-            placeholder_within_budget(&info(900, 700), MAX_FRAME_BYTES - 900 * 700 * 4 + 1),
+            placeholder_within_budget(&info(900, 700), MAX_FRAME_BYTES - cost + 1),
             (64, 32)
         );
     }

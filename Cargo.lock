@@ -1596,6 +1596,7 @@ dependencies = [
  "lsw-installer",
  "lsw-proto",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

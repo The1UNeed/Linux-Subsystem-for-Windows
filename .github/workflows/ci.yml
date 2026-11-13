@@ -44,8 +44,8 @@ jobs:
       - name: Build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends debhelper dpkg-dev \
-            libgtk-4-dev libadwaita-1-dev libxkbcommon-dev gcc-mingw-w64-x86-64
+          sudo apt-get install -y --no-install-recommends build-essential debhelper dpkg-dev \
+            pkgconf libgtk-4-dev libadwaita-1-dev libxkbcommon-dev gcc-mingw-w64-x86-64
           rustup show
       - uses: Swatinem/rust-cache@v2
       - name: Source package
@@ -53,8 +53,10 @@ jobs:
       - name: Binary package
         run: dpkg-buildpackage -b -us -uc
       - name: Install check
-        run: sudo apt-get install -y ../lsw_*.deb && lsw --version
+        run: |
+          mkdir -p dist && cp ../lsw_*.deb dist/
+          sudo apt-get install -y ./dist/lsw_*.deb && lsw --version
       - uses: actions/upload-artifact@v4
         with:
           name: lsw-deb
-          path: ../lsw_*.deb
+          path: dist/lsw_*.deb

@@ -12,6 +12,9 @@ makedepends=('rustup' 'mingw-w64-gcc' 'git')
 optdepends=('pipewire: Windows sound')
 source=("$pkgname::git+$url#tag=v0.0.1-alpha")
 sha256sums=('SKIP')
+# makepkg's LTO flags compile aws-lc's C code to GCC LTO objects, which
+# Rust's linker cannot read.
+options=('!lto')
 
 prepare() {
   cd "$pkgname"

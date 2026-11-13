@@ -176,9 +176,38 @@ pub fn qemu_args(functions: &[PciAddr]) -> Vec<String> {
     args
 }
 
+/// Why `new` cannot be assigned while `current` (the functions assigned
+/// now) is: one assignment at a time, so `lsw gpu release` always knows
+/// what to give back. Re-assigning the same device is allowed.
+pub fn assignment_conflict(current: &[PciAddr], new: &PciAddr) -> Option<String> {
+    match current.first() {
+        Some(first) if first != new => Some(format!(
+            "{first} is already assigned to Windows; run `lsw gpu release` first"
+        )),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_assignment_at_a_time() {
+        let a = PciAddr::parse("0000:00:02.1").unwrap();
+        let b = PciAddr::parse("0000:00:02.2").unwrap();
+        assert_eq!(assignment_conflict(&[], &a), None);
+        assert_eq!(
+            assignment_conflict(std::slice::from_ref(&a), &a),
+            None,
+            "same device"
+        );
+        let e = assignment_conflict(std::slice::from_ref(&a), &b).unwrap();
+        assert!(
+            e.contains("0000:00:02.1") && e.contains("lsw gpu release"),
+            "{e}"
+        );
+    }
 
     fn func(sys: &Path, addr: &str, vendor: &str, class: &str, group: &str, driver: &str) {
         let d = sys.join(addr);

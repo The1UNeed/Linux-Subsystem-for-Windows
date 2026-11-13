@@ -863,18 +863,12 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
     let result = loop {
         tokio::select! {
             activity = running.next_activity() => match activity {
-                vm::Activity::Exited(status) => {
-                    println!("QEMU exited: {}", status?);
-                    break Ok(());
-                }
+                vm::Activity::Exited(status) => break qemu_exit(status?, paths),
                 vm::Activity::Event(Err(QmpError::Closed)) => {
                     // QEMU closes QMP as it exits (Windows shut itself
                     // down, or QEMU died): report how it ended.
                     match tokio::time::timeout(Duration::from_secs(10), running.wait()).await {
-                        Ok(status) => {
-                            println!("QEMU exited: {}", status?);
-                            break Ok(());
-                        }
+                        Ok(status) => break qemu_exit(status?, paths),
                         // QEMU is killed when `running` is dropped.
                         Err(_) => break Err(anyhow::anyhow!("QEMU closed its QMP monitor but kept running")),
                     }
@@ -964,6 +958,22 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
     api_server.abort();
     let _ = std::fs::remove_file(paths.api_socket());
     result
+}
+
+/// How `lsw run` ends when QEMU exits by itself: success when Windows shut
+/// down (exit 0), an error for a crash or a signal, so the systemd unit's
+/// `Restart=on-failure` applies.
+fn qemu_exit(status: std::process::ExitStatus, paths: &VmPaths) -> anyhow::Result<()> {
+    if status.success() {
+        println!("Windows shut down; QEMU exited ({status}).");
+        Ok(())
+    } else {
+        bail!(
+            "QEMU stopped unexpectedly ({status}); see {}\n{}",
+            paths.qemu_log().display(),
+            vm::tail(&paths.qemu_log(), 30)
+        )
+    }
 }
 
 /// Which LSW views are attached, from QEMU's chardev state.
@@ -1292,6 +1302,10 @@ fn gpu(paths: &VmPaths, action: GpuAction) -> anyhow::Result<()> {
             let mut cfg = VmConfig::load(&paths.data)?;
             let _lock = vm::lock_vm(paths)?;
             let addr = PciAddr::parse(&pci).context("expected a PCI address like 0000:01:00.0")?;
+            // Before asking for privileges: one assignment at a time.
+            if let Some(e) = lsw_daemon::gpu::assignment_conflict(&cfg.passthrough, &addr) {
+                bail!(e);
+            }
             let set = passthrough_set(sysfs, &addr).map_err(|e| anyhow::anyhow!(e))?;
             let helper = ["/usr/lib/lsw/lsw-helper", "/usr/libexec/lsw-helper"]
                 .into_iter()
@@ -1423,4 +1437,24 @@ async fn ctl(paths: &VmPaths, action: CtlAction) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn a_qemu_crash_fails_lsw_run_and_a_shutdown_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let paths =
+            VmPaths::with_bases(&d.join("data"), &d.join("run"), &d.join("sock"), "windows");
+        assert!(qemu_exit(std::process::ExitStatus::from_raw(0), &paths).is_ok());
+        // exit(1)
+        let e = qemu_exit(std::process::ExitStatus::from_raw(1 << 8), &paths).unwrap_err();
+        assert!(e.to_string().contains("unexpectedly"), "{e}");
+        // killed by SIGSEGV
+        assert!(qemu_exit(std::process::ExitStatus::from_raw(11), &paths).is_err());
+    }
 }

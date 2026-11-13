@@ -53,12 +53,22 @@ pub struct SessionClient<S> {
     out: mpsc::UnboundedSender<Vec<u8>>,
     /// Bytes queued but not yet written (shared with the writer task).
     queued: Arc<AtomicUsize>,
+    /// The writer task, stopped with the client: a guest that stopped
+    /// reading would otherwise keep it blocked in a write forever, holding
+    /// the socket and every queued frame.
+    writer_task: tokio::task::AbortHandle,
     next_seq: u64,
     attached: bool,
     /// Host clipboard content offered to the guest, by serial.
     host_serial: u64,
     host_items: Vec<(ClipFormat, Vec<u8>)>,
     assembler: ClipboardAssembler,
+}
+
+impl<S> Drop for SessionClient<S> {
+    fn drop(&mut self) {
+        self.writer_task.abort();
+    }
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> SessionClient<S> {
@@ -68,7 +78,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> SessionClient<S> {
         let (out, mut frames) = mpsc::unbounded_channel::<Vec<u8>>();
         let queued = Arc::new(AtomicUsize::new(0));
         let written = queued.clone();
-        tokio::spawn(async move {
+        let writer_task = tokio::spawn(async move {
             while let Some(frame) = frames.recv().await {
                 let ok = writer.write_all(&frame).await.is_ok();
                 written.fetch_sub(frame.len(), Ordering::AcqRel);
@@ -76,13 +86,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> SessionClient<S> {
                     break;
                 }
             }
-        });
+        })
+        .abort_handle();
         let mut c = Self {
             reader,
             decoder: FrameDecoder::new(),
             buf: vec![0u8; 64 * 1024].into_boxed_slice(),
             out,
             queued,
+            writer_task,
             next_seq: 1,
             attached: false,
             host_serial: 0,
@@ -482,5 +494,74 @@ mod tests {
         let (_, err) = tokio::join!(flood, host_side);
         assert!(matches!(err, ChannelError::Overloaded), "{err:?}");
         assert!(s.queued.load(Ordering::Acquire) <= MAX_QUEUED_BYTES);
+    }
+
+    /// A stream that records when it is dropped.
+    struct Tracked {
+        inner: tokio::io::DuplexStream,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+    impl AsyncRead for Tracked {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+    impl AsyncWrite for Tracked {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_a_client_whose_guest_stopped_reading_releases_the_socket() {
+        let (host, guest) = tokio::io::duplex(1024);
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut s = SessionClient::new(Tracked {
+            inner: host,
+            dropped: dropped.clone(),
+        })
+        .await
+        .unwrap();
+        // The guest never reads: fill the pipe until the writer blocks.
+        for nonce in 0..2000 {
+            s.queue(None, Message::Ping { nonce }).unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            s.queued.load(Ordering::Acquire) > 0,
+            "the writer must be blocked"
+        );
+        drop(s);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "the blocked writer kept the socket and its queue"
+        );
+        drop(guest);
     }
 }
