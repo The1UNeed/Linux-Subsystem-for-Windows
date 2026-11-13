@@ -290,10 +290,9 @@ extern "system" fn clipboard_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
         let owner = unsafe { GetClipboardOwner() }.unwrap_or_default();
         if owner != hwnd
             && let Some(tx) = CLIPBOARD_TX.get()
+            && let Ok(t) = tx.lock()
         {
-            if let Ok(t) = tx.lock() {
-                let _ = t.send(Event::ClipboardChanged);
-            }
+            let _ = t.send(Event::ClipboardChanged);
         }
         return LRESULT(0);
     }
