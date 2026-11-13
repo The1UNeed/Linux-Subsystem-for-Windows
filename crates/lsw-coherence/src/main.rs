@@ -116,6 +116,9 @@ struct App {
     guest_foreground: Option<u64>,
     /// Window count last reported to the supervisor.
     reported: Option<u32>,
+    /// Ctrl and Super are held (LSW's own shortcuts).
+    lsw_modifiers: bool,
+    vm: String,
     pending: Option<PendingPress>,
     next_hit: u32,
     exit: bool,
@@ -286,6 +289,31 @@ impl App {
         }
     }
 
+    /// Leave Coherence for the Window view: open the LSW app, then exit
+    /// (Windows keeps running).
+    fn switch_to_window_view(&mut self) {
+        let exe = std::env::current_exe()
+            .ok()
+            .and_then(|e| e.parent().map(|d| d.join("lsw-app")))
+            .filter(|p| p.is_file())
+            .unwrap_or_else(|| "lsw-app".into());
+        let started = std::process::Command::new("systemd-run")
+            .args(["--user", "--collect", "--quiet", "--unit"])
+            .arg(format!("lsw-app-{}", self.vm))
+            .arg(&exe)
+            .args(["--name", &self.vm])
+            .status()
+            .is_ok_and(|s| s.success())
+            || std::process::Command::new(&exe)
+                .args(["--name", &self.vm])
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .is_ok();
+        if started {
+            self.exit = true;
+        }
+    }
+
     /// Tell the supervisor how many windows are visible, when it changes.
     fn report_count(&mut self) {
         let visible = self
@@ -445,6 +473,8 @@ fn main() -> anyhow::Result<()> {
         focused: None,
         guest_foreground: None,
         reported: None,
+        lsw_modifiers: false,
+        vm: name.clone(),
         pending: None,
         next_hit: 1,
         exit: false,
@@ -756,6 +786,11 @@ impl KeyboardHandler for App {
         _: u32,
         event: KeyEvent,
     ) {
+        // Ctrl+Super+C: back to the Window view (KEY_C = 46).
+        if self.lsw_modifiers && event.raw_code == 46 {
+            self.switch_to_window_view();
+            return;
+        }
         if let Some(qnum) = keymap::evdev_to_qnum(event.raw_code) {
             self.send(Request::Key { qnum, down: true });
         }
@@ -788,10 +823,11 @@ impl KeyboardHandler for App {
         _: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
         _: u32,
-        _: Modifiers,
+        modifiers: Modifiers,
         _: RawModifiers,
         _: u32,
     ) {
+        self.lsw_modifiers = modifiers.ctrl && modifiers.logo;
     }
 }
 

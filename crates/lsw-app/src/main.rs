@@ -173,6 +173,7 @@ fn build_window(app: &adw::Application, options: Options) {
     header.pack_end(&full_screen_button);
 
     let menu = gio::Menu::new();
+    menu.append(Some("Coherence"), Some("win.coherence"));
     menu.append(Some("Send Ctrl+Alt+Delete"), Some("win.ctrl-alt-del"));
     menu.append(Some("Shut Down Windows"), Some("win.powerdown"));
     let menu_button = gtk::MenuButton::builder()
@@ -251,6 +252,14 @@ fn build_window(app: &adw::Application, options: Options) {
         move |_, _| view.send(Cmd::CtrlAltDel)
     ));
     window.add_action(&a);
+    let coherence_name = options.name.clone();
+    let a = gio::SimpleAction::new("coherence", None);
+    a.connect_activate(glib::clone!(
+        #[weak]
+        window,
+        move |_, _| switch_to_coherence(&window, &coherence_name)
+    ));
+    window.add_action(&a);
     let a = gio::SimpleAction::new("powerdown", None);
     a.connect_activate(glib::clone!(
         #[weak]
@@ -293,6 +302,11 @@ fn build_window(app: &adw::Application, options: Options) {
                 state.contains(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SUPER_MASK);
             if lsw_mod && matches!(keyval, gdk::Key::f | gdk::Key::F) {
                 view.set_full_screen(!view.full_screen.get());
+                return glib::Propagation::Stop;
+            }
+            if lsw_mod && matches!(keyval, gdk::Key::c | gdk::Key::C) {
+                let _ =
+                    gtk::prelude::WidgetExt::activate_action(&view.window, "win.coherence", None);
                 return glib::Propagation::Stop;
             }
             if view.stack.visible_child_name().as_deref() != Some("display") {
@@ -527,31 +541,49 @@ fn remember_monitor_size(window: &adw::ApplicationWindow, paths: &VmPaths) {
     }
 }
 
-/// Start the VM supervisor in the background: as a transient systemd user
-/// unit when systemd is available (it then outlives the app and logs to
-/// the journal), otherwise as a plain child process.
-fn start_vm(name: &str) -> std::io::Result<()> {
-    let lsw = std::env::current_exe()
+/// Leave the Window view for Coherence: start the Coherence client and
+/// close this window (Windows keeps running).
+fn switch_to_coherence(window: &adw::ApplicationWindow, name: &str) {
+    match spawn_lsw_program(
+        "lsw-coherence",
+        &["--name", name],
+        &format!("lsw-coherence-{name}"),
+    ) {
+        Ok(()) => window.close(),
+        Err(e) => tracing::warn!("cannot start Coherence: {e}"),
+    }
+}
+
+/// Start an LSW program next to this one, detached (systemd user unit
+/// when available).
+fn spawn_lsw_program(program: &str, args: &[&str], unit: &str) -> std::io::Result<()> {
+    let exe = std::env::current_exe()
         .ok()
-        .and_then(|e| e.parent().map(|d| d.join("lsw")))
+        .and_then(|e| e.parent().map(|d| d.join(program)))
         .filter(|p| p.is_file())
-        .unwrap_or_else(|| PathBuf::from("lsw"));
-    let unit = format!("lsw-vm-{name}");
+        .unwrap_or_else(|| PathBuf::from(program));
     let systemd = std::process::Command::new("systemd-run")
-        .args(["--user", "--collect", "--quiet", "--unit", &unit])
-        .arg(&lsw)
-        .args(["--name", name, "run"])
+        .args(["--user", "--collect", "--quiet", "--unit", unit])
+        .arg(&exe)
+        .args(args)
         .status();
     match systemd {
         Ok(s) if s.success() => Ok(()),
-        _ => std::process::Command::new(&lsw)
-            .args(["--name", name, "run"])
+        _ => std::process::Command::new(&exe)
+            .args(args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
             .map(|_| ()),
     }
+}
+
+/// Start the VM supervisor in the background: as a transient systemd user
+/// unit when systemd is available (it then outlives the app and logs to
+/// the journal), otherwise as a plain child process.
+fn start_vm(name: &str) -> std::io::Result<()> {
+    spawn_lsw_program("lsw", &["--name", name, "run"], &format!("lsw-vm-{name}"))
 }
 
 /// Largest clipboard item read from the Linux side.

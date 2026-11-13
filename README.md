@@ -12,6 +12,13 @@ built for Linux (Ubuntu and CachyOS first) from open-source parts.
 > [what works](#what-works-in-this-alpha) and the
 > [known limits](#known-limits).
 
+![Windows Notepad and Calculator as separate Linux windows (Coherence)](docs/images/coherence-notepad-calculator.png)
+
+*Coherence: Windows 11's Notepad and Calculator as two native windows on a
+Linux desktop. Clicking in them works as in Windows
+([7 + 2 = 9](docs/images/coherence-input-calculator.png)), and any Windows
+app starts from the Linux app grid ([Paint](docs/images/coherence-launch-paint.png)).*
+
 ## What works in this alpha
 
 | Feature | Notes |
@@ -75,6 +82,10 @@ systemctl --user enable --now lsw@windows   # keep the VM supervised
 
 Then open **Windows** from the app grid for the full desktop, or any Windows
 app from the "Windows Apps" folder.
+
+![The Windows desktop in the LSW window](docs/images/window-view-dynamic-resolution.jpg)
+
+*The Window view: Windows resizes to fit the window.*
 
 More in the [user guide](docs/USER-GUIDE.md).
 
