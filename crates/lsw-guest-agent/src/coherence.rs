@@ -306,8 +306,19 @@ fn describe(hwnd: HWND) -> Option<WindowInfo> {
                 unsafe { GetAncestor(GetForegroundWindow(), GA_ROOTOWNER) }
             })
         })
-        .filter(|o| !o.is_invalid() && *o != hwnd)
-        .map(|o| o.0 as usize as u64);
+        .filter(|o| !o.is_invalid() && *o != hwnd);
+    // A popup is mirrored only as part of a window that is mirrored itself:
+    // taskbar and desktop tooltips (owned by the shell) are not.
+    if kind == WindowKind::Popup {
+        let Some(o) = owner_id else { return None };
+        // SAFETY: plain query.
+        if !unsafe { IsWindowVisible(o) }.as_bool()
+            || SHELL_CLASSES.contains(&class_name(o).as_str())
+        {
+            return None;
+        }
+    }
+    let owner_id = owner_id.map(|o| o.0 as usize as u64);
     Some(WindowInfo {
         id: hwnd.0 as usize as u64,
         owner: owner_id,

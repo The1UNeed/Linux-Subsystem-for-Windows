@@ -181,6 +181,8 @@ impl App {
         let size = (info.rect.width.max(1), info.rect.height.max(1));
         let owner = info.owner.and_then(|o| self.windows.get(&o));
         let shell = match (info.kind, owner) {
+            // A popup of a window we do not mirror: never a stray toplevel.
+            (WindowKind::Popup, None) => return,
             (WindowKind::Popup, Some(parent)) => {
                 let Ok(positioner) = XdgPositioner::new(&self.xdg) else {
                     return;
