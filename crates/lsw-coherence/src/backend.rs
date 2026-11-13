@@ -123,8 +123,11 @@ async fn connection(
                 match req {
                     Request::Guest(msg) => {
                         // Windows may be idle-paused (all windows were
-                        // minimized): it must run to restore a window.
-                        if matches!(msg, CoMessage::Activate { .. } | CoMessage::Restore { .. }) {
+                        // minimized): user actions need it running.
+                        if matches!(
+                            msg,
+                            CoMessage::Activate { .. } | CoMessage::Restore { .. } | CoMessage::HitTest { .. }
+                        ) {
                             wake(paths).await;
                         }
                         writer.send(&msg).await?
@@ -132,7 +135,12 @@ async fn connection(
                     Request::Motion { x, y } => mouse.set_abs_position(x, y).await?,
                     Request::Button { button, down } => {
                         tracing::debug!("button {button} {}", if down { "down" } else { "up" });
-                        if down { mouse.press(button).await? } else { mouse.release(button).await? }
+                        if down {
+                            wake(paths).await;
+                            mouse.press(button).await?
+                        } else {
+                            mouse.release(button).await?
+                        }
                     }
                     Request::WindowCount(count) => {
                         let api = paths.api_socket();
@@ -146,7 +154,12 @@ async fn connection(
                         });
                     }
                     Request::Key { qnum, down } => {
-                        if down { keyboard.press(qnum).await? } else { keyboard.release(qnum).await? }
+                        if down {
+                            wake(paths).await;
+                            keyboard.press(qnum).await?
+                        } else {
+                            keyboard.release(qnum).await?
+                        }
                     }
                 }
             }
