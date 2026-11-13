@@ -112,6 +112,11 @@ enum Cmd {
     },
     /// Resize the Windows display (through the guest agent).
     Display { width: u32, height: u32 },
+    /// Pass host USB devices through to Windows.
+    Usb {
+        #[command(subcommand)]
+        action: UsbAction,
+    },
 }
 
 #[derive(clap::Args, Clone)]
@@ -131,6 +136,16 @@ struct LaunchArgs {
     /// No display for the LSW app (screenshots through `lsw ctl` still work).
     #[arg(long)]
     headless: bool,
+}
+
+#[derive(Subcommand)]
+enum UsbAction {
+    /// List host USB devices.
+    List,
+    /// Plug a device into Windows (`BUS-ADDR` or `VID:PID`).
+    Attach { device: String },
+    /// Unplug a device from Windows.
+    Detach { device: String },
 }
 
 #[derive(Subcommand)]
@@ -186,6 +201,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Run { launch } => run(&paths, &launch).await,
         Cmd::Ctl { action } => ctl(&paths, action).await,
         Cmd::Clip { action } => clip(&paths, action).await,
+        Cmd::Usb { action } => usb(&paths, action).await,
         Cmd::Display { width, height } => {
             let mut s = attach_session(&paths).await?;
             s.display_hint(width, height, 100).await?;
@@ -844,6 +860,43 @@ async fn clip(paths: &VmPaths, action: ClipAction) -> anyhow::Result<()> {
             })
             .await;
             println!("clipboard offered to Windows");
+        }
+    }
+    Ok(())
+}
+
+async fn usb(paths: &VmPaths, action: UsbAction) -> anyhow::Result<()> {
+    use lsw_daemon::usb;
+    let devices = usb::list(Path::new("/sys/bus/usb/devices"), Path::new("/dev/bus/usb"));
+    let pick = |spec: &str| {
+        usb::find(&devices, spec)
+            .cloned()
+            .with_context(|| format!("no USB device {spec:?}; see `lsw usb list`"))
+    };
+    match action {
+        UsbAction::List => {
+            if devices.is_empty() {
+                println!("No USB devices (hubs are not listed).");
+            }
+            for d in &devices {
+                println!("{}-{}  {}", d.bus, d.addr, d.label());
+            }
+        }
+        UsbAction::Attach { device } => {
+            let d = pick(&device)?;
+            let mut qmp = Qmp::connect_with_retry(&paths.ctl_socket(), Duration::from_secs(2))
+                .await
+                .context("VM is not running")?;
+            usb::attach(&mut qmp, &d).await?;
+            println!("{} is now connected to Windows", d.label());
+        }
+        UsbAction::Detach { device } => {
+            let d = pick(&device)?;
+            let mut qmp = Qmp::connect_with_retry(&paths.ctl_socket(), Duration::from_secs(2))
+                .await
+                .context("VM is not running")?;
+            usb::detach(&mut qmp, &d).await?;
+            println!("{} is back on Linux", d.label());
         }
     }
     Ok(())

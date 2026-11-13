@@ -126,7 +126,7 @@ B/C.
 │   wizard, settings,        (Wayland client:  │      │  service (SYSTEM) +          │
 │   Window/FullScreen/PiP    1 toplevel per    │      │  per-user session helper     │
 │        │                   Windows window)   │      │  - window tracking + WGC     │
-│        └──── D-Bus ────┐        │            │      │    capture                   │
+│        └──── sockets ──┐        │            │      │    capture                   │
 │                 lsw-daemon (user service)    │      │  - input injection           │
 │   VM lifecycle · QMP · devices · idle ·      │      │  - clipboard, apps, icons,   │
 │   GPU tier choice · guest channel            │      │    tray, notifications, DnD  │
@@ -134,8 +134,8 @@ B/C.
 │      QEMU  ◄──QMP── swtpm   virtiofsd  passt │      │ virtio-win drivers (signed)  │
 │        │                                     │      │ GPU driver (tier A, C/C++)   │
 └────────┼─────────────────────────────────────┘      └──────────────▲───────────────┘
-         │ virtio-vsock: control (lsw-proto)                         │
-         │ shared memory ring: damaged regions (ivshmem / blob)      │
+         │ virtio-serial: control + session + frames (lsw-proto)    │
+         │ (ivshmem / blob memory for frames after the alpha)       │
          └───────────────────────────────────────────────────────────┘
 ```
 
@@ -161,7 +161,9 @@ KVM + **QEMU driven directly over QMP** (no libvirt). LSW ships pinned builds
 of QEMU and virglrenderer under `/usr/lib/lsw/`. Machine: `q35`, OVMF with
 Secure Boot (Microsoft keys enrolled), swtpm TPM 2.0, Hyper-V enlightenments,
 virtio-blk with iothread and `io_uring`, virtio-net via passt, virtio-balloon
-with free-page reporting, vhost-vsock, virtiofs, xHCI, ICH9 HDA → PipeWire.
+with free-page reporting, virtio-serial (agent ports), virtiofs, xHCI, ICH9
+HDA → PipeWire. Every PCI device has a fixed slot so Windows never sees
+hardware move when features are toggled.
 
 ### Coherence pipeline (zero copy)
 
@@ -173,7 +175,8 @@ with free-page reporting, vhost-vsock, virtiofs, xHCI, ICH9 HDA → PipeWire.
 3. `lsw-coherence` presents each window as a Wayland surface; popups,
    menus and tooltips map to `xdg_popup` relative to their owner; owned
    dialogs become child toplevels.
-4. Input travels back over vsock and is injected in the guest.
+4. Input goes through QEMU's absolute pointer and keyboard (D-Bus display),
+   at the guest window's position.
 
 ### GPU tiers (all in v1)
 
@@ -216,12 +219,30 @@ signing.
 - Windows Update is blocked from replacing LSW's GPU and virtio drivers.
 - No telemetry.
 
+### Decisions made during implementation
+
+Each replaces a line of the original design; the reason is the evidence
+from running it.
+
+| Decision | Why |
+|---|---|
+| Guest channel is **virtio-serial**, not vsock. | virtio-win's vsock needs a separately registered Winsock provider with a dynamic address family; virtio-serial is a signed driver installed by the MSI and appears as a plain device file (the transport QEMU's own guest agent uses). vhost-vsock was removed. |
+| Two ports: **control** (supervisor) and **session** (UI). | On Wayland only a focused client may own the clipboard, so the UI process speaks for the host desktop directly; no D-Bus relay through the supervisor. |
+| The host speaks first (`Attach`), once per (re)open reported by QEMU's `VSERPORT_CHANGE`. | Frames written while the guest has the port closed queue up; periodic retries arrived as a burst of 158 handshakes on the first run. |
+| UI ↔ VM uses **QEMU's peer-to-peer D-Bus display** (fd passed over QMP), not a daemon D-Bus service. | No bus exposure; QEMU already provides display, input and resize. |
+| Dynamic resolution = `SetUIInfo` (EDID + display event) **plus** an agent hint. | viogpudo learns the size from the EDID but Windows only switches when asked; the agent switches once the mode is listed. |
+| Answer file on a **CD**, not a USB stick. | A USB stick is a disk that Windows PE enumerates before the virtio disk, so `DiskID 0` pointed at the stick. |
+| swtpm, passt, virtiofsd sockets under `$HOME/.cache/lsw/sock`. | Ubuntu's AppArmor profiles for swtpm and passt deny `/run/user`. |
+| Shared folders: virtiofsd in an unprivileged user namespace (identity uid/gid map, needs `newuidmap`); WinFsp directory mount points under `%USERPROFILE%\Linux\`, redirected as known folders. | Verified both ways; files keep the Linux user's ownership. |
+| **LSW Tools CD** on every boot; the agent updates itself from it. | Same path installs and updates; no network or store needed. |
+| Alpha Coherence frames go over a third virtio-serial port (LZ4, damaged regions only). | virtio-win 0.1.302 ships no IVSHMEM driver and the only other build (2021 "prewhql") cannot be relied on to load on current Windows 11. The transport is behind an interface; ivshmem (or tier A blob memory) replaces it when a signed driver is available. |
+
 ## 4. Delivery
 
 | Milestone | Content |
 |---|---|
 | M0 Foundations | Repo, CI, daemon boots Windows 11 (Secure Boot, TPM, virtio) from an auto-downloaded ISO with an unattended install. |
-| M1 Window mode | Guest agent over vsock, 2D display, dynamic resolution, clipboard, audio, shared folders, USB passthrough, Full Screen. |
+| M1 Window mode | Guest agent over virtio-serial, 2D display, dynamic resolution, clipboard, audio, shared folders, USB passthrough, Full Screen. |
 | M2 Coherence | Per-window capture, Wayland client, input, launchers, Start menu, tray, notifications, links, file associations, drag and drop, PiP. |
 | M3 GPU | Tier B, tier C, tier A (virgl, then Venus). GPU driver work runs in parallel from M0. |
 | M4 Release | Idle/suspend lifecycle, power tuning, packages, signing pipeline, guest auto-update, docs → v0.0.1-alpha. |
