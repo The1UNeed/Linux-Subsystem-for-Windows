@@ -39,6 +39,13 @@ pub fn install_target(
     should_update(own_build, cd_build, last_attempt).then(|| cd_build.trim().to_owned())
 }
 
+/// Files the Windows shell drops into folders on its own: not user data.
+pub fn is_shell_metadata(path: &std::path::Path) -> bool {
+    path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+        n.eq_ignore_ascii_case("desktop.ini") || n.eq_ignore_ascii_case("thumbs.db")
+    })
+}
+
 /// The largest of `modes` that fits inside `width`×`height`.
 pub fn best_fitting_mode(modes: &[(u32, u32)], width: u32, height: u32) -> Option<(u32, u32)> {
     modes
@@ -444,6 +451,17 @@ mod tests {
             "newer than the failed one"
         );
         assert!(!should_update("v+a", "  ", None), "empty file");
+    }
+
+    #[test]
+    fn shell_metadata_is_not_user_data() {
+        use std::path::Path;
+        assert!(is_shell_metadata(Path::new(
+            "C:/Users/u/Linux/Desktop/desktop.ini"
+        )));
+        assert!(is_shell_metadata(Path::new("Desktop/Thumbs.db")));
+        assert!(!is_shell_metadata(Path::new("Desktop/report.docx")));
+        assert!(!is_shell_metadata(Path::new("Desktop/desktop.ini.bak")));
     }
 
     #[test]

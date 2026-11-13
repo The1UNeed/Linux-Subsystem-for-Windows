@@ -439,7 +439,9 @@ struct Windows {
     clipboard_owner: HWND,
     cf_html: u32,
     cf_png: u32,
-    shares: HashMap<String, (Child, String)>,
+    /// Mounted shares: our virtiofs.exe (None for a mount adopted from a
+    /// previous agent) and the mount path.
+    shares: HashMap<String, (Option<Child>, String)>,
 }
 
 fn reg_dword(key: &str, value: &str) -> Option<u32> {
@@ -508,16 +510,40 @@ fn is_mount_point(dir: &Path) -> bool {
         .is_ok_and(|m| m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
 }
 
+/// A working mount: WinFsp's reparse point, readable.
+fn is_live_mount(dir: &Path) -> bool {
+    is_mount_point(dir) && std::fs::read_dir(dir).is_ok()
+}
+
 /// WinFsp creates the mount directory itself. Remove a stale mount point or
-/// an empty folder; move a plain folder with files aside (they were written
-/// while the share was missing) instead of hiding or deleting them.
+/// a folder with nothing but shell metadata (Explorer recreates a missing
+/// Desktop with a desktop.ini); move a folder with real files aside (they
+/// were written while the share was missing) instead of hiding or deleting
+/// them.
 fn clear_mount_dir(dir: &Path) {
     if !dir.exists() && !is_mount_point(dir) {
         return;
     }
-    if is_mount_point(dir) || std::fs::remove_dir(dir).is_ok() {
+    if is_mount_point(dir) {
         let _ = std::fs::remove_dir(dir);
         return;
+    }
+    let names: Vec<_> = std::fs::read_dir(dir)
+        .map(|r| r.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    if names.iter().all(|p| crate::core::is_shell_metadata(p)) {
+        for p in &names {
+            if let Ok(meta) = std::fs::metadata(p) {
+                let mut perms = meta.permissions();
+                #[allow(clippy::permissions_set_readonly_false)]
+                perms.set_readonly(false);
+                let _ = std::fs::set_permissions(p, perms);
+            }
+            let _ = std::fs::remove_file(p);
+        }
+        if std::fs::remove_dir(dir).is_ok() {
+            return;
+        }
     }
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -566,31 +592,27 @@ impl Windows {
     }
 
     fn mount(&mut self, share: &ShareSpec) -> Result<String, String> {
-        if let Some((child, path)) = self.shares.get_mut(&share.tag)
-            && child.try_wait().ok().flatten().is_none()
-        {
-            return Ok(path.clone());
-        }
-        // Mounts left by a previous agent (restart, update) belong to no one
-        // now: stop their virtiofs.exe once, so every share is mounted anew.
-        static STALE_STOPPED: std::sync::Once = std::sync::Once::new();
-        STALE_STOPPED.call_once(|| {
-            let stopped = Command::new("taskkill")
-                .args(["/f", "/im", "virtiofs.exe"])
-                .creation_flags(CREATE_NO_WINDOW)
-                .output()
-                .is_ok_and(|o| o.status.success());
-            if stopped {
-                log("stopped the previous agent's shared-folder mounts");
-                std::thread::sleep(Duration::from_secs(1));
+        if let Some((child, path)) = self.shares.get_mut(&share.tag) {
+            let alive = match child {
+                Some(c) => c.try_wait().ok().flatten().is_none(),
+                None => is_live_mount(Path::new(path.as_str())),
+            };
+            if alive {
+                return Ok(path.clone());
             }
-        });
+        }
         let profile = std::env::var_os("USERPROFILE").ok_or("USERPROFILE is not set")?;
         let parent = Path::new(&profile).join("Linux");
         std::fs::create_dir_all(&parent).map_err(|e| e.to_string())?;
         let dir = parent.join(known_folder_name(share.folder));
-        clear_mount_dir(&dir);
         let dir_str = dir.to_string_lossy().into_owned();
+        // A previous agent (before a restart or an update) left this share
+        // mounted: keep it. Remounting would make the folder vanish for a
+        // moment, which Explorer reports as an error.
+        if is_live_mount(&dir) {
+            return Ok(self.finish(share, None, dir_str));
+        }
+        clear_mount_dir(&dir);
 
         // Directory mount point first, then a free drive letter. Mounted
         // means WinFsp's reparse point is there and virtiofs.exe still runs:
@@ -600,7 +622,7 @@ impl Windows {
             child.try_wait().ok().flatten().is_none() && is_mount_point(&dir)
         }) && std::fs::read_dir(&dir).is_ok()
         {
-            return Ok(self.finish(share, child, dir_str));
+            return Ok(self.finish(share, Some(child), dir_str));
         }
         let _ = child.kill();
         log(format!(
@@ -615,7 +637,7 @@ impl Windows {
             letter.is_some()
         });
         match letter {
-            Some(c) => Ok(self.finish(share, child, format!("{c}:\\"))),
+            Some(c) => Ok(self.finish(share, Some(child), format!("{c}:\\"))),
             None => {
                 let mut child = child;
                 let _ = child.kill();
@@ -624,7 +646,7 @@ impl Windows {
         }
     }
 
-    fn finish(&mut self, share: &ShareSpec, child: Child, path: String) -> String {
+    fn finish(&mut self, share: &ShareSpec, child: Option<Child>, path: String) -> String {
         let id = match share.folder {
             KnownFolder::Desktop => &FOLDERID_Desktop,
             KnownFolder::Documents => &FOLDERID_Documents,
