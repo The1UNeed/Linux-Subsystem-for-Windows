@@ -6,21 +6,22 @@ use lsw_installer::{download, media};
 use std::path::{Path, PathBuf};
 
 /// Where the Windows agent build is looked for, in order:
-/// `$LSW_GUEST_DIR`, the packaged `/usr/lib/lsw/guest`, then the
-/// cross-compiled build next to this binary in a source tree
-/// (`target/x86_64-pc-windows-gnu/release`).
+/// `$LSW_GUEST_DIR`, the cross-compiled build next to this binary in a
+/// source tree (`target/x86_64-pc-windows-gnu/release`), then the packaged
+/// `/usr/lib/lsw/guest`.
 pub fn find_agent_exe() -> Option<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Some(d) = std::env::var_os("LSW_GUEST_DIR") {
         dirs.push(d.into());
     }
-    dirs.push("/usr/lib/lsw/guest".into());
+    // A source build uses its own agent, even with the package installed.
     if let Some(target) = std::env::current_exe()
         .ok()
         .and_then(|e| e.parent()?.parent().map(Path::to_path_buf))
     {
         dirs.push(target.join("x86_64-pc-windows-gnu/release"));
     }
+    dirs.push("/usr/lib/lsw/guest".into());
     dirs.into_iter()
         .map(|d| d.join("lsw-agent.exe"))
         .find(|p| p.is_file())
