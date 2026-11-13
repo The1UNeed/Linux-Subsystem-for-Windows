@@ -92,9 +92,10 @@ async fn connection(
     updates: &Sender<Update>,
     requests: &mut mpsc::UnboundedReceiver<Request>,
 ) -> anyhow::Result<()> {
-    let mut qmp = Qmp::connect_with_retry(&paths.ui_qmp_socket(), Duration::from_millis(500))
-        .await
-        .map_err(|_| anyhow::anyhow!("Windows is not running"))?;
+    let mut qmp =
+        Qmp::connect_with_retry(&paths.coherence_qmp_socket(), Duration::from_millis(500))
+            .await
+            .map_err(|_| anyhow::anyhow!("Windows is not running"))?;
     let display = lsw_daemon::display::connect(&mut qmp).await?;
     let keyboard = KeyboardProxy::new(&display).await?;
     let mouse = MouseProxy::new(&display).await?;

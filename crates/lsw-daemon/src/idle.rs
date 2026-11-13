@@ -11,7 +11,8 @@ pub const BOOT_GRACE: Duration = Duration::from_secs(180);
 /// What the supervisor observes every few seconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Observation {
-    /// The Window/Full Screen view is attached (session port connected).
+    /// The Window/Full Screen view is attached (its QMP monitor is
+    /// connected; it shows the display whether or not the agent runs).
     pub window_view: bool,
     /// The Coherence view is attached (Coherence port connected).
     pub coherence_view: bool,

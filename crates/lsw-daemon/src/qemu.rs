@@ -445,6 +445,16 @@ pub fn build_args(cfg: &VmConfig, paths: &VmPaths, opts: &LaunchOptions) -> Vec<
         ),
     ]);
     push(&["-mon", "chardev=qmpui,mode=control"]);
+    // Fourth monitor for the Coherence client, which may run beside the
+    // Window view.
+    push(&[
+        "-chardev",
+        &format!(
+            "socket,id=qmpcoh,path={},server=on,wait=off",
+            p(&paths.coherence_qmp_socket())
+        ),
+    ]);
+    push(&["-mon", "chardev=qmpcoh,mode=control"]);
     push(&["-pidfile", &p(&paths.qemu_pidfile())]);
     push(&["-boot", "menu=off,strict=on"]);
 
@@ -562,6 +572,9 @@ mod tests {
         ));
         assert!(
             s.contains("socket,id=qmpui,path=/run/user/1000/lsw/win/ui.sock,server=on,wait=off")
+                && s.contains(
+                    "socket,id=qmpcoh,path=/run/user/1000/lsw/win/cohqmp.sock,server=on,wait=off"
+                )
         );
         assert!(!s.contains("vsock"));
         assert!(!s.contains("vhost-user-fs"));

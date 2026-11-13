@@ -93,7 +93,12 @@ impl VmPaths {
     pub fn coherence_socket(&self) -> PathBuf {
         self.run.join("coherence.sock")
     }
-    /// QMP monitor reserved for the UI (display connection, input).
+    /// QMP monitor reserved for the Coherence client (a QMP socket serves
+    /// one client at a time, and Coherence may run beside the Window view).
+    pub fn coherence_qmp_socket(&self) -> PathBuf {
+        self.run.join("cohqmp.sock")
+    }
+    /// QMP monitor reserved for the Window view (display connection, input).
     pub fn ui_qmp_socket(&self) -> PathBuf {
         self.run.join("ui.sock")
     }
@@ -133,6 +138,7 @@ impl VmPaths {
             self.coherence_socket(),
             self.api_socket(),
             self.ui_qmp_socket(),
+            self.coherence_qmp_socket(),
             self.tpm_socket(),
             self.passt_socket(),
             self.virtiofs_socket(lsw_proto::MAX_LIST_LEN),

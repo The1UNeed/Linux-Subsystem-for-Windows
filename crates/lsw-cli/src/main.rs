@@ -951,8 +951,10 @@ async fn observe_views(
         let label = c.get("label").and_then(|v| v.as_str()).unwrap_or("");
         let file = c.get("filename").and_then(|v| v.as_str()).unwrap_or("");
         let up = lsw_daemon::idle::chardev_connected(file);
+        // A view is its display connection: the Window view holds its QMP
+        // monitor for its whole life, with or without the guest agent.
         match label {
-            "session" => obs.window_view = up,
+            "qmpui" => obs.window_view = up,
             "coherence" => obs.coherence_view = up,
             _ => {}
         }
@@ -1103,6 +1105,7 @@ async fn attach_session(
     paths: &VmPaths,
 ) -> anyhow::Result<lsw_daemon::session::SessionClient<tokio::net::UnixStream>> {
     use lsw_daemon::session::{SessionEvent, connect};
+    wake(paths).await;
     let mut s = connect(&paths.session_socket())
         .await
         .context("VM is not running (no session socket), or another LSW window owns it")?;
@@ -1330,7 +1333,24 @@ async fn usb(paths: &VmPaths, action: UsbAction) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Resume an idle-paused VM before acting on it (best effort: a VM run
+/// without the supervisor has no API socket).
+async fn wake(paths: &VmPaths) {
+    let _ = api::call(
+        &paths.api_socket(),
+        &api::Request::Wake,
+        Duration::from_secs(2),
+    )
+    .await;
+}
+
 async fn ctl(paths: &VmPaths, action: CtlAction) -> anyhow::Result<()> {
+    if !matches!(
+        action,
+        CtlAction::Status | CtlAction::Pause | CtlAction::Quit
+    ) {
+        wake(paths).await;
+    }
     let mut qmp = Qmp::connect_with_retry(&paths.ctl_socket(), Duration::from_secs(2))
         .await
         .context("VM is not running (no control socket)")?;
