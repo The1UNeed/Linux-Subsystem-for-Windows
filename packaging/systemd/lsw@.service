@@ -1,0 +1,22 @@
+# LSW VM supervisor, one instance per VM: systemctl --user start lsw@windows
+[Unit]
+Description=LSW Windows VM (%i)
+Documentation=https://github.com/The1UNeed/Linux-Subsystem-for-Windows
+
+[Service]
+ExecStart=/usr/bin/lsw --name %i run
+# Ctrl+C equivalent: lsw shuts Windows down cleanly (ACPI) on SIGINT.
+KillSignal=SIGINT
+# Only lsw gets it: QEMU would quit on SIGINT instead of letting Windows
+# shut down. Whatever is left at the timeout is killed.
+KillMode=mixed
+TimeoutStopSec=150
+Restart=on-failure
+# 78: a setup problem the user must fix (see `journalctl --user -u lsw@%i`).
+RestartPreventExitStatus=78
+RestartSec=5
+# GPU passthrough (tier B/C) pins guest memory.
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,33 @@
+#!/usr/bin/make -f
+# Builds with the toolchain pinned in rust-toolchain.toml (rustup), including
+# the Windows guest agent (x86_64-pc-windows-gnu, MinGW).
+export CARGO_HOME ?= $(HOME)/.cargo
+export PATH := $(CARGO_HOME)/bin:$(PATH)
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release --locked --workspace
+	cargo build --release --locked --target x86_64-pc-windows-gnu -p lsw-guest-agent
+
+override_dh_auto_test:
+	cargo test --release --locked --workspace
+
+override_dh_auto_install:
+	install -Dm755 target/release/lsw debian/lsw/usr/bin/lsw
+	install -Dm755 target/release/lsw-app debian/lsw/usr/bin/lsw-app
+	install -Dm755 target/release/lsw-coherence debian/lsw/usr/bin/lsw-coherence
+	install -Dm755 target/release/lsw-helper debian/lsw/usr/lib/lsw/lsw-helper
+	install -Dm644 target/x86_64-pc-windows-gnu/release/lsw-agent.exe debian/lsw/usr/lib/lsw/guest/lsw-agent.exe
+	install -Dm644 packaging/systemd/lsw@.service debian/lsw/usr/lib/systemd/user/lsw@.service
+	install -Dm644 packaging/polkit/dev.lsw.helper.policy debian/lsw/usr/share/polkit-1/actions/dev.lsw.helper.policy
+	install -Dm644 packaging/desktop/dev.lsw.Lsw.desktop debian/lsw/usr/share/applications/dev.lsw.Lsw.desktop
+	install -Dm644 packaging/desktop/dev.lsw.Lsw.svg debian/lsw/usr/share/icons/hicolor/scalable/apps/dev.lsw.Lsw.svg
+
+# The .exe is a Windows binary: nothing for dh_strip/dh_shlibdeps to do.
+override_dh_strip:
+	dh_strip --exclude=lsw-agent.exe
+
+override_dh_shlibdeps:
+	dh_shlibdeps -X lsw-agent.exe

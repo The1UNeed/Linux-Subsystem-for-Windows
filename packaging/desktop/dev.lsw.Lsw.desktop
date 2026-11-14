@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Windows
+GenericName=Windows 11
+Comment=Run Windows apps on Linux
+Exec=lsw-app
+Icon=dev.lsw.Lsw
+Categories=System;Emulator;
+Keywords=windows;vm;lsw;virtual machine;
+StartupNotify=true
+StartupWMClass=dev.lsw.Lsw

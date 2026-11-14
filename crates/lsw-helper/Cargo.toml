@@ -1,0 +1,17 @@
+[package]
+name = "lsw-helper"
+description = "Privileged LSW helper (polkit): VFIO binding and SR-IOV for GPU tiers B and C"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+lsw-daemon.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

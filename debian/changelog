@@ -1,0 +1,7 @@
+lsw (0.0.1~alpha) noble; urgency=medium
+
+  * First alpha: unattended Windows 11 install, Window and Full Screen views,
+    Coherence, shared folders, clipboard, audio, USB, app launchers, idle
+    pause, GPU passthrough plumbing (tiers B/C).
+
+ -- LSW contributors <noreply@github.com>  Fri, 13 Nov 2026 06:00:00 +0000

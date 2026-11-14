@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-4-dev libadwaita-1-dev libxkbcommon-dev gcc-mingw-w64-x86-64
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Lint (Linux)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Lint (Windows agent)
+        run: cargo clippy -p lsw-guest-agent --target x86_64-pc-windows-gnu --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked
+      - name: Windows agent
+        run: cargo build --release -p lsw-guest-agent --target x86_64-pc-windows-gnu --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lsw-agent
+          path: target/x86_64-pc-windows-gnu/release/lsw-agent.exe
+
+  deb:
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential debhelper dpkg-dev \
+            pkgconf libgtk-4-dev libadwaita-1-dev libxkbcommon-dev gcc-mingw-w64-x86-64
+          rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Source package
+        run: dpkg-buildpackage -S -us -uc -d
+      - name: Binary package
+        run: dpkg-buildpackage -b -us -uc
+      - name: Install check
+        run: |
+          mkdir -p dist && cp ../lsw_*.deb dist/
+          sudo apt-get install -y ./dist/lsw_*.deb && lsw --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lsw-deb
+          path: dist/lsw_*.deb

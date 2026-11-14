@@ -1,0 +1,8 @@
+/target
+*.iso
+*.raw
+*.img
+*.fd
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts

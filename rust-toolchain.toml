@@ -1,0 +1,5 @@
+# Toolchain used by CI and release builds (rustup users get it automatically).
+[toolchain]
+channel = "1.100"
+components = ["clippy", "rustfmt"]
+targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-gnu"]

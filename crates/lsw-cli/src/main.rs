@@ -1,0 +1,1791 @@
+//! `lsw`: command-line front end for the LSW host service.
+//!
+//! M0 commands:
+//!
+//! * `lsw doctor` – host capability report and blocking problems.
+//! * `lsw create` – download and verify media, write the answer file and the
+//!   VM configuration.
+//! * `lsw install` – boot the installer, follow progress, power off when done.
+//! * `lsw run` – boot the installed VM in the foreground.
+//! * `lsw ctl` – talk to a running VM (status, pause, resume, screenshot…).
+
+mod guest;
+
+use anyhow::{Context, bail};
+use clap::{Parser, Subcommand, ValueEnum};
+use lsw_daemon::api;
+use lsw_daemon::channel::{AgentEvent, Channel, ControlCommand, ControlSession, serve_control};
+use lsw_daemon::config::{
+    Firmware, GpuTier, InstallMedia, Network, Profile, Share, VmConfig, parse_user_dirs,
+};
+use lsw_daemon::firmware;
+use lsw_daemon::host::HostReport;
+use lsw_daemon::paths::VmPaths;
+use lsw_daemon::qemu::{Audio, CONTROL_PORT_ID, DiskIo, LaunchOptions};
+use lsw_daemon::qmp::{Qmp, QmpError};
+use lsw_daemon::vm::{self, Vm};
+use lsw_installer::{download, media, unattend};
+use lsw_proto::ShareSpec;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+#[derive(Parser)]
+#[command(name = "lsw", version, about = "Linux Subsystem for Windows")]
+struct Cli {
+    /// VM name.
+    #[arg(long, global = true, default_value = "windows")]
+    name: String,
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Source {
+    /// Windows 11 multi-edition ISO from Microsoft (installs Pro).
+    Consumer,
+    /// Windows 11 Enterprise Evaluation (90 days, for testing).
+    Evaluation,
+    /// An ISO you already have (`--iso`).
+    Iso,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum TierArg {
+    Auto,
+    A,
+    B,
+    C,
+    D,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum NetArg {
+    Auto,
+    Passt,
+    User,
+    None,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ProfileArg {
+    Productivity,
+    Development,
+    Games,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Check whether this host can run LSW.
+    Doctor {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Prepare a new Windows VM (downloads media, writes the answer file).
+    Create {
+        #[command(flatten)]
+        args: CreateArgs,
+    },
+    /// Run the unattended installation and wait for it to finish.
+    Install {
+        /// Give up after this many minutes.
+        #[arg(long, default_value_t = 240)]
+        timeout_min: u64,
+        /// Save a screenshot of the finished desktop here.
+        #[arg(long)]
+        screenshot: Option<PathBuf>,
+        #[command(flatten)]
+        launch: LaunchArgs,
+    },
+    /// Boot the installed VM in the foreground (Ctrl+C shuts it down).
+    Run {
+        #[command(flatten)]
+        launch: LaunchArgs,
+    },
+    /// Control a running VM.
+    Ctl {
+        #[command(subcommand)]
+        action: CtlAction,
+    },
+    /// Read or set the Windows clipboard (through the guest agent).
+    Clip {
+        #[command(subcommand)]
+        action: ClipAction,
+    },
+    /// Resize the Windows display (through the guest agent).
+    Display { width: u32, height: u32 },
+    /// Pass host USB devices through to Windows.
+    Usb {
+        #[command(subcommand)]
+        action: UsbAction,
+    },
+    /// GPU passthrough (tier B: a second GPU; tier C: an Intel SR-IOV VF).
+    Gpu {
+        #[command(subcommand)]
+        action: GpuAction,
+    },
+    /// Windows apps as Linux launchers.
+    Apps {
+        #[command(subcommand)]
+        action: AppsAction,
+    },
+    /// Start a Windows app (starting Windows and Coherence if needed).
+    Launch {
+        /// App id from its launcher (`shell:AppsFolder` id).
+        app: String,
+    },
+}
+
+#[derive(clap::Args, Clone)]
+struct LaunchArgs {
+    /// Use the portable thread-pool disk backend instead of io_uring.
+    #[arg(long)]
+    disk_threads: bool,
+    /// Disable QEMU's seccomp sandbox (debugging only).
+    #[arg(long)]
+    no_sandbox: bool,
+    /// Expose VNC on this Unix socket (debugging).
+    #[arg(long)]
+    vnc: Option<PathBuf>,
+    /// No sound device, even when PipeWire is running.
+    #[arg(long)]
+    no_audio: bool,
+    /// No display for the LSW app (screenshots through `lsw ctl` still work).
+    #[arg(long)]
+    headless: bool,
+}
+
+#[derive(Subcommand)]
+enum GpuAction {
+    /// List display controllers and their IOMMU groups.
+    List,
+    /// Give a GPU (with every function of its slot: HDMI/DP audio, USB-C…)
+    /// to Windows from the next start. Asks for an administrator password
+    /// (polkit). Experimental.
+    Assign { pci: String },
+    /// Give the GPU back to Linux.
+    Release,
+}
+
+#[derive(Subcommand)]
+enum AppsAction {
+    /// Write a launcher for every installed Windows app.
+    Sync,
+}
+
+#[derive(Subcommand)]
+enum UsbAction {
+    /// List host USB devices.
+    List,
+    /// Plug a device into Windows (`BUS-ADDR` or `VID:PID`).
+    Attach { device: String },
+    /// Unplug a device from Windows.
+    Detach { device: String },
+}
+
+#[derive(Subcommand)]
+enum ClipAction {
+    /// Print the Windows clipboard text.
+    Get,
+    /// Put text on the Windows clipboard.
+    Set { text: String },
+}
+
+#[derive(Subcommand)]
+enum CtlAction {
+    Status,
+    Pause,
+    Resume,
+    /// Save a PNG screenshot.
+    Screenshot {
+        path: PathBuf,
+    },
+    /// ACPI power button.
+    Powerdown,
+    /// Stop QEMU immediately.
+    Quit,
+    /// Type ASCII text into the guest (US layout; `\n` presses Enter).
+    Type {
+        text: String,
+    },
+    /// Press a key combination, e.g. `meta_l+r` (QKeyCode names).
+    Key {
+        combo: String,
+    },
+}
+
+fn main() -> std::process::ExitCode {
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    match runtime.block_on(lsw_main()) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            // A configuration problem: the systemd unit must not restart.
+            if e.downcast_ref::<vm::NotReady>().is_some() {
+                std::process::ExitCode::from(vm::NotReady::EXIT_CODE as u8)
+            } else {
+                std::process::ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+async fn lsw_main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        // Log lines go to stderr, and a failed write is dropped (the
+        // default reports it with eprintln!, which panics on a closed
+        // terminal).
+        .with_writer(std::io::stderr)
+        .log_internal_errors(false)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_env("LSW_LOG")
+                .unwrap_or_else(|_| "info".into()),
+        )
+        .with_target(false)
+        .init();
+    let cli = Cli::parse();
+    let paths = VmPaths::resolve(&cli.name)?;
+    match cli.cmd {
+        Cmd::Doctor { json } => doctor(json),
+        Cmd::Create { args } => create(&cli.name, &paths, args).await,
+        Cmd::Install {
+            timeout_min,
+            screenshot,
+            launch,
+        } => install(&paths, timeout_min, screenshot, &launch).await,
+        Cmd::Run { launch } => run(&paths, &launch).await,
+        Cmd::Ctl { action } => ctl(&paths, action).await,
+        Cmd::Clip { action } => clip(&paths, action).await,
+        Cmd::Usb { action } => usb(&paths, action).await,
+        Cmd::Apps {
+            action: AppsAction::Sync,
+        } => {
+            let r = api_call(&paths, &api::Request::SyncApps, Duration::from_secs(120)).await?;
+            println!("{} Windows app launcher(s) written", r.apps.unwrap_or(0));
+            Ok(())
+        }
+        Cmd::Launch { app } => launch(&cli.name, &paths, &app).await,
+        Cmd::Gpu { action } => gpu(&paths, action),
+        Cmd::Display { width, height } => {
+            let mut s = attach_session(&paths).await?;
+            s.display_hint(width, height, 100).await?;
+            s.flush(Duration::from_secs(5)).await?;
+            println!("asked Windows for {width}x{height}");
+            Ok(())
+        }
+    }
+}
+
+fn doctor(json: bool) -> anyhow::Result<()> {
+    let report = HostReport::probe();
+    let problems = report.problems();
+    let warnings = report.warnings();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &serde_json::json!({ "host": report, "problems": problems, "warnings": warnings })
+            )?
+        );
+    } else {
+        println!(
+            "CPU:          {:?}, virtualization {}",
+            report.cpu_vendor,
+            yes(report.virt_extensions)
+        );
+        println!("Logical CPUs: {}", report.logical_cpus);
+        println!("Memory:       {} MiB", report.mem_total_mib);
+        println!(
+            "KVM:          present {}, accessible {}",
+            yes(report.kvm_present),
+            yes(report.kvm_accessible)
+        );
+        println!("IOMMU groups: {}", report.iommu_groups);
+        println!("PipeWire:     {}", yes(report.pipewire));
+        println!("D-Bus display: {}", yes(report.qemu_dbus_display));
+        for g in &report.gpus {
+            println!(
+                "GPU:          {} {:04x}:{:04x} driver={} boot_vga={} vfs={} render={}",
+                g.pci_addr,
+                g.vendor,
+                g.device,
+                g.driver.as_deref().unwrap_or("-"),
+                g.boot_vga,
+                g.sriov_total_vfs,
+                g.render_node.as_deref().unwrap_or("-")
+            );
+        }
+        println!("GPU tiers:    {:?}", report.tiers);
+        let b = &report.binaries;
+        for (name, p) in [
+            ("qemu", &b.qemu),
+            ("swtpm", &b.swtpm),
+            ("passt", &b.passt),
+            ("virtiofsd", &b.virtiofsd),
+            ("newuidmap", &b.newuidmap),
+        ] {
+            println!(
+                "{name:<13} {}",
+                p.as_ref()
+                    .map_or("not found".into(), |p| p.display().to_string())
+            );
+        }
+        if !warnings.is_empty() {
+            println!("\nWarnings:");
+            for p in &warnings {
+                println!("  - {}\n    fix: {}", p.what, p.fix);
+            }
+        }
+        if problems.is_empty() {
+            println!("\nThis host can run LSW.");
+        } else {
+            println!("\nProblems:");
+            for p in &problems {
+                println!("  - {}\n    fix: {}", p.what, p.fix);
+            }
+        }
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        std::process::exit(2)
+    }
+}
+
+fn yes(b: bool) -> &'static str {
+    if b { "yes" } else { "no" }
+}
+
+#[derive(clap::Args)]
+struct CreateArgs {
+    #[arg(long, value_enum, default_value_t = ProfileArg::Productivity)]
+    profile: ProfileArg,
+    #[arg(long, value_enum, default_value_t = Source::Consumer)]
+    source: Source,
+    /// Path to a Windows 11 ISO (with `--source iso`).
+    #[arg(long)]
+    iso: Option<PathBuf>,
+    /// Image name in the ISO for `--source iso` (default "Windows 11 Pro").
+    #[arg(long, default_value = "Windows 11 Pro")]
+    edition: String,
+    /// Download language as named by Microsoft (`English`, `English International`, …).
+    #[arg(long, default_value = "English")]
+    language: String,
+    /// Windows account name (default: your Linux user name).
+    #[arg(long)]
+    user: Option<String>,
+    #[arg(long, value_enum, default_value_t = TierArg::Auto)]
+    tier: TierArg,
+    #[arg(long, value_enum, default_value_t = NetArg::Auto)]
+    network: NetArg,
+    /// Override memory in MiB.
+    #[arg(long)]
+    memory: Option<u32>,
+    /// Override vCPU count.
+    #[arg(long)]
+    cpus: Option<u16>,
+    /// Override disk size in GiB.
+    #[arg(long)]
+    disk: Option<u64>,
+    /// Do not pair the Linux Desktop/Documents/Downloads/Pictures/Music/Videos
+    /// folders with Windows.
+    #[arg(long)]
+    no_shared_folders: bool,
+    /// Create the VM with Secure Boot off (when no firmware with Microsoft's
+    /// keys is installed).
+    #[arg(long)]
+    no_secure_boot: bool,
+}
+
+async fn create(name: &str, paths: &VmPaths, a: CreateArgs) -> anyhow::Result<()> {
+    if paths.data.join(VmConfig::FILE_NAME).exists() {
+        bail!("VM {name:?} already exists in {}", paths.data.display());
+    }
+    let host = HostReport::probe();
+    paths.create()?;
+    let cache = guest::cache_dir(paths)?;
+
+    let profile = match a.profile {
+        ProfileArg::Productivity => Profile::Productivity,
+        ProfileArg::Development => Profile::Development,
+        ProfileArg::Games => Profile::Games,
+    };
+    let (mem, cpus, disk) = profile.capped(host.mem_total_mib, host.logical_cpus.max(2));
+    let tier = match a.tier {
+        TierArg::Auto => host.recommended_tier(profile),
+        TierArg::A if !lsw_daemon::gpu::TIER_A_DRIVER_READY => bail!(
+            "GPU tier A (paravirtualized 3D) is not available in this release: its Windows driver \
+             is not ready. Use tier D now; tier B/C need `lsw gpu assign` after creating the VM."
+        ),
+        TierArg::A => GpuTier::A,
+        TierArg::B => GpuTier::B,
+        TierArg::C => GpuTier::C,
+        TierArg::D => GpuTier::D,
+    };
+    if !host.tiers.contains(&tier) {
+        bail!(
+            "GPU tier {tier:?} is not available on this host (available: {:?})",
+            host.tiers
+        );
+    }
+    let network = match a.network {
+        NetArg::Auto if host.binaries.passt.is_some() => Network::Passt,
+        NetArg::Auto | NetArg::User => Network::User,
+        NetArg::Passt => Network::Passt,
+        NetArg::None => Network::None,
+    };
+
+    // Tier A's test-signed driver needs Secure Boot off (alpha decision);
+    // never without the driver itself.
+    let test_signing = tier == GpuTier::A && lsw_daemon::gpu::TIER_A_DRIVER_READY;
+    // Secure Boot with Microsoft's keys, or an explicit decision not to:
+    // never a silent downgrade.
+    let want_secure_boot = !test_signing && !a.no_secure_boot;
+    let fw = match firmware::find(Path::new("/"), want_secure_boot) {
+        Some(fw) => fw,
+        None if want_secure_boot && firmware::find(Path::new("/"), false).is_some() => bail!(
+            "no UEFI firmware with Microsoft's Secure Boot keys enrolled was found (Ubuntu's \
+             'ovmf' package has one; Arch's 'edk2-ovmf' does not). Install one, or run \
+             `lsw create --no-secure-boot` to create a VM with Secure Boot off."
+        ),
+        None => bail!(
+            "no OVMF firmware found; install the 'ovmf' (Ubuntu) or 'edk2-ovmf' (Arch) package"
+        ),
+    };
+    if !fw.ms_keys_enrolled {
+        eprintln!("note: Secure Boot is off for this VM (--no-secure-boot).");
+    }
+    let vars = paths.data.join("OVMF_VARS.fd");
+    // No vm.json yet: this VM is still being created (possibly a retry of
+    // a failed creation), so its NVRAM must come from this template.
+    firmware::reset_vars(&fw, &vars)?;
+
+    let client = download::client()?;
+    let virtio_iso = cache.join(format!("virtio-win-{}.iso", download::VIRTIO_WIN_VERSION));
+    eprintln!(
+        "Checking virtio-win {} drivers (pinned SHA-256)…",
+        download::VIRTIO_WIN_VERSION
+    );
+    download::ensure_pinned(
+        &client,
+        download::VIRTIO_WIN_URL,
+        &virtio_iso,
+        download::VIRTIO_WIN_SHA256,
+        progress_printer(),
+    )
+    .await?;
+    eprintln!();
+
+    let (windows_iso, image_name, image_index) = match a.source {
+        Source::Iso => {
+            let iso = a.iso.context("--source iso needs --iso PATH")?;
+            anyhow::ensure!(iso.is_file(), "{} does not exist", iso.display());
+            (iso, a.edition.clone(), None)
+        }
+        Source::Consumer => {
+            eprintln!(
+                "Resolving Windows 11 ({}) download from Microsoft…",
+                a.language
+            );
+            let r = download::resolve_consumer(&client, &a.language).await?;
+            // The consumer ISO is promised to match Microsoft's published
+            // SHA-256: no hash, no download.
+            anyhow::ensure!(
+                r.sha256.is_some(),
+                "Microsoft's download page did not list a SHA-256 for {}; refusing an \
+                 unverified download (use --source iso with an ISO you checked)",
+                r.file_name
+            );
+            let dest = cache.join(&r.file_name);
+            fetch_cached(&client, &r, &dest).await?;
+            (dest, "Windows 11 Pro".to_owned(), None)
+        }
+        Source::Evaluation => {
+            eprintln!("Resolving Windows 11 Enterprise Evaluation download…");
+            let r = download::resolve_evaluation(&client, "en-US").await?;
+            let dest = cache.join(&r.file_name);
+            fetch_cached(&client, &r, &dest).await?;
+            (dest, "Windows 11 Enterprise Evaluation".to_owned(), Some(1))
+        }
+    };
+
+    let username = a.user.unwrap_or_else(default_user);
+    let password = random_password();
+    let creds = paths.data.join("credentials.json");
+    write_private(
+        &creds,
+        &serde_json::to_vec_pretty(
+            &serde_json::json!({ "username": username, "password": password }),
+        )?,
+    )?;
+
+    let locale = match a.language.as_str() {
+        "English International" => "en-GB",
+        _ => "en-US",
+    };
+    let xml = unattend::render(&unattend::UnattendOptions {
+        username: username.clone(),
+        full_name: username.clone(),
+        password,
+        locale: locale.into(),
+        time_zone: "UTC".into(),
+        computer_name: "LSW-WINDOWS".into(),
+        image_name,
+        image_index,
+        product_key: None,
+    })?;
+    // The agent and WinFsp are part of a working install: no silent
+    // partial setup medium.
+    let payload = guest::Payload::load(&cache, true).await?.context(
+        "no LSW agent build found (the lsw package ships it in /usr/lib/lsw/guest; from a \
+         source tree, build it with `cargo build --release -p lsw-guest-agent --target \
+         x86_64-pc-windows-gnu` or set LSW_GUEST_DIR)",
+    )?;
+    eprintln!(
+        "Including LSW agent {} in the setup medium.",
+        payload.build_id
+    );
+    let setup_iso = paths.data.join("setup.iso");
+    media::build_setup_media(
+        &setup_iso,
+        &xml,
+        &media::FirstBootConfig { test_signing },
+        Some(payload.as_guest()),
+    )?;
+    restrict_file(&setup_iso)?;
+
+    let cfg = VmConfig {
+        name: name.to_owned(),
+        memory_mib: a.memory.unwrap_or(mem),
+        vcpus: a.cpus.unwrap_or(cpus),
+        disk_path: paths.data.join("disk.raw"),
+        disk_size_gib: a.disk.unwrap_or(disk),
+        firmware: Firmware {
+            code: fw.code,
+            vars,
+            secure_boot: fw.ms_keys_enrolled,
+        },
+        tpm_state_dir: paths.data.join("tpm"),
+        network,
+        gpu_tier: tier,
+        shares: if a.no_shared_folders {
+            Vec::new()
+        } else {
+            default_shares()
+        },
+        microphone: false,
+        passthrough: Vec::new(),
+        install: Some(InstallMedia {
+            windows_iso,
+            virtio_win_iso: virtio_iso,
+            setup_iso,
+        }),
+    };
+    cfg.save(&paths.data)?;
+    println!("Created VM {name:?} in {}", paths.data.display());
+    println!(
+        "  {} MiB, {} vCPUs, {} GiB disk, GPU tier {:?}, network {:?}, Secure Boot {}",
+        cfg.memory_mib,
+        cfg.vcpus,
+        cfg.disk_size_gib,
+        cfg.gpu_tier,
+        cfg.network,
+        yes(cfg.firmware.secure_boot)
+    );
+    println!(
+        "  Windows account: {username} (password in {})",
+        creds.display()
+    );
+    println!("Next: lsw install");
+    Ok(())
+}
+
+async fn fetch_cached(
+    client: &download::Client,
+    r: &download::ResolvedIso,
+    dest: &Path,
+) -> anyhow::Result<()> {
+    if dest.exists() {
+        if let Some(expected) = &r.sha256 {
+            eprintln!("Verifying cached {}…", dest.display());
+            let actual = download::sha256_file(dest).await?;
+            anyhow::ensure!(
+                actual.eq_ignore_ascii_case(expected),
+                "cached ISO has the wrong checksum; delete {}",
+                dest.display()
+            );
+        }
+        return Ok(());
+    }
+    eprintln!("Downloading {}…", r.file_name);
+    let sha = download::download(
+        client,
+        &r.url,
+        dest,
+        r.sha256.as_deref(),
+        progress_printer(),
+    )
+    .await?;
+    eprintln!(
+        "\nSHA-256 {sha}{}",
+        if r.sha256.is_some() {
+            " (matches Microsoft's published hash)"
+        } else {
+            ""
+        }
+    );
+    Ok(())
+}
+
+fn progress_printer() -> impl FnMut(u64, Option<u64>) {
+    let mut last = std::time::Instant::now() - Duration::from_secs(1);
+    move |done, total| {
+        if last.elapsed() < Duration::from_millis(500) {
+            return;
+        }
+        last = std::time::Instant::now();
+        match total {
+            Some(t) if t > 0 => eprint!(
+                "\r  {:>6.1} / {:.1} MiB ({:.0}%)",
+                mib(done),
+                mib(t),
+                done as f64 * 100.0 / t as f64
+            ),
+            _ => eprint!("\r  {:>6.1} MiB", mib(done)),
+        }
+    }
+}
+
+fn mib(b: u64) -> f64 {
+    b as f64 / (1024.0 * 1024.0)
+}
+
+fn default_user() -> String {
+    let raw = std::env::var("USER").unwrap_or_else(|_| "user".into());
+    let clean: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(20)
+        .collect();
+    match clean.to_ascii_lowercase().as_str() {
+        "" | "administrator" | "guest" => "lswuser".into(),
+        _ => clean,
+    }
+}
+
+/// 24 random characters from two v4 UUIDs (the OS CSPRNG via getrandom).
+fn random_password() -> String {
+    let a = uuid::Uuid::new_v4().simple().to_string();
+    let b = uuid::Uuid::new_v4().simple().to_string();
+    format!("Lsw-{}{}", &a[..10], &b[..10])
+}
+
+fn write_private(path: &Path, data: &[u8]) -> anyhow::Result<()> {
+    std::fs::write(path, data)?;
+    restrict_file(path)
+}
+
+#[cfg(unix)]
+fn restrict_file(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_file(_: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+/// Linux XDG user folders paired with Windows known folders.
+fn default_shares() -> Vec<Share> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return Vec::new();
+    };
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    let text = std::fs::read_to_string(config_home.join("user-dirs.dirs")).unwrap_or_default();
+    let dirs = parse_user_dirs(&text, &home);
+    Share::defaults(&home, |key| {
+        dirs.iter().find(|(k, _)| k == key).map(|(_, p)| p.clone())
+    })
+}
+
+fn launch_options(host: &HostReport, l: &LaunchArgs) -> LaunchOptions {
+    LaunchOptions {
+        display: match &l.vnc {
+            Some(p) => lsw_daemon::qemu::Display::VncUnix(p.clone()),
+            None if l.headless || !host.qemu_dbus_display => lsw_daemon::qemu::Display::Headless,
+            // The LSW app attaches to this peer-to-peer D-Bus display.
+            None => lsw_daemon::qemu::Display::DbusP2p,
+        },
+        disk_io: if l.disk_threads {
+            DiskIo::Threads
+        } else {
+            DiskIo::IoUring
+        },
+        audio: if host.pipewire && !l.no_audio {
+            Audio::PipeWire
+        } else {
+            Audio::None
+        },
+        tools_iso: None,
+        display_size: (1280, 800),
+        sandbox: !l.no_sandbox,
+    }
+}
+
+/// How long after its vCPUs first run the VM is still in its UEFI firmware
+/// (no Windows code yet; Windows' boot manager starts after about 4 s).
+const FIRMWARE_STAGE: Duration = Duration::from_secs(4);
+
+/// What a stop signal does, given when the guest's vCPUs first ran (None:
+/// never, QEMU starts them stopped): stop the VM at once while no Windows
+/// code can have run (a power-button press in the firmware is lost), else
+/// shut Windows down.
+fn stop_now(guest_started: Option<std::time::Instant>) -> bool {
+    guest_started.is_none_or(|t| t.elapsed() < FIRMWARE_STAGE)
+}
+
+/// Run `resume` (the first `cont`) and return when the guest may have
+/// started: the time *before* it is sent, so no delay in the supervisor
+/// while the reply is awaited can stretch the firmware stage.
+async fn resumed_at<T>(resume: impl std::future::Future<Output = T>) -> (std::time::Instant, T) {
+    let started = std::time::Instant::now();
+    (started, resume.await)
+}
+
+/// The signals that end a VM-owning command: Ctrl+C, SIGTERM and SIGHUP.
+/// QEMU runs in its own process group, so without handling them it would
+/// outlive `lsw`. Created before the VM starts, so a signal during start
+/// is not lost (it is seen right after).
+struct StopSignals {
+    int: tokio::signal::unix::Signal,
+    term: tokio::signal::unix::Signal,
+    /// None when started with SIGHUP ignored (`nohup`): then a hangup must
+    /// not stop anything.
+    hup: Option<tokio::signal::unix::Signal>,
+}
+
+impl StopSignals {
+    fn new() -> anyhow::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        // Registering a handler would undo `nohup`'s "ignore SIGHUP".
+        let nohup = std::fs::read_to_string("/proc/self/status").is_ok_and(|s| sighup_ignored(&s));
+        let hup = if nohup {
+            None
+        } else {
+            // Whatever the command is doing when the terminal goes away
+            // (also while nobody waits for a stop signal), stop writing to
+            // it.
+            let mut hangup = signal(SignalKind::hangup())?;
+            tokio::spawn(async move {
+                while hangup.recv().await.is_some() {
+                    detach_from_terminal();
+                }
+            });
+            Some(signal(SignalKind::hangup())?)
+        };
+        Ok(Self {
+            int: signal(SignalKind::interrupt())?,
+            term: signal(SignalKind::terminate())?,
+            hup,
+        })
+    }
+
+    async fn recv(&mut self) -> &'static str {
+        let signal = tokio::select! {
+            _ = self.int.recv() => "Interrupted",
+            _ = self.term.recv() => "Terminated",
+            Some(_) = async {
+                match self.hup.as_mut() {
+                    Some(h) => h.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => "Hung up",
+        };
+        if signal == "Hung up" {
+            detach_from_terminal();
+        }
+        signal
+    }
+
+    /// A signal that already arrived (e.g. while the VM was starting).
+    async fn pending(&mut self) -> Option<&'static str> {
+        tokio::select! {
+            biased;
+            signal = self.recv() => Some(signal),
+            () = std::future::ready(()) => None,
+        }
+    }
+}
+
+/// Whether the `SigIgn:` mask of `/proc/self/status` ignores SIGHUP
+/// (signal 1, bit 0), as under `nohup`.
+fn sighup_ignored(status: &str) -> bool {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("SigIgn:"))
+        .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+        .is_some_and(|mask| mask & 1 != 0)
+}
+
+/// The terminal is gone: writing to it would fail (and `println!` would
+/// panic, killing QEMU on unwind). Send what went to it to /dev/null.
+fn detach_from_terminal() {
+    use std::os::fd::AsFd;
+    // Only a terminal (a character device): under systemd stdout is the
+    // journal, which keeps working.
+    let is_tty = |fd: std::os::fd::BorrowedFd<'_>| {
+        rustix::fs::fstat(fd).is_ok_and(|st| {
+            rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::CharacterDevice
+        })
+    };
+    // Each separately: `lsw run > run.log` keeps its log.
+    let (out, err) = (
+        is_tty(std::io::stdout().as_fd()),
+        is_tty(std::io::stderr().as_fd()),
+    );
+    if !out && !err {
+        return;
+    }
+    if let Ok(null) = std::fs::OpenOptions::new().write(true).open("/dev/null") {
+        if out {
+            let _ = rustix::stdio::dup2_stdout(&null);
+        }
+        if err {
+            let _ = rustix::stdio::dup2_stderr(&null);
+        }
+    }
+}
+
+/// A guest-provided string made safe for a terminal (no control
+/// characters, so no escape sequences).
+fn printable(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
+/// `println!` that never panics: the supervisor's output may go to a
+/// terminal that has gone away.
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout(), $($arg)*);
+    }};
+}
+
+/// `eprintln!` that never panics (see [`say!`]).
+macro_rules! esay {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
+async fn install(
+    paths: &VmPaths,
+    timeout_min: u64,
+    screenshot: Option<PathBuf>,
+    l: &LaunchArgs,
+) -> anyhow::Result<()> {
+    let mut stop = StopSignals::new()?;
+    let _lock = vm::lock_vm(paths)?;
+    let mut cfg = VmConfig::load(&paths.data)?;
+    let install = cfg
+        .install
+        .clone()
+        .context("this VM is already installed")?;
+    let host = HostReport::probe();
+    let opts = launch_options(&host, l);
+    let _ = std::fs::remove_file(paths.serial_log());
+    let started = std::time::Instant::now();
+    let interrupted = |signal: &str| {
+        anyhow::anyhow!(
+            "{signal}: installation stopped (QEMU was stopped too). The VM is not marked \
+             installed; run `lsw install` to start over."
+        )
+    };
+    let mut running = Vm::new(cfg.clone(), paths.clone())
+        .start(&host.binaries, &opts)
+        .await?;
+    // QEMU starts with its vCPUs stopped: nothing has run yet.
+    if let Some(signal) = stop.pending().await {
+        running.kill().await?;
+        return Err(interrupted(signal));
+    }
+    running.resume().await?;
+    esay!("VM started; getting past the \"Press any key to boot from CD\" prompt…");
+    let press =
+        running.press_key_repeatedly("ret", Duration::from_millis(500), Duration::from_secs(20));
+    let signal = tokio::select! {
+        () = press => None,
+        signal = stop.recv() => Some(signal),
+    };
+    if let Some(signal) = signal {
+        running.kill().await?;
+        return Err(interrupted(signal));
+    }
+    esay!("Windows Setup is running unattended. Progress (from the guest's serial console):");
+    // Either outcome marker ends the wait: DONE or FAILED <steps>.
+    let marker = unattend::INSTALL_OUTCOME_PREFIX;
+    let serial = paths.serial_log();
+    let wait = vm::wait_for_serial_marker(
+        &serial,
+        marker,
+        Duration::from_secs(timeout_min * 60),
+        |line| {
+            if !line.trim().is_empty() {
+                esay!(
+                    "  [{:>5.1} min] {line}",
+                    started.elapsed().as_secs_f64() / 60.0
+                );
+            }
+        },
+    );
+    let outcome = tokio::select! {
+        r = wait => r?,
+        status = running.wait() => {
+            bail!("QEMU exited during installation ({:?}); see {}\n{}", status?, paths.qemu_log().display(), vm::tail(&paths.qemu_log(), 30));
+        }
+        signal = stop.recv() => {
+            running.kill().await?;
+            return Err(interrupted(signal));
+        }
+    };
+    if outcome.contains(unattend::INSTALL_FAILED_MARKER) {
+        let steps = outcome
+            .split(unattend::INSTALL_FAILED_MARKER)
+            .nth(1)
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        let shutdown = running.shutdown(Duration::from_secs(180));
+        tokio::pin!(shutdown);
+        let off = loop {
+            tokio::select! {
+                off = &mut shutdown => break off?,
+                signal = stop.recv() => esay!("{signal}: Windows is already shutting down; please wait."),
+            }
+        };
+        esay!("{off}");
+        bail!(
+            "Windows installed, but these LSW steps failed: {steps}. The VM is not marked \
+             installed. The reasons are logged inside Windows in \
+             C:\\ProgramData\\LSW\\firstboot.log; the setup files are kept in {}. To \
+             start over, delete that directory and run `lsw create` again.",
+            paths.data.display()
+        );
+    }
+    esay!(
+        "Installation finished in {:.1} minutes.",
+        started.elapsed().as_secs_f64() / 60.0
+    );
+    // Windows is installed: record it now, before the screenshot and the
+    // shutdown, so nothing that happens after can lose it.
+    cfg.install = None;
+    cfg.save(&paths.data)?;
+    // The setup image contains the account password.
+    let _ = std::fs::remove_file(&install.setup_iso);
+    // Give the desktop a moment to settle for the screenshot (unless asked
+    // to stop), then shut down. Best effort: a failed screenshot changes
+    // nothing.
+    let settle = tokio::select! {
+        () = tokio::time::sleep(Duration::from_secs(15)) => None,
+        signal = stop.recv() => Some(signal),
+    };
+    match settle {
+        Some(signal) => esay!("{signal}: skipping the screenshot."),
+        None => {
+            let shot = screenshot.unwrap_or_else(|| paths.data.join("installed.png"));
+            match running.qmp.screendump_png(&shot).await {
+                Ok(()) => esay!("Screenshot: {}", shot.display()),
+                Err(e) => esay!("note: no screenshot ({e})"),
+            }
+        }
+    }
+    let shutdown = running.shutdown(Duration::from_secs(180));
+    tokio::pin!(shutdown);
+    let off = loop {
+        tokio::select! {
+            off = &mut shutdown => break off?,
+            signal = stop.recv() => esay!("{signal}: Windows is already shutting down; please wait."),
+        }
+    };
+    esay!("{off}");
+    say!("Windows is installed. Start it with: lsw run");
+    Ok(())
+}
+
+async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
+    // Ctrl+C, SIGTERM (systemctl stop, logout, host shutdown) and SIGHUP
+    // (the terminal closed) shut Windows down instead of leaving it
+    // running unsupervised. Handled from the start: one that arrives while
+    // the VM is being prepared is seen before QEMU starts.
+    let mut stop = StopSignals::new()?;
+    let _lock = vm::lock_vm(paths)?;
+    let cfg = VmConfig::load(&paths.data)?;
+    if cfg.install.is_some() {
+        bail!("Windows is not installed yet; run `lsw install` first");
+    }
+    let host = HostReport::probe();
+    let mut opts = launch_options(&host, l);
+    opts.display_size = lsw_daemon::config::DisplaySize::load(&paths.display_size_file());
+    opts.tools_iso = match guest::prepare_tools(paths).await {
+        Ok(t) => t,
+        Err(e) => {
+            esay!("warning: LSW Tools CD not built: {e:#}");
+            None
+        }
+    };
+    let cfg_name = cfg.name.clone();
+    if let Some(signal) = stop.pending().await {
+        say!("{signal}: not starting Windows.");
+        return Ok(());
+    }
+    let mut running = Vm::new(cfg, paths.clone())
+        .start(&host.binaries, &opts)
+        .await?;
+    // QEMU starts with its vCPUs stopped: until they run, stopping is
+    // harmless.
+    if let Some(signal) = stop.pending().await {
+        say!("{signal}: stopping the VM before Windows starts.");
+        running.kill().await?;
+        return Ok(());
+    }
+    let (started, resumed) = resumed_at(running.resume()).await;
+    resumed?;
+    let guest_started = Some(started);
+    let shares: Vec<ShareSpec> = running
+        .shares
+        .iter()
+        .map(|s| ShareSpec {
+            tag: s.tag.clone(),
+            folder: s.folder,
+        })
+        .collect();
+    say!(
+        "VM running ({} shared folder(s)). Control it with `lsw ctl …`; Ctrl+C shuts Windows down.",
+        shares.len()
+    );
+    let (port_tx, port_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<ControlCommand>();
+    let connected = Arc::new(AtomicBool::new(false));
+    let agent = tokio::spawn(supervise_agent(
+        paths.agent_socket(),
+        shares,
+        port_rx,
+        cmd_rx,
+        connected.clone(),
+        AppSync {
+            paths: paths.clone(),
+            vm: cfg_name,
+            commands: cmd_tx.clone(),
+        },
+    ));
+    let (call_tx, mut call_rx) = tokio::sync::mpsc::unbounded_channel::<api::Call>();
+    let mut idle = lsw_daemon::idle::IdlePolicy::new();
+    let mut idle_tick = tokio::time::interval(Duration::from_secs(2));
+    let mut coherence_windows = 0u32;
+    let api_path = paths.api_socket();
+    let api_server = tokio::spawn(async move {
+        if let Err(e) = api::serve(&api_path, call_tx).await {
+            tracing::warn!("API socket: {e}");
+        }
+    });
+    let result = loop {
+        tokio::select! {
+            activity = running.next_activity() => match activity {
+                vm::Activity::Exited(status) => break qemu_exit(status?, paths),
+                vm::Activity::Event(Err(QmpError::Closed)) => {
+                    // QEMU closes QMP as it exits (Windows shut itself
+                    // down, or QEMU died): report how it ended.
+                    match tokio::time::timeout(Duration::from_secs(10), running.wait()).await {
+                        Ok(status) => break qemu_exit(status?, paths),
+                        // QEMU is killed when `running` is dropped.
+                        Err(_) => break Err(anyhow::anyhow!("QEMU closed its QMP monitor but kept running")),
+                    }
+                }
+                vm::Activity::Event(event) => {
+                    let event = event?;
+                    if event.name == "VSERPORT_CHANGE"
+                        && event.data.get("id").and_then(|v| v.as_str()) == Some(CONTROL_PORT_ID)
+                    {
+                        let open = event.data.get("open").and_then(|v| v.as_bool()).unwrap_or(false);
+                        if !open {
+                            // Agent stopped or Windows is rebooting: the
+                            // socket stays up, so this is the only sign.
+                            // Until it says hello again, Windows is not
+                            // idle-paused.
+                            connected.store(false, Ordering::Release);
+                        }
+                        let _ = port_tx.send(open);
+                    }
+                }
+            },
+            signal = stop.recv() => {
+                // In the first seconds the VM is still in its firmware: no
+                // Windows to shut down, and a power-button press there is
+                // lost.
+                if stop_now(guest_started) {
+                    say!("{signal}: stopping the VM before Windows starts.");
+                    running.kill().await?;
+                    break Ok(());
+                }
+                say!("{signal}: shutting Windows down…");
+                say!("{}", running.shutdown(Duration::from_secs(120)).await?);
+                break Ok(());
+            }
+            call = call_rx.recv() => {
+                let Some(call) = call else { continue };
+                match &call.request {
+                    api::Request::Windows { count } => {
+                        coherence_windows = *count;
+                        let _ = call.reply.send(api::Response::ok());
+                        continue;
+                    }
+                    api::Request::Wake => {
+                        if idle.wake(std::time::Instant::now()) == lsw_daemon::idle::Action::Resume {
+                            running.resume().await?;
+                            say!("Resumed for a view.");
+                            // The pause stopped Windows' clock.
+                            let _ = cmd_tx.send(ControlCommand::SyncClock);
+                        }
+                        let _ = call.reply.send(api::Response::ok());
+                        continue;
+                    }
+                    api::Request::Status => {
+                        let _ = call.reply.send(api::Response {
+                            agent: Some(connected.load(Ordering::Acquire)),
+                            paused: Some(idle.paused()),
+                            ..api::Response::ok()
+                        });
+                        continue;
+                    }
+                    api::Request::Launch { .. } | api::Request::SyncApps => {
+                        // The agent must run to answer.
+                        if idle.wake(std::time::Instant::now()) == lsw_daemon::idle::Action::Resume {
+                            running.resume().await?;
+                            say!("Resumed for a request.");
+                            // The pause stopped Windows' clock.
+                            let _ = cmd_tx.send(ControlCommand::SyncClock);
+                        }
+                    }
+                }
+                handle_api_call(call, &connected, &cmd_tx, paths);
+            }
+            _ = idle_tick.tick() => {
+                let mut obs = observe_views(&mut running, coherence_windows).await;
+                obs.agent = connected.load(Ordering::Acquire);
+                if !obs.coherence_view {
+                    coherence_windows = 0;
+                }
+                match idle.observe(obs, std::time::Instant::now()) {
+                    lsw_daemon::idle::Action::Pause => {
+                        running.pause().await?;
+                        say!("Nothing of Windows is visible: paused (0% CPU).");
+                    }
+                    lsw_daemon::idle::Action::Resume => {
+                        running.resume().await?;
+                        say!("Resumed.");
+                        // The pause stopped Windows' clock.
+                        let _ = cmd_tx.send(ControlCommand::SyncClock);
+                    }
+                    lsw_daemon::idle::Action::None => {}
+                }
+            }
+        }
+    };
+    agent.abort();
+    api_server.abort();
+    let _ = std::fs::remove_file(paths.api_socket());
+    result
+}
+
+/// How `lsw run` ends when QEMU exits by itself: success when Windows shut
+/// down (exit 0), an error for a crash or a signal, so the systemd unit's
+/// `Restart=on-failure` applies.
+fn qemu_exit(status: std::process::ExitStatus, paths: &VmPaths) -> anyhow::Result<()> {
+    if status.success() {
+        say!("Windows shut down; QEMU exited ({status}).");
+        Ok(())
+    } else {
+        bail!(
+            "QEMU stopped unexpectedly ({status}); see {}\n{}",
+            paths.qemu_log().display(),
+            vm::tail(&paths.qemu_log(), 30)
+        )
+    }
+}
+
+/// Which LSW views are attached, from QEMU's chardev state.
+async fn observe_views(
+    running: &mut vm::Running,
+    coherence_windows: u32,
+) -> lsw_daemon::idle::Observation {
+    let mut obs = lsw_daemon::idle::Observation {
+        coherence_windows,
+        ..Default::default()
+    };
+    // On error, report everything visible: never pause on bad information.
+    let Ok(list) = running.qmp.execute("query-chardev", None).await else {
+        obs.window_view = true;
+        return obs;
+    };
+    for c in list.as_array().into_iter().flatten() {
+        let label = c.get("label").and_then(|v| v.as_str()).unwrap_or("");
+        let file = c.get("filename").and_then(|v| v.as_str()).unwrap_or("");
+        let up = lsw_daemon::idle::chardev_connected(file);
+        // A view is its display connection: the Window view holds its QMP
+        // monitor for its whole life, with or without the guest agent.
+        match label {
+            "qmpui" => obs.window_view = up,
+            "coherence" => obs.coherence_view = up,
+            _ => {}
+        }
+    }
+    obs
+}
+
+/// Answer one API request without blocking the supervisor loop.
+fn handle_api_call(
+    call: api::Call,
+    connected: &AtomicBool,
+    commands: &tokio::sync::mpsc::UnboundedSender<ControlCommand>,
+    paths: &VmPaths,
+) {
+    let api::Call { request, reply } = call;
+    match request {
+        api::Request::Status | api::Request::Windows { .. } | api::Request::Wake => {
+            let _ = reply.send(api::Response {
+                agent: Some(connected.load(Ordering::Acquire)),
+                ..api::Response::ok()
+            });
+        }
+        api::Request::Launch { launch } => {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = commands.send(ControlCommand::Launch(launch, tx));
+            tokio::spawn(async move {
+                let r = match rx.await {
+                    Ok(Ok(())) => api::Response::ok(),
+                    Ok(Err(e)) => api::Response::err(e),
+                    Err(_) => api::Response::err("the agent channel closed"),
+                };
+                let _ = reply.send(r);
+            });
+        }
+        api::Request::SyncApps => {
+            let sync = AppSync {
+                paths: paths.clone(),
+                vm: paths
+                    .data
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                commands: commands.clone(),
+            };
+            tokio::spawn(async move {
+                let r = match sync.run().await {
+                    Ok(n) => api::Response {
+                        apps: Some(n),
+                        ..api::Response::ok()
+                    },
+                    Err(e) => api::Response::err(format!("{e:#}")),
+                };
+                let _ = reply.send(r);
+            });
+        }
+    }
+}
+
+/// Writes Linux launchers for the installed Windows apps.
+#[derive(Clone)]
+struct AppSync {
+    paths: VmPaths,
+    vm: String,
+    commands: tokio::sync::mpsc::UnboundedSender<ControlCommand>,
+}
+
+impl AppSync {
+    async fn run(&self) -> anyhow::Result<usize> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.commands
+            .send(ControlCommand::ListApps(tx))
+            .map_err(|_| anyhow::anyhow!("the agent channel is gone"))?;
+        let apps = tokio::time::timeout(Duration::from_secs(90), rx)
+            .await
+            .context("the agent did not list its apps in time")??
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let data_home = guest::data_home(&self.paths)?;
+        let lsw = std::env::current_exe()?;
+        let n = lsw_daemon::apps::sync(
+            &apps,
+            &data_home.join("applications"),
+            &data_home.join("lsw/icons"),
+            &lsw,
+            &self.vm,
+        )?;
+        guest::gnome_app_folder();
+        tracing::info!("{n} Windows app launchers written");
+        Ok(n)
+    }
+}
+
+/// Keep the control channel to the guest agent up for the VM's lifetime.
+async fn supervise_agent(
+    socket: PathBuf,
+    shares: Vec<ShareSpec>,
+    mut port_open: tokio::sync::mpsc::UnboundedReceiver<bool>,
+    mut commands: tokio::sync::mpsc::UnboundedReceiver<ControlCommand>,
+    connected: Arc<AtomicBool>,
+    app_sync: AppSync,
+) {
+    let mut synced = false;
+    loop {
+        let mut channel = match Channel::connect(&socket, Duration::from_secs(30)).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("agent channel: {e}");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+        let mut session =
+            ControlSession::new(shares.clone()).with_time_zone(lsw_daemon::host::time_zone);
+        let r = serve_control(
+            &mut channel,
+            &mut session,
+            &mut port_open,
+            &mut commands,
+            |event| match event {
+                AgentEvent::Connected {
+                    agent_version,
+                    os_build,
+                    protocol,
+                } => {
+                    say!(
+                        "Agent connected: lsw-agent {}, Windows {}, protocol {protocol}",
+                        printable(&agent_version),
+                        printable(&os_build)
+                    );
+                    connected.store(true, Ordering::Release);
+                    if !synced {
+                        // Launchers appear once Windows is installed and running.
+                        synced = true;
+                        let sync = app_sync.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = sync.run().await {
+                                tracing::warn!("app launchers: {e:#}");
+                            }
+                        });
+                    }
+                }
+                AgentEvent::Share { tag, ok, detail } => {
+                    if ok {
+                        say!(
+                            "Shared folder {} mounted at {}",
+                            printable(&tag),
+                            printable(&detail)
+                        );
+                    } else {
+                        say!(
+                            "Shared folder {} failed: {}",
+                            printable(&tag),
+                            printable(&detail)
+                        );
+                    }
+                }
+            },
+        )
+        .await;
+        tracing::info!("agent channel ended: {r:?}");
+        connected.store(false, Ordering::Release);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// Connect to the session channel and wait for the agent to attach.
+async fn attach_session(
+    paths: &VmPaths,
+) -> anyhow::Result<lsw_daemon::session::SessionClient<tokio::net::UnixStream>> {
+    use lsw_daemon::session::{SessionEvent, connect};
+    wake(paths).await;
+    let mut s = connect(&paths.session_socket())
+        .await
+        .context("VM is not running (no session socket), or another LSW window owns it")?;
+    let attached = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let SessionEvent::Attached { .. } = s.next_event().await? {
+                return anyhow::Ok(());
+            }
+        }
+    })
+    .await;
+    match attached {
+        Ok(r) => r.map(|()| s),
+        Err(_) => bail!("the guest agent did not answer (is it running in Windows?)"),
+    }
+}
+
+async fn clip(paths: &VmPaths, action: ClipAction) -> anyhow::Result<()> {
+    use lsw_daemon::session::SessionEvent;
+    use lsw_proto::ClipFormat;
+    let mut s = attach_session(paths).await?;
+    match action {
+        ClipAction::Get => {
+            // The agent offers its clipboard right after attaching.
+            let got = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match s.next_event().await? {
+                        SessionEvent::GuestClipboard { serial, formats }
+                            if formats.contains(&ClipFormat::Text) =>
+                        {
+                            s.fetch(serial, ClipFormat::Text).await?;
+                        }
+                        SessionEvent::GuestClipboardData {
+                            format: ClipFormat::Text,
+                            data,
+                            ..
+                        } => return anyhow::Ok(String::from_utf8_lossy(&data).into_owned()),
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .context("Windows did not offer any clipboard text")??;
+            println!("{got}");
+        }
+        ClipAction::Set { text } => {
+            s.offer(vec![(ClipFormat::Text, text.into_bytes())]).await?;
+            // Serve the agent's request, then give it a moment to apply.
+            let _ = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    s.next_event().await?;
+                }
+                #[allow(unreachable_code)]
+                anyhow::Ok(())
+            })
+            .await;
+            // The last reply may still be queued.
+            s.flush(Duration::from_secs(5)).await?;
+            println!("clipboard offered to Windows");
+        }
+    }
+    Ok(())
+}
+
+async fn api_call(
+    paths: &VmPaths,
+    request: &api::Request,
+    timeout: Duration,
+) -> anyhow::Result<api::Response> {
+    let r = api::call(&paths.api_socket(), request, timeout)
+        .await
+        .context("Windows is not running (start it with `lsw run` or the LSW app)")?;
+    if !r.ok {
+        // The text can come from Windows (the agent's error).
+        bail!(
+            "{}",
+            printable(&r.error.unwrap_or_else(|| "request failed".into()))
+        );
+    }
+    Ok(r)
+}
+
+/// Start a Windows app from a launcher: bring up Windows and the Coherence
+/// view if needed, then ask the agent to start the app.
+async fn launch(name: &str, paths: &VmPaths, app: &str) -> anyhow::Result<()> {
+    let status = api::call(
+        &paths.api_socket(),
+        &api::Request::Status,
+        Duration::from_secs(2),
+    )
+    .await;
+    if status.is_err() {
+        guest::start_detached("lsw", &["--name", name, "run"], &format!("lsw-vm-{name}"))?;
+    }
+    // Wait for the agent (a cold start takes Windows' boot time).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+    loop {
+        if let Ok(r) = api::call(
+            &paths.api_socket(),
+            &api::Request::Status,
+            Duration::from_secs(2),
+        )
+        .await
+            && r.agent == Some(true)
+        {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            bail!("Windows did not become ready in time");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    if guest::coherence_idle(paths) {
+        guest::start_detached(
+            "lsw-coherence",
+            &["--name", name],
+            &format!("lsw-coherence-{name}"),
+        )?;
+    }
+    api_call(
+        paths,
+        &api::Request::Launch {
+            launch: app.to_owned(),
+        },
+        Duration::from_secs(10),
+    )
+    .await?;
+    Ok(())
+}
+
+fn gpu(paths: &VmPaths, action: GpuAction) -> anyhow::Result<()> {
+    use lsw_daemon::gpu::{PciAddr, passthrough_set};
+    let sysfs = Path::new("/sys/bus/pci/devices");
+    match action {
+        GpuAction::List => {
+            let report = HostReport::probe();
+            for g in &report.gpus {
+                let set = PciAddr::parse(&g.pci_addr).map(|a| passthrough_set(sysfs, &a));
+                let note = match set {
+                    Some(Ok(_)) if g.boot_vga => "drives the Linux desktop".to_owned(),
+                    Some(Ok(_)) => "can be assigned (tier B)".to_owned(),
+                    Some(Err(e)) => e,
+                    None => "invalid address".to_owned(),
+                };
+                println!(
+                    "{}  {:04x}:{:04x}  driver={}  vfs={}  {note}",
+                    g.pci_addr,
+                    g.vendor,
+                    g.device,
+                    g.driver.as_deref().unwrap_or("-"),
+                    g.sriov_total_vfs
+                );
+            }
+        }
+        GpuAction::Assign { pci } => {
+            // The VM must exist and be stopped before anything changes.
+            let mut cfg = VmConfig::load(&paths.data)?;
+            let _lock = vm::lock_vm(paths)?;
+            let addr = PciAddr::parse(&pci).context("expected a PCI address like 0000:01:00.0")?;
+            // Before asking for privileges: one assignment at a time.
+            if let Some(e) = lsw_daemon::gpu::assignment_conflict(&cfg.passthrough, &addr) {
+                bail!(e);
+            }
+            let set = passthrough_set(sysfs, &addr).map_err(|e| anyhow::anyhow!(e))?;
+            let helper = ["/usr/lib/lsw/lsw-helper", "/usr/libexec/lsw-helper"]
+                .into_iter()
+                .find(|p| Path::new(p).is_file())
+                .context("lsw-helper is not installed (it ships with the LSW package)")?;
+            let status = std::process::Command::new("pkexec")
+                .args([helper, "bind-vfio", addr.as_str()])
+                .status()
+                .context("pkexec")?;
+            anyhow::ensure!(status.success(), "lsw-helper failed");
+            cfg.passthrough = set.into_iter().map(|f| f.addr).collect();
+            cfg.gpu_tier = GpuTier::B;
+            cfg.save(&paths.data)?;
+            println!("{addr} is assigned to Windows from the next start (tier B).");
+        }
+        GpuAction::Release => {
+            let mut cfg = VmConfig::load(&paths.data)?;
+            let _lock = vm::lock_vm(paths)?;
+            if let Some(first) = cfg.passthrough.first().cloned() {
+                let helper = ["/usr/lib/lsw/lsw-helper", "/usr/libexec/lsw-helper"]
+                    .into_iter()
+                    .find(|p| Path::new(p).is_file())
+                    .context("lsw-helper is not installed")?;
+                let status = std::process::Command::new("pkexec")
+                    .args([helper, "release", first.as_str()])
+                    .status()?;
+                anyhow::ensure!(status.success(), "lsw-helper failed");
+            }
+            cfg.passthrough.clear();
+            cfg.gpu_tier = GpuTier::D;
+            cfg.save(&paths.data)?;
+            println!("The GPU is back on Linux.");
+        }
+    }
+    Ok(())
+}
+
+async fn usb(paths: &VmPaths, action: UsbAction) -> anyhow::Result<()> {
+    use lsw_daemon::usb;
+    let devices = usb::list(Path::new("/sys/bus/usb/devices"), Path::new("/dev/bus/usb"));
+    let pick = |spec: &str| {
+        usb::find(&devices, spec)
+            .cloned()
+            .with_context(|| format!("no USB device {spec:?}; see `lsw usb list`"))
+    };
+    match action {
+        UsbAction::List => {
+            if devices.is_empty() {
+                println!("No USB devices (hubs are not listed).");
+            }
+            for d in &devices {
+                println!("{}-{}  {}", d.bus, d.addr, d.label());
+            }
+        }
+        UsbAction::Attach { device } => {
+            let d = pick(&device)?;
+            let mut qmp = Qmp::connect_with_retry(&paths.ctl_socket(), Duration::from_secs(2))
+                .await
+                .context("VM is not running")?;
+            usb::attach(&mut qmp, &d).await?;
+            println!("{} is now connected to Windows", d.label());
+        }
+        UsbAction::Detach { device } => {
+            let d = pick(&device)?;
+            let mut qmp = Qmp::connect_with_retry(&paths.ctl_socket(), Duration::from_secs(2))
+                .await
+                .context("VM is not running")?;
+            usb::detach(&mut qmp, &d).await?;
+            println!("{} is back on Linux", d.label());
+        }
+    }
+    Ok(())
+}
+
+/// Resume an idle-paused VM before acting on it (best effort: a VM run
+/// without the supervisor has no API socket).
+async fn wake(paths: &VmPaths) {
+    let _ = api::call(
+        &paths.api_socket(),
+        &api::Request::Wake,
+        Duration::from_secs(2),
+    )
+    .await;
+}
+
+async fn ctl(paths: &VmPaths, action: CtlAction) -> anyhow::Result<()> {
+    if !matches!(
+        action,
+        CtlAction::Status | CtlAction::Pause | CtlAction::Quit
+    ) {
+        wake(paths).await;
+    }
+    let mut qmp = Qmp::connect_with_retry(&paths.ctl_socket(), Duration::from_secs(2))
+        .await
+        .context("VM is not running (no control socket)")?;
+    match action {
+        CtlAction::Status => println!("{}", qmp.status().await?),
+        CtlAction::Pause => {
+            qmp.execute("stop", None).await?;
+            println!("paused");
+        }
+        CtlAction::Resume => {
+            qmp.execute("cont", None).await?;
+            println!("running");
+        }
+        CtlAction::Screenshot { path } => {
+            let abs = std::path::absolute(&path)?;
+            qmp.screendump_png(&abs).await?;
+            println!("{}", abs.display());
+        }
+        CtlAction::Powerdown => {
+            qmp.execute("system_powerdown", None).await?;
+            println!("power button pressed");
+        }
+        CtlAction::Quit => {
+            let _ = qmp.execute("quit", None).await;
+            println!("quit");
+        }
+        CtlAction::Type { text } => {
+            let text = text.replace("\\n", "\n");
+            let skipped = qmp.type_text(&text).await?;
+            if !skipped.is_empty() {
+                eprintln!("skipped characters without a US-layout key: {skipped:?}");
+            }
+        }
+        CtlAction::Key { combo } => {
+            let keys: Vec<&str> = combo.split('+').collect();
+            qmp.send_combo(&keys).await?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn a_stop_signal_stops_at_once_only_before_windows_can_run() {
+        use std::time::Instant;
+        assert!(stop_now(None), "vCPUs never ran (QEMU starts with -S)");
+        assert!(stop_now(Some(Instant::now())), "just resumed: firmware");
+        // A delayed supervisor (e.g. stopped for a while) does not matter:
+        // the time counts from when the guest really started running.
+        let long_ago = Instant::now() - Duration::from_secs(6);
+        assert!(
+            !stop_now(Some(long_ago)),
+            "Windows may be running: shut down"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_guest_start_time_is_taken_before_cont_is_sent() {
+        use std::time::Instant;
+        // A `cont` whose reply comes late (or a supervisor delayed while it
+        // waits): QEMU already runs the guest from the moment it is sent.
+        let (started, sent_at) = resumed_at(async {
+            let sent_at = Instant::now();
+            std::thread::sleep(Duration::from_millis(50));
+            sent_at
+        })
+        .await;
+        assert!(started <= sent_at, "timestamp taken before cont is sent");
+        // With the delay counted, a stop after it is a shutdown once the
+        // firmware stage has passed.
+        let delayed = started - FIRMWARE_STAGE;
+        assert!(!stop_now(Some(delayed)));
+    }
+
+    #[test]
+    fn nohup_is_detected_from_the_ignored_signal_mask() {
+        let status = |mask: &str| {
+            format!("Name:\tlsw\nSigBlk:\t0000000000000000\nSigIgn:\t{mask}\nSigCgt:\t0\n")
+        };
+        assert!(sighup_ignored(&status("0000000000000001")), "nohup");
+        assert!(sighup_ignored(&status("0000000000001001")));
+        assert!(!sighup_ignored(&status("0000000000001000")), "only SIGPIPE");
+        assert!(!sighup_ignored("Name:\tlsw\n"), "no mask");
+    }
+
+    #[test]
+    fn guest_strings_cannot_drive_the_terminal() {
+        assert_eq!(
+            printable("10.0.26300\x1b]0;pwned\x07"),
+            "10.0.26300?]0;pwned?"
+        );
+        assert_eq!(
+            printable("C:\\Users\\u\\Linux\\Documents"),
+            "C:\\Users\\u\\Linux\\Documents"
+        );
+    }
+
+    #[test]
+    fn a_qemu_crash_fails_lsw_run_and_a_shutdown_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let paths =
+            VmPaths::with_bases(&d.join("data"), &d.join("run"), &d.join("sock"), "windows");
+        assert!(qemu_exit(std::process::ExitStatus::from_raw(0), &paths).is_ok());
+        // exit(1)
+        let e = qemu_exit(std::process::ExitStatus::from_raw(1 << 8), &paths).unwrap_err();
+        assert!(e.to_string().contains("unexpectedly"), "{e}");
+        // killed by SIGSEGV
+        assert!(qemu_exit(std::process::ExitStatus::from_raw(11), &paths).is_err());
+    }
+}

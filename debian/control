@@ -1,0 +1,26 @@
+Source: lsw
+Section: admin
+Priority: optional
+Maintainer: LSW contributors <noreply@github.com>
+Build-Depends: debhelper-compat (= 13),
+               pkgconf,
+               libgtk-4-dev (>= 4.14),
+               libadwaita-1-dev (>= 1.5),
+               libxkbcommon-dev,
+               gcc-mingw-w64-x86-64
+Standards-Version: 4.7.0
+Homepage: https://github.com/The1UNeed/Linux-Subsystem-for-Windows
+Rules-Requires-Root: no
+
+Package: lsw
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends},
+         qemu-system-x86 (>= 1:8.2), qemu-system-modules-opengl, ovmf, swtpm,
+         swtpm-tools, passt, virtiofsd, uidmap, pkexec, polkitd
+Recommends: pipewire
+Description: Linux Subsystem for Windows: Windows 11 apps on the Linux desktop
+ LSW runs Windows 11 in a KVM virtual machine and shows its apps as native
+ Linux windows (Coherence), in a window, or full screen. It installs
+ Windows unattended, shares your Desktop/Documents/Downloads/Pictures/
+ Music/Videos folders, syncs the clipboard, plays sound through PipeWire,
+ passes USB devices through, and adds every Windows app to the app grid.
