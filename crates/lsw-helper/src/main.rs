@@ -2,7 +2,7 @@
 //! (`pkexec /usr/lib/lsw/lsw-helper …`, action `dev.lsw.helper.gpu`).
 //!
 //! It does three things and nothing else, each on validated PCI addresses
-//! of non-boot display controllers:
+//! of display controllers (`bind-vfio` refuses the boot GPU):
 //!
 //! * `bind-vfio ADDR` – hand a GPU and every function of its slot (HDMI/DP
 //!   audio, USB-C…; its IOMMU group must hold nothing else but bridges) to

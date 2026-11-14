@@ -239,6 +239,11 @@ fn main() -> std::process::ExitCode {
 
 async fn lsw_main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
+        // Log lines go to stderr, and a failed write is dropped (the
+        // default reports it with eprintln!, which panics on a closed
+        // terminal).
+        .with_writer(std::io::stderr)
+        .log_internal_errors(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("LSW_LOG")
                 .unwrap_or_else(|_| "info".into()),
@@ -755,6 +760,14 @@ struct StopSignals {
 impl StopSignals {
     fn new() -> anyhow::Result<Self> {
         use tokio::signal::unix::{SignalKind, signal};
+        // Whatever the command is doing when the terminal goes away (also
+        // while nobody waits for a stop signal), stop writing to it.
+        let mut hangup = signal(SignalKind::hangup())?;
+        tokio::spawn(async move {
+            while hangup.recv().await.is_some() {
+                detach_from_terminal();
+            }
+        });
         Ok(Self {
             int: signal(SignalKind::interrupt())?,
             term: signal(SignalKind::terminate())?,
@@ -787,10 +800,29 @@ impl StopSignals {
 /// The terminal is gone: writing to it would fail (and `println!` would
 /// panic, killing QEMU on unwind). Send stdout and stderr to /dev/null.
 fn detach_from_terminal() {
+    use std::os::fd::AsFd;
+    // Only a terminal (a character device): under systemd stdout is the
+    // journal, which keeps working.
+    let is_tty = |fd: std::os::fd::BorrowedFd<'_>| {
+        rustix::fs::fstat(fd).is_ok_and(|st| {
+            rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::CharacterDevice
+        })
+    };
+    if !is_tty(std::io::stdout().as_fd()) && !is_tty(std::io::stderr().as_fd()) {
+        return;
+    }
     if let Ok(null) = std::fs::OpenOptions::new().write(true).open("/dev/null") {
         let _ = rustix::stdio::dup2_stdout(&null);
         let _ = rustix::stdio::dup2_stderr(&null);
     }
+}
+
+/// A guest-provided string made safe for a terminal (no control
+/// characters, so no escape sequences).
+fn printable(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
 }
 
 /// `println!` that never panics: the supervisor's output may go to a
@@ -840,7 +872,7 @@ async fn install(
         running.kill().await?;
         return Err(interrupted(signal));
     }
-    eprintln!("VM started; getting past the \"Press any key to boot from CD\" prompt…");
+    esay!("VM started; getting past the \"Press any key to boot from CD\" prompt…");
     let press =
         running.press_key_repeatedly("ret", Duration::from_millis(500), Duration::from_secs(20));
     let signal = tokio::select! {
@@ -851,7 +883,7 @@ async fn install(
         running.kill().await?;
         return Err(interrupted(signal));
     }
-    eprintln!("Windows Setup is running unattended. Progress (from the guest's serial console):");
+    esay!("Windows Setup is running unattended. Progress (from the guest's serial console):");
     // Either outcome marker ends the wait: DONE or FAILED <steps>.
     let marker = unattend::INSTALL_OUTCOME_PREFIX;
     let serial = paths.serial_log();
@@ -861,7 +893,7 @@ async fn install(
         Duration::from_secs(timeout_min * 60),
         |line| {
             if !line.trim().is_empty() {
-                eprintln!(
+                esay!(
                     "  [{:>5.1} min] {line}",
                     started.elapsed().as_secs_f64() / 60.0
                 );
@@ -885,7 +917,7 @@ async fn install(
             .unwrap_or("")
             .trim()
             .to_owned();
-        eprintln!("{}", running.shutdown(Duration::from_secs(180)).await?);
+        esay!("{}", running.shutdown(Duration::from_secs(180)).await?);
         bail!(
             "Windows installed, but these LSW steps failed: {steps}. The VM is not marked \
              installed. The reasons are logged inside Windows in \
@@ -894,25 +926,43 @@ async fn install(
             paths.data.display()
         );
     }
-    eprintln!(
+    esay!(
         "Installation finished in {:.1} minutes.",
         started.elapsed().as_secs_f64() / 60.0
     );
-    // Give the desktop a moment to settle for the screenshot.
-    tokio::time::sleep(Duration::from_secs(15)).await;
-    // Best effort: a failed screenshot must not discard a finished install.
-    let shot = screenshot.unwrap_or_else(|| paths.data.join("installed.png"));
-    match running.qmp.screendump_png(&shot).await {
-        Ok(()) => eprintln!("Screenshot: {}", shot.display()),
-        Err(e) => eprintln!("note: no screenshot ({e})"),
-    }
-    eprintln!("{}", running.shutdown(Duration::from_secs(180)).await?);
-
+    // Windows is installed: record it now, before the screenshot and the
+    // shutdown, so nothing that happens after can lose it.
     cfg.install = None;
     cfg.save(&paths.data)?;
     // The setup image contains the account password.
     let _ = std::fs::remove_file(&install.setup_iso);
-    println!("Windows is installed. Start it with: lsw run");
+    // Give the desktop a moment to settle for the screenshot (unless asked
+    // to stop), then shut down. Best effort: a failed screenshot changes
+    // nothing.
+    let settle = tokio::select! {
+        () = tokio::time::sleep(Duration::from_secs(15)) => None,
+        signal = stop.recv() => Some(signal),
+    };
+    match settle {
+        Some(signal) => esay!("{signal}: skipping the screenshot."),
+        None => {
+            let shot = screenshot.unwrap_or_else(|| paths.data.join("installed.png"));
+            match running.qmp.screendump_png(&shot).await {
+                Ok(()) => esay!("Screenshot: {}", shot.display()),
+                Err(e) => esay!("note: no screenshot ({e})"),
+            }
+        }
+    }
+    let shutdown = running.shutdown(Duration::from_secs(180));
+    tokio::pin!(shutdown);
+    let off = loop {
+        tokio::select! {
+            off = &mut shutdown => break off?,
+            signal = stop.recv() => esay!("{signal}: Windows is already shutting down; please wait."),
+        }
+    };
+    esay!("{off}");
+    say!("Windows is installed. Start it with: lsw run");
     Ok(())
 }
 
@@ -1248,33 +1298,51 @@ async fn supervise_agent(
         };
         let mut session =
             ControlSession::new(shares.clone()).with_time_zone(lsw_daemon::host::time_zone);
-        let r = serve_control(&mut channel, &mut session, &mut port_open, &mut commands, |event| match event {
-            AgentEvent::Connected {
-                agent_version,
-                os_build,
-                protocol,
-            } => {
-                say!("Agent connected: lsw-agent {agent_version}, Windows {os_build}, protocol {protocol}");
-                connected.store(true, Ordering::Release);
-                if !synced {
-                    // Launchers appear once Windows is installed and running.
-                    synced = true;
-                    let sync = app_sync.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = sync.run().await {
-                            tracing::warn!("app launchers: {e:#}");
-                        }
-                    });
+        let r = serve_control(
+            &mut channel,
+            &mut session,
+            &mut port_open,
+            &mut commands,
+            |event| match event {
+                AgentEvent::Connected {
+                    agent_version,
+                    os_build,
+                    protocol,
+                } => {
+                    say!(
+                        "Agent connected: lsw-agent {}, Windows {}, protocol {protocol}",
+                        printable(&agent_version),
+                        printable(&os_build)
+                    );
+                    connected.store(true, Ordering::Release);
+                    if !synced {
+                        // Launchers appear once Windows is installed and running.
+                        synced = true;
+                        let sync = app_sync.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = sync.run().await {
+                                tracing::warn!("app launchers: {e:#}");
+                            }
+                        });
+                    }
                 }
-            }
-            AgentEvent::Share { tag, ok, detail } => {
-                if ok {
-                    say!("Shared folder {tag} mounted at {detail}");
-                } else {
-                    say!("Shared folder {tag} failed: {detail}");
+                AgentEvent::Share { tag, ok, detail } => {
+                    if ok {
+                        say!(
+                            "Shared folder {} mounted at {}",
+                            printable(&tag),
+                            printable(&detail)
+                        );
+                    } else {
+                        say!(
+                            "Shared folder {} failed: {}",
+                            printable(&tag),
+                            printable(&detail)
+                        );
+                    }
                 }
-            }
-        })
+            },
+        )
         .await;
         tracing::info!("agent channel ended: {r:?}");
         connected.store(false, Ordering::Release);
@@ -1584,6 +1652,18 @@ async fn ctl(paths: &VmPaths, action: CtlAction) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn guest_strings_cannot_drive_the_terminal() {
+        assert_eq!(
+            printable("10.0.26300\x1b]0;pwned\x07"),
+            "10.0.26300?]0;pwned?"
+        );
+        assert_eq!(
+            printable("C:\\Users\\u\\Linux\\Documents"),
+            "C:\\Users\\u\\Linux\\Documents"
+        );
+    }
 
     #[test]
     fn a_qemu_crash_fails_lsw_run_and_a_shutdown_does_not() {
