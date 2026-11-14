@@ -755,6 +755,14 @@ fn stop_now(guest_started: Option<std::time::Instant>) -> bool {
     guest_started.is_none_or(|t| t.elapsed() < FIRMWARE_STAGE)
 }
 
+/// Run `resume` (the first `cont`) and return when the guest may have
+/// started: the time *before* it is sent, so no delay in the supervisor
+/// while the reply is awaited can stretch the firmware stage.
+async fn resumed_at<T>(resume: impl std::future::Future<Output = T>) -> (std::time::Instant, T) {
+    let started = std::time::Instant::now();
+    (started, resume.await)
+}
+
 /// The signals that end a VM-owning command: Ctrl+C, SIGTERM and SIGHUP.
 /// QEMU runs in its own process group, so without handling them it would
 /// outlive `lsw`. Created before the VM starts, so a signal during start
@@ -1054,8 +1062,9 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
         running.kill().await?;
         return Ok(());
     }
-    running.resume().await?;
-    let guest_started = Some(std::time::Instant::now());
+    let (started, resumed) = resumed_at(running.resume()).await;
+    resumed?;
+    let guest_started = Some(started);
     let shares: Vec<ShareSpec> = running
         .shares
         .iter()
@@ -1723,6 +1732,24 @@ mod tests {
             !stop_now(Some(long_ago)),
             "Windows may be running: shut down"
         );
+    }
+
+    #[tokio::test]
+    async fn the_guest_start_time_is_taken_before_cont_is_sent() {
+        use std::time::Instant;
+        // A `cont` whose reply comes late (or a supervisor delayed while it
+        // waits): QEMU already runs the guest from the moment it is sent.
+        let (started, sent_at) = resumed_at(async {
+            let sent_at = Instant::now();
+            std::thread::sleep(Duration::from_millis(50));
+            sent_at
+        })
+        .await;
+        assert!(started <= sent_at, "timestamp taken before cont is sent");
+        // With the delay counted, a stop after it is a shutdown once the
+        // firmware stage has passed.
+        let delayed = started - FIRMWARE_STAGE;
+        assert!(!stop_now(Some(delayed)));
     }
 
     #[test]
