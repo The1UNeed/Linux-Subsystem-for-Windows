@@ -754,24 +754,34 @@ const FIRMWARE_STAGE: Duration = Duration::from_secs(4);
 struct StopSignals {
     int: tokio::signal::unix::Signal,
     term: tokio::signal::unix::Signal,
-    hup: tokio::signal::unix::Signal,
+    /// None when started with SIGHUP ignored (`nohup`): then a hangup must
+    /// not stop anything.
+    hup: Option<tokio::signal::unix::Signal>,
 }
 
 impl StopSignals {
     fn new() -> anyhow::Result<Self> {
         use tokio::signal::unix::{SignalKind, signal};
-        // Whatever the command is doing when the terminal goes away (also
-        // while nobody waits for a stop signal), stop writing to it.
-        let mut hangup = signal(SignalKind::hangup())?;
-        tokio::spawn(async move {
-            while hangup.recv().await.is_some() {
-                detach_from_terminal();
-            }
-        });
+        // Registering a handler would undo `nohup`'s "ignore SIGHUP".
+        let nohup = std::fs::read_to_string("/proc/self/status").is_ok_and(|s| sighup_ignored(&s));
+        let hup = if nohup {
+            None
+        } else {
+            // Whatever the command is doing when the terminal goes away
+            // (also while nobody waits for a stop signal), stop writing to
+            // it.
+            let mut hangup = signal(SignalKind::hangup())?;
+            tokio::spawn(async move {
+                while hangup.recv().await.is_some() {
+                    detach_from_terminal();
+                }
+            });
+            Some(signal(SignalKind::hangup())?)
+        };
         Ok(Self {
             int: signal(SignalKind::interrupt())?,
             term: signal(SignalKind::terminate())?,
-            hup: signal(SignalKind::hangup())?,
+            hup,
         })
     }
 
@@ -779,7 +789,12 @@ impl StopSignals {
         let signal = tokio::select! {
             _ = self.int.recv() => "Interrupted",
             _ = self.term.recv() => "Terminated",
-            _ = self.hup.recv() => "Hung up",
+            Some(_) = async {
+                match self.hup.as_mut() {
+                    Some(h) => h.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => "Hung up",
         };
         if signal == "Hung up" {
             detach_from_terminal();
@@ -797,8 +812,18 @@ impl StopSignals {
     }
 }
 
+/// Whether the `SigIgn:` mask of `/proc/self/status` ignores SIGHUP
+/// (signal 1, bit 0), as under `nohup`.
+fn sighup_ignored(status: &str) -> bool {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("SigIgn:"))
+        .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+        .is_some_and(|mask| mask & 1 != 0)
+}
+
 /// The terminal is gone: writing to it would fail (and `println!` would
-/// panic, killing QEMU on unwind). Send stdout and stderr to /dev/null.
+/// panic, killing QEMU on unwind). Send what went to it to /dev/null.
 fn detach_from_terminal() {
     use std::os::fd::AsFd;
     // Only a terminal (a character device): under systemd stdout is the
@@ -808,12 +833,21 @@ fn detach_from_terminal() {
             rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::CharacterDevice
         })
     };
-    if !is_tty(std::io::stdout().as_fd()) && !is_tty(std::io::stderr().as_fd()) {
+    // Each separately: `lsw run > run.log` keeps its log.
+    let (out, err) = (
+        is_tty(std::io::stdout().as_fd()),
+        is_tty(std::io::stderr().as_fd()),
+    );
+    if !out && !err {
         return;
     }
     if let Ok(null) = std::fs::OpenOptions::new().write(true).open("/dev/null") {
-        let _ = rustix::stdio::dup2_stdout(&null);
-        let _ = rustix::stdio::dup2_stderr(&null);
+        if out {
+            let _ = rustix::stdio::dup2_stdout(&null);
+        }
+        if err {
+            let _ = rustix::stdio::dup2_stderr(&null);
+        }
     }
 }
 
@@ -917,7 +951,15 @@ async fn install(
             .unwrap_or("")
             .trim()
             .to_owned();
-        esay!("{}", running.shutdown(Duration::from_secs(180)).await?);
+        let shutdown = running.shutdown(Duration::from_secs(180));
+        tokio::pin!(shutdown);
+        let off = loop {
+            tokio::select! {
+                off = &mut shutdown => break off?,
+                signal = stop.recv() => esay!("{signal}: Windows is already shutting down; please wait."),
+            }
+        };
+        esay!("{off}");
         bail!(
             "Windows installed, but these LSW steps failed: {steps}. The VM is not marked \
              installed. The reasons are logged inside Windows in \
@@ -1429,7 +1471,11 @@ async fn api_call(
         .await
         .context("Windows is not running (start it with `lsw run` or the LSW app)")?;
     if !r.ok {
-        bail!("{}", r.error.unwrap_or_else(|| "request failed".into()));
+        // The text can come from Windows (the agent's error).
+        bail!(
+            "{}",
+            printable(&r.error.unwrap_or_else(|| "request failed".into()))
+        );
     }
     Ok(r)
 }
@@ -1652,6 +1698,17 @@ async fn ctl(paths: &VmPaths, action: CtlAction) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn nohup_is_detected_from_the_ignored_signal_mask() {
+        let status = |mask: &str| {
+            format!("Name:\tlsw\nSigBlk:\t0000000000000000\nSigIgn:\t{mask}\nSigCgt:\t0\n")
+        };
+        assert!(sighup_ignored(&status("0000000000000001")), "nohup");
+        assert!(sighup_ignored(&status("0000000000001001")));
+        assert!(!sighup_ignored(&status("0000000000001000")), "only SIGPIPE");
+        assert!(!sighup_ignored("Name:\tlsw\n"), "no mask");
+    }
 
     #[test]
     fn guest_strings_cannot_drive_the_terminal() {
