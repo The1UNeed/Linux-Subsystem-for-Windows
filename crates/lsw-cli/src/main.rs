@@ -743,9 +743,17 @@ fn launch_options(host: &HostReport, l: &LaunchArgs) -> LaunchOptions {
     }
 }
 
-/// How long after QEMU starts the VM is still in its UEFI firmware (no
-/// Windows code runs yet; Windows' boot manager starts after about 4 s).
+/// How long after its vCPUs first run the VM is still in its UEFI firmware
+/// (no Windows code yet; Windows' boot manager starts after about 4 s).
 const FIRMWARE_STAGE: Duration = Duration::from_secs(4);
+
+/// What a stop signal does, given when the guest's vCPUs first ran (None:
+/// never, QEMU starts them stopped): stop the VM at once while no Windows
+/// code can have run (a power-button press in the firmware is lost), else
+/// shut Windows down.
+fn stop_now(guest_started: Option<std::time::Instant>) -> bool {
+    guest_started.is_none_or(|t| t.elapsed() < FIRMWARE_STAGE)
+}
 
 /// The signals that end a VM-owning command: Ctrl+C, SIGTERM and SIGHUP.
 /// QEMU runs in its own process group, so without handling them it would
@@ -902,10 +910,12 @@ async fn install(
     let mut running = Vm::new(cfg.clone(), paths.clone())
         .start(&host.binaries, &opts)
         .await?;
+    // QEMU starts with its vCPUs stopped: nothing has run yet.
     if let Some(signal) = stop.pending().await {
         running.kill().await?;
         return Err(interrupted(signal));
     }
+    running.resume().await?;
     esay!("VM started; getting past the \"Press any key to boot from CD\" prompt…");
     let press =
         running.press_key_repeatedly("ret", Duration::from_millis(500), Duration::from_secs(20));
@@ -1037,13 +1047,15 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
     let mut running = Vm::new(cfg, paths.clone())
         .start(&host.binaries, &opts)
         .await?;
-    let qemu_started = std::time::Instant::now();
+    // QEMU starts with its vCPUs stopped: until they run, stopping is
+    // harmless.
     if let Some(signal) = stop.pending().await {
-        // Windows has not booted yet: nothing to shut down cleanly.
         say!("{signal}: stopping the VM before Windows starts.");
         running.kill().await?;
         return Ok(());
     }
+    running.resume().await?;
+    let guest_started = Some(std::time::Instant::now());
     let shares: Vec<ShareSpec> = running
         .shares
         .iter()
@@ -1115,7 +1127,7 @@ async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
                 // In the first seconds the VM is still in its firmware: no
                 // Windows to shut down, and a power-button press there is
                 // lost.
-                if qemu_started.elapsed() < FIRMWARE_STAGE {
+                if stop_now(guest_started) {
                     say!("{signal}: stopping the VM before Windows starts.");
                     running.kill().await?;
                     break Ok(());
@@ -1698,6 +1710,20 @@ async fn ctl(paths: &VmPaths, action: CtlAction) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn a_stop_signal_stops_at_once_only_before_windows_can_run() {
+        use std::time::Instant;
+        assert!(stop_now(None), "vCPUs never ran (QEMU starts with -S)");
+        assert!(stop_now(Some(Instant::now())), "just resumed: firmware");
+        // A delayed supervisor (e.g. stopped for a while) does not matter:
+        // the time counts from when the guest really started running.
+        let long_ago = Instant::now() - Duration::from_secs(6);
+        assert!(
+            !stop_now(Some(long_ago)),
+            "Windows may be running: shut down"
+        );
+    }
 
     #[test]
     fn nohup_is_detected_from_the_ignored_signal_mask() {

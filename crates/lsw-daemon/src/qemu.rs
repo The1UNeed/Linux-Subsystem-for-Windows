@@ -143,6 +143,9 @@ pub fn build_args(cfg: &VmConfig, paths: &VmPaths, opts: &LaunchOptions) -> Vec<
         &format!("guest=lsw-{},debug-threads=on", esc(&cfg.name)),
     ]);
     push(&["-nodefaults", "-no-user-config", "-msg", "timestamp=on"]);
+    // Start with the vCPUs stopped: the supervisor resumes them once it is
+    // ready, so before that no guest code has run and stopping is harmless.
+    push(&["-S"]);
     push(&[
         "-machine",
         "q35,accel=kvm,smm=on,vmport=off,hpet=off,memory-backend=mem0",
@@ -589,6 +592,7 @@ mod tests {
         assert!(s.contains("-display none"));
         assert!(s.contains("-sandbox on,"));
         assert!(!s.contains("ide-cd"), "no install media after setup");
+        assert!(s.contains(" -S "), "vCPUs start stopped");
         assert!(
             s.contains("-chardev ringbuf,id=ser0,size=65536"),
             "serial bounded after setup"

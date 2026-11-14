@@ -316,6 +316,8 @@ impl Running {
         self.qmp.execute("stop", None).await.map(|_| ())
     }
 
+    /// Run the vCPUs: after an idle pause, and once after start (QEMU
+    /// starts with them stopped).
     pub async fn resume(&mut self) -> Result<(), QmpError> {
         self.qmp.execute("cont", None).await.map(|_| ())
     }
