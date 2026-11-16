@@ -3,8 +3,10 @@ set -e
 
 #DEBHELPER#
 
-# Give suckless-tools its /usr/bin/lsw back (see lsw.preinst).
+# Give suckless-tools its /usr/bin/lsw back (see lsw.preinst), unless the
+# diversion is not ours (preinst then failed on someone else's).
 remove_diversion() {
+    [ "$(dpkg-divert --listpackage /usr/bin/lsw)" = lsw ] || return 0
     dpkg-divert --package lsw --remove --rename \
         --divert /usr/bin/lsw.suckless-tools /usr/bin/lsw
 }

@@ -58,6 +58,8 @@ jobs:
         run: |
           mkdir -p dist && cp ../lsw_*.deb dist/
           sudo packaging/tests/deb-install.sh dist/lsw_*.deb
+          # The README names the release file (GitHub turns ~ into .).
+          grep -qF "lsw_$(dpkg-parsechangelog -S Version | tr '~' '.')_amd64.deb" README.md
           sudo apt-get install -y ./dist/lsw_*.deb && lsw --version
       - uses: actions/upload-artifact@v4
         with:

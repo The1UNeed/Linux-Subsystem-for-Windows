@@ -19,7 +19,12 @@ show_logs() {
     return 0
 }
 # A failing setup command stops the script (set -e): show what it printed.
-trap 'status=$?; [ "$status" -eq 0 ] || show_logs; rm -rf "$work"' EXIT
+on_exit() {
+    local status=$?
+    [ "$status" -eq 0 ] || show_logs
+    rm -rf "$work"
+}
+trap on_exit EXIT
 check() {
     local what=$1; shift
     if "$@"; then
@@ -94,6 +99,14 @@ for state in "removed, config left" "never installed"; do
     check "dpkg --verify suckless-tools" verified suckless-tools
     apt_get purge lsw
 done
+
+echo "== someone else's diversion of /usr/bin/lsw"
+dpkg-divert --local --divert /usr/bin/lsw.local --add /usr/bin/lsw >/dev/null
+check "LSW does not install" bash -c "! dpkg -i '$NEW' >'$work/dpkg.log' 2>&1"
+check "and is not left half-installed" bash -c "[ \"\$(dpkg-query -W -f '\${db:Status-Abbrev}' lsw | cut -c2-3)\" = 'n ' ]"
+check "the local diversion is untouched" bash -c "[ \"\$(dpkg-divert --listpackage /usr/bin/lsw)\" = LOCAL ]"
+dpkg-divert --local --remove /usr/bin/lsw >/dev/null
+apt_get purge lsw
 
 echo "== LSW first, then suckless-tools; then suckless-tools removed"
 apt_get purge suckless-tools lsw
