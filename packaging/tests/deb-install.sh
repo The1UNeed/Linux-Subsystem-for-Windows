@@ -20,12 +20,15 @@ apt_get() { apt-get -y -q -o Dpkg::Use-Pty=0 "$@" >"$work/apt.log" 2>&1; }
 is_lsw() { /usr/bin/lsw --version 2>/dev/null | grep -q '^lsw 0'; }
 is_suckless() { [ "$(sha256sum <"$1")" = "$SUCKLESS_SUM" ]; }
 no_diversion() { [ -z "$(dpkg-divert --list /usr/bin/lsw)" ]; }
-# dpkg --verify, ignoring documentation (container images leave it out).
+# Installed, and dpkg --verify finds nothing outside the documentation
+# (container images leave it out).
 verified() {
     local problems
-    problems=$(dpkg --verify "$1" | grep -vE ' /usr/share/(doc|man)/' || true)
+    [ "$(dpkg-query -W -f '${db:Status-Abbrev}' "$1" 2>/dev/null)" = "ii " ] || return 1
+    problems=$(dpkg --verify "$1" 2>&1 | grep -vE ' /usr/share/(doc|man)/' || true)
     [ -z "$problems" ]
 }
+not_installed() { [ "$(dpkg-query -W -f '${db:Status-Abbrev}' lsw 2>/dev/null | cut -c2)" != i ]; }
 
 # The released 0.0.1~alpha: same files, no diversion.
 dpkg-deb -R "$NEW" "$work/old"
@@ -64,6 +67,17 @@ check "no diversion left" no_diversion
 check "/usr/bin/lsw is suckless-tools'" is_suckless /usr/bin/lsw
 check "no /usr/bin/lsw.suckless-tools left" test ! -e /usr/bin/lsw.suckless-tools
 check "dpkg --verify suckless-tools" verified suckless-tools
+
+echo "== a failed install leaves suckless-tools' lsw in place"
+for state in "removed, config left" "never installed"; do
+    check "install fails ($state)" bash -c "! dpkg -i '$work/bad.deb' >'$work/dpkg.log' 2>&1"
+    check "LSW is not installed" not_installed
+    check "no diversion left" no_diversion
+    check "/usr/bin/lsw is suckless-tools'" is_suckless /usr/bin/lsw
+    check "no /usr/bin/lsw.suckless-tools left" test ! -e /usr/bin/lsw.suckless-tools
+    check "dpkg --verify suckless-tools" verified suckless-tools
+    apt_get purge lsw
+done
 
 echo "== LSW first, then suckless-tools; then suckless-tools removed"
 apt_get purge suckless-tools lsw
