@@ -1,0 +1,25 @@
+#!/bin/sh
+set -e
+
+suckless_tools_installed() {
+    case "$(dpkg-query -W -f '${db:Status-Status}' suckless-tools 2>/dev/null)" in
+        ''|not-installed|config-files) return 1 ;;
+    esac
+}
+
+# 0.0.1~alpha, the only version without the diversion (see lsw.preinst),
+# cannot be installed beside suckless-tools' /usr/bin/lsw: refuse to
+# downgrade to it while suckless-tools is installed or its lsw is diverted.
+case "$1" in
+    upgrade)
+        if dpkg --compare-versions "$2" le "0.0.1~alpha" &&
+            { suckless_tools_installed || [ -e /usr/bin/lsw.suckless-tools ]; }; then
+            echo "lsw $2 cannot be installed beside suckless-tools, which also has /usr/bin/lsw. Keep this version, or remove suckless-tools first." >&2
+            exit 1
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

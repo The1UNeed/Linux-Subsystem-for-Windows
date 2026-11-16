@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.0.1-alpha.1 (Ubuntu package only)
+
+* The `.deb` installs beside Ubuntu's `suckless-tools` (dmenu), which also
+  has a `/usr/bin/lsw`; that tool becomes `lsw.suckless-tools` while LSW is
+  installed. The programs are unchanged.
+* The README's install steps use the release `.deb`; there is no PPA yet.
+
 ## 0.0.1-alpha
 
 First alpha. See the README for what works and the known limits.

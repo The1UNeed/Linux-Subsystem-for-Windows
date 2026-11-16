@@ -1,0 +1,27 @@
+#!/bin/sh
+set -e
+
+suckless_tools_installed() {
+    case "$(dpkg-query -W -f '${db:Status-Status}' suckless-tools 2>/dev/null)" in
+        ''|not-installed|config-files) return 1 ;;
+    esac
+}
+
+# suckless-tools (the package with dmenu) also ships /usr/bin/lsw, an X11
+# window lister. Move its copy to /usr/bin/lsw.suckless-tools so both
+# packages can be installed; dpkg keeps that path for its future upgrades.
+case "$1" in
+    install|upgrade)
+        dpkg-divert --package lsw --add --rename \
+            --divert /usr/bin/lsw.suckless-tools /usr/bin/lsw
+        # 0.0.1~alpha installed with --force-overwrite replaced that copy.
+        if [ "$1" = upgrade ] && dpkg --compare-versions "$2" le "0.0.1~alpha" &&
+            suckless_tools_installed && [ ! -e /usr/bin/lsw.suckless-tools ]; then
+            echo "lsw $2 had overwritten suckless-tools' lsw. To get it back as lsw.suckless-tools: sudo apt install --reinstall suckless-tools" >&2
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0
