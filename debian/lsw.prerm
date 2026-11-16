@@ -1,0 +1,19 @@
+#!/bin/sh
+set -e
+
+# 0.0.1~alpha, the only version without the diversion (see lsw.preinst),
+# cannot be installed beside suckless-tools' /usr/bin/lsw: refuse to
+# downgrade to it while that file is diverted.
+case "$1" in
+    upgrade)
+        if dpkg --compare-versions "$2" le "0.0.1~alpha" &&
+            [ -e /usr/bin/lsw.suckless-tools ]; then
+            echo "lsw $2 cannot be installed beside suckless-tools, which also has /usr/bin/lsw." >&2
+            exit 1
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

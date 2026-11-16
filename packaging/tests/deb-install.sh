@@ -29,7 +29,7 @@ verified() {
 
 # The released 0.0.1~alpha: same files, no diversion.
 dpkg-deb -R "$NEW" "$work/old"
-rm "$work/old/DEBIAN/preinst" "$work/old/DEBIAN/postrm"
+rm "$work/old/DEBIAN/preinst" "$work/old/DEBIAN/prerm" "$work/old/DEBIAN/postrm"
 sed -i 's/^Version: .*/Version: 0.0.1~alpha/' "$work/old/DEBIAN/control"
 dpkg-deb -b "$work/old" "$work/old.deb" >/dev/null
 # This version, failing to unpack: it also contains dpkg's /usr/bin/dpkg-split.
@@ -93,6 +93,23 @@ check "suckless-tools' lsw is /usr/bin/lsw.suckless-tools" is_suckless /usr/bin/
 check "LSW is removed" apt_get remove lsw
 check "/usr/bin/lsw is suckless-tools'" is_suckless /usr/bin/lsw
 check "no diversion left" no_diversion
+
+echo "== downgrade to 0.0.1~alpha"
+check "LSW installs" apt_get install "$NEW"
+check "beside suckless-tools, the downgrade is refused" bash -c "! dpkg -i '$work/old.deb' >'$work/dpkg.log' 2>&1"
+check "with a message" grep -q "cannot be installed beside suckless-tools" "$work/dpkg.log"
+check "LSW is still this version" bash -c "[ \"\$(dpkg-query -W -f '\${Version} \${db:Status-Abbrev}' lsw)\" = '$(dpkg-deb -f "$NEW" Version) ii ' ]"
+check "/usr/bin/lsw is LSW" is_lsw
+check "suckless-tools' lsw is still /usr/bin/lsw.suckless-tools" is_suckless /usr/bin/lsw.suckless-tools
+check "dpkg --verify lsw" verified lsw
+apt_get purge suckless-tools
+check "without suckless-tools, the downgrade works" bash -c "dpkg -i '$work/old.deb' >'$work/dpkg.log' 2>&1"
+check "the downgrade leaves no diversion" no_diversion
+check "/usr/bin/lsw is LSW" is_lsw
+check "dpkg --verify lsw" verified lsw
+check "LSW is purged" apt_get purge lsw
+check "no /usr/bin/lsw left" test ! -e /usr/bin/lsw
+apt_get install suckless-tools
 
 echo "== 0.0.1~alpha beside suckless-tools fails (the original bug)"
 check "0.0.1~alpha does not install" bash -c "! apt-get -y install '$work/old.deb' >'$work/apt.log' 2>&1"

@@ -13,9 +13,10 @@ case "$1" in
     remove|abort-install|disappear)
         remove_diversion
         ;;
-    abort-upgrade)
-        # Back to 0.0.1~alpha, the only version without this diversion: undo
-        # the one preinst just added, as that version never removes it.
+    upgrade|abort-upgrade)
+        # Going (back) to 0.0.1~alpha, the only version without this
+        # diversion, which would never remove it: a failed upgrade from it,
+        # or a downgrade to it (only without suckless-tools: see lsw.prerm).
         if dpkg --compare-versions "$2" le "0.0.1~alpha"; then
             remove_diversion
         fi
