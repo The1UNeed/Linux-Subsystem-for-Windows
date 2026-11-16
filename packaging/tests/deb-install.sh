@@ -101,11 +101,11 @@ for state in "removed, config left" "never installed"; do
 done
 
 echo "== someone else's diversion of /usr/bin/lsw"
-dpkg-divert --local --divert /usr/bin/lsw.local --add /usr/bin/lsw >/dev/null
+dpkg-divert --local --no-rename --divert /usr/bin/lsw.local --add /usr/bin/lsw >/dev/null
 check "LSW does not install" bash -c "! dpkg -i '$NEW' >'$work/dpkg.log' 2>&1"
 check "and is not left half-installed" bash -c "[ \"\$(dpkg-query -W -f '\${db:Status-Abbrev}' lsw | cut -c2-3)\" = 'n ' ]"
 check "the local diversion is untouched" bash -c "[ \"\$(dpkg-divert --listpackage /usr/bin/lsw)\" = LOCAL ]"
-dpkg-divert --local --remove /usr/bin/lsw >/dev/null
+dpkg-divert --local --no-rename --remove /usr/bin/lsw >/dev/null
 apt_get purge lsw
 
 echo "== LSW first, then suckless-tools; then suckless-tools removed"
