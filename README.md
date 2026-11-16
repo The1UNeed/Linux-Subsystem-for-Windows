@@ -66,12 +66,13 @@ app starts from the Linux app grid ([Paint](docs/images/coherence-launch-paint.p
 
 ## Install
 
-Ubuntu 24.04 or later: download `lsw_…_amd64.deb` from the
-[latest release](https://github.com/The1UNeed/Linux-Subsystem-for-Windows/releases/latest),
-then, in the folder you saved it to:
+Ubuntu 24.04 or later: download the `.deb` file (`lsw_<version>_amd64.deb`)
+from the newest [release](https://github.com/The1UNeed/Linux-Subsystem-for-Windows/releases),
+then install it with apt, using the file's name with `./` in front:
 
 ```sh
-sudo apt install ./lsw_*_amd64.deb
+cd ~/Downloads
+sudo apt install ./lsw_<version>_amd64.deb
 ```
 
 apt also installs QEMU, swtpm and the other packages LSW needs. There is no

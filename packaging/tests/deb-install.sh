@@ -21,7 +21,11 @@ is_lsw() { /usr/bin/lsw --version 2>/dev/null | grep -q '^lsw 0'; }
 is_suckless() { [ "$(sha256sum <"$1")" = "$SUCKLESS_SUM" ]; }
 no_diversion() { [ -z "$(dpkg-divert --list /usr/bin/lsw)" ]; }
 # dpkg --verify, ignoring documentation (container images leave it out).
-verified() { [ -z "$(dpkg --verify "$1" | grep -vE ' /usr/share/(doc|man)/')" ]; }
+verified() {
+    local problems
+    problems=$(dpkg --verify "$1" | grep -vE ' /usr/share/(doc|man)/' || true)
+    [ -z "$problems" ]
+}
 
 # The released 0.0.1~alpha: same files, no diversion.
 dpkg-deb -R "$NEW" "$work/old"
@@ -42,6 +46,11 @@ check "LSW installs" apt_get install "$NEW"
 check "/usr/bin/lsw is LSW" is_lsw
 check "suckless-tools' lsw is /usr/bin/lsw.suckless-tools" is_suckless /usr/bin/lsw.suckless-tools
 check "dpkg --verify lsw" verified lsw
+
+echo "== a reinstall keeps the diversion"
+check "LSW reinstalls" apt_get install --reinstall "$NEW"
+check "/usr/bin/lsw is LSW" is_lsw
+check "suckless-tools' lsw is still /usr/bin/lsw.suckless-tools" is_suckless /usr/bin/lsw.suckless-tools
 
 echo "== a failed reinstall keeps the diversion"
 check "the broken package fails to unpack" bash -c "! dpkg -i '$work/bad.deb' >'$work/dpkg.log' 2>&1"
