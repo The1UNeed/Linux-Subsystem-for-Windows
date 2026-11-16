@@ -74,7 +74,8 @@ then, in the folder you saved it to, install it with apt:
 sudo apt install ./lsw_0.0.1.alpha.1_amd64.deb
 ```
 
-apt also installs QEMU, swtpm and the other packages LSW needs. There is no
+apt also installs QEMU, swtpm and the other packages LSW needs (a note that
+the download "is performed unsandboxed as root" is harmless). There is no
 PPA yet. `sudo apt install lsw` without the `.deb` installs a different
 program: Ubuntu's `suckless-tools`, which includes dmenu and an X11 tool also
 called `lsw`. LSW installs beside it and renames that tool to

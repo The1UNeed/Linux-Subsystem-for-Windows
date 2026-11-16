@@ -171,6 +171,11 @@ check "no diversion left" no_diversion
 echo "== 0.0.1~alpha beside suckless-tools fails (the original bug)"
 check "0.0.1~alpha does not install" bash -c "! apt-get -y install '$work/old.deb' >'$work/apt.log' 2>&1"
 check "with the overwrite error" grep -q "trying to overwrite '/usr/bin/lsw'" "$work/apt.log"
+check "this version then installs" apt_get install "$NEW"
+check "/usr/bin/lsw is LSW" is_lsw
+check "suckless-tools' lsw is /usr/bin/lsw.suckless-tools" is_suckless /usr/bin/lsw.suckless-tools
+check "dpkg --verify lsw" verified lsw
+check "dpkg --audit finds nothing" bash -c "[ -z \"\$(dpkg --audit)\" ]"
 
 if [ "$failures" -ne 0 ]; then echo "$failures check(s) failed"; exit 1; fi
 echo "All checks passed"

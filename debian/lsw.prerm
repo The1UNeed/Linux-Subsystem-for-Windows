@@ -14,7 +14,7 @@ case "$1" in
     upgrade)
         if dpkg --compare-versions "$2" le "0.0.1~alpha" &&
             { suckless_tools_installed || [ -e /usr/bin/lsw.suckless-tools ]; }; then
-            echo "lsw $2 cannot be installed beside suckless-tools, which also has /usr/bin/lsw." >&2
+            echo "lsw $2 cannot be installed beside suckless-tools, which also has /usr/bin/lsw. Keep this version, or remove suckless-tools first." >&2
             exit 1
         fi
         ;;
