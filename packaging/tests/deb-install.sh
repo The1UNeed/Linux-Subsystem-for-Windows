@@ -47,7 +47,13 @@ verified() {
     problems=$(dpkg --verify "$1" 2>&1 | grep -vE ' /usr/share/(doc|man)/' || true)
     [ -z "$problems" ]
 }
-not_installed() { [ "$(dpkg-query -W -f '${db:Status-Abbrev}' lsw 2>/dev/null | cut -c2)" != i ]; }
+# Not installed, or only its configuration left; no half-installed states.
+not_installed() {
+    case "$(dpkg-query -W -f '${db:Status-Abbrev}' lsw 2>/dev/null | cut -c2-3)" in
+        'n '|'c '|'') return 0 ;;
+        *) return 1 ;;
+    esac
+}
 
 # The released 0.0.1~alpha: same files, no diversion.
 dpkg-deb -R "$NEW" "$work/old"
@@ -148,6 +154,8 @@ check "suckless-tools' lsw is still /usr/bin/lsw.suckless-tools" is_suckless /us
 check "dpkg --verify lsw" verified lsw
 rm /usr/bin/lsw.suckless-tools
 check "with suckless-tools' lsw deleted by hand, the downgrade is still refused" bash -c "! dpkg -i '$work/old.deb' >'$work/dpkg.log' 2>&1"
+check "with a message" grep -q "cannot be installed beside suckless-tools" "$work/dpkg.log"
+check "LSW is still this version" bash -c "[ \"\$(dpkg-query -W -f '\${Version} \${db:Status-Abbrev}' lsw)\" = '$(dpkg-deb -f "$NEW" Version) ii ' ]"
 apt_get purge suckless-tools
 check "without suckless-tools, the downgrade works" bash -c "dpkg -i '$work/old.deb' >'$work/dpkg.log' 2>&1"
 check "the downgrade leaves no diversion" no_diversion
