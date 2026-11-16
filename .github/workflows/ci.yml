@@ -52,26 +52,13 @@ jobs:
         run: dpkg-buildpackage -S -us -uc -d
       - name: Binary package
         run: dpkg-buildpackage -b -us -uc
+      # suckless-tools (dmenu) also ships /usr/bin/lsw: install, upgrade and
+      # remove LSW beside it, including failed upgrades.
       - name: Install check
         run: |
           mkdir -p dist && cp ../lsw_*.deb dist/
+          sudo packaging/tests/deb-install.sh dist/lsw_*.deb
           sudo apt-get install -y ./dist/lsw_*.deb && lsw --version
-      # suckless-tools (dmenu) also ships /usr/bin/lsw; LSW must install
-      # beside it in either order and give the name back when removed.
-      - name: Install check with suckless-tools
-        run: |
-          sudo apt-get install -y suckless-tools
-          lsw --version | grep -q '^lsw 0'
-          test -x /usr/bin/lsw.suckless-tools
-          sudo apt-get remove -y lsw
-          test "$(dpkg -S /usr/bin/lsw)" = "suckless-tools: /usr/bin/lsw"
-          test ! -e /usr/bin/lsw.suckless-tools
-          sudo apt-get install -y ./dist/lsw_*.deb
-          lsw --version | grep -q '^lsw 0'
-          test -x /usr/bin/lsw.suckless-tools
-          sudo apt-get remove -y lsw
-          test -z "$(dpkg-divert --list /usr/bin/lsw)"
-          test "$(dpkg -S /usr/bin/lsw)" = "suckless-tools: /usr/bin/lsw"
       - uses: actions/upload-artifact@v4
         with:
           name: lsw-deb

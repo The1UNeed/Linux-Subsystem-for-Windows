@@ -4,10 +4,21 @@ set -e
 #DEBHELPER#
 
 # Give suckless-tools its /usr/bin/lsw back (see lsw.preinst).
+remove_diversion() {
+    dpkg-divert --package lsw --remove --rename \
+        --divert /usr/bin/lsw.suckless-tools /usr/bin/lsw
+}
+
 case "$1" in
     remove|abort-install|disappear)
-        dpkg-divert --package lsw --remove --rename \
-            --divert /usr/bin/lsw.suckless-tools /usr/bin/lsw
+        remove_diversion
+        ;;
+    abort-upgrade)
+        # Back to a version without this diversion (0.0.1~alpha): undo the
+        # one preinst just added, as that version never removes it.
+        if dpkg --compare-versions "$2" lt "0.0.1~alpha+1"; then
+            remove_diversion
+        fi
         ;;
 esac
 

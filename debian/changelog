@@ -1,3 +1,10 @@
+lsw (0.0.1~alpha+1) noble; urgency=medium
+
+  * Install beside suckless-tools, which also ships /usr/bin/lsw: divert its
+    copy to /usr/bin/lsw.suckless-tools, and restore it on removal.
+
+ -- LSW contributors <noreply@github.com>  Mon, 16 Nov 2026 06:00:00 +0000
+
 lsw (0.0.1~alpha) noble; urgency=medium
 
   * First alpha: unattended Windows 11 install, Window and Full Screen views,
