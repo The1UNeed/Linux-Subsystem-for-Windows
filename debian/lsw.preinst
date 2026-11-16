@@ -1,0 +1,16 @@
+#!/bin/sh
+set -e
+
+# suckless-tools (the package with dmenu) also ships /usr/bin/lsw, an X11
+# window lister. Move its copy to /usr/bin/lsw.suckless-tools so both
+# packages can be installed; dpkg keeps that path for its future upgrades.
+case "$1" in
+    install|upgrade)
+        dpkg-divert --package lsw --add --rename \
+            --divert /usr/bin/lsw.suckless-tools /usr/bin/lsw
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

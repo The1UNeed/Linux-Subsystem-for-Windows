@@ -250,6 +250,7 @@ from running it.
 | System shortcuts (Super, Alt+Tab) go to Windows only in Full Screen; in the Window view Linux keeps them. Ctrl+Super+C switches between the Window view and Coherence. | In a window among other Linux windows, taking the desktop's shortcuts away surprised users; Full Screen is where Windows owns the screen. |
 | Windows' DPI scale stays at 100 %; the Window view and Full Screen give Windows the monitor's native pixels (fractional scaling included). | Changing Windows' scale needs a sign-out for many apps; native pixels keep the picture sharp. |
 | After installation COM1 goes to a 64 KiB ring buffer in QEMU, not a file. | Setup reports progress there; afterwards a guest could fill the host disk through it. |
+| The `.deb` diverts suckless-tools' `/usr/bin/lsw` to `/usr/bin/lsw.suckless-tools` (dpkg-divert) and restores it on removal. | Ubuntu's suckless-tools (dmenu, common with sway and i3) ships an X11 window lister named `lsw`, and `apt install lsw` installs it; dpkg refused to install LSW beside it. Renaming the `lsw` command would break every guide and launcher. |
 
 ## 4. Delivery
 

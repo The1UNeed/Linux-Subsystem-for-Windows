@@ -66,12 +66,19 @@ app starts from the Linux app grid ([Paint](docs/images/coherence-launch-paint.p
 
 ## Install
 
-Ubuntu (PPA, once published):
+Ubuntu 24.04 or later: download `lsw_…_amd64.deb` from the
+[latest release](https://github.com/The1UNeed/Linux-Subsystem-for-Windows/releases/latest),
+then, in the folder you saved it to:
 
 ```sh
-sudo add-apt-repository ppa:lsw/lsw
-sudo apt install lsw
+sudo apt install ./lsw_*_amd64.deb
 ```
+
+apt also installs QEMU, swtpm and the other packages LSW needs. There is no
+PPA yet. `sudo apt install lsw` without the `.deb` installs a different
+program: Ubuntu's `suckless-tools`, which includes dmenu and an X11 tool also
+called `lsw`. LSW installs beside it and renames that tool to
+`lsw.suckless-tools`. Removing LSW gives the name back.
 
 CachyOS / Arch: build `packaging/arch/PKGBUILD` with `makepkg -si`.
 

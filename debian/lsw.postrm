@@ -1,0 +1,14 @@
+#!/bin/sh
+set -e
+
+#DEBHELPER#
+
+# Give suckless-tools its /usr/bin/lsw back (see lsw.preinst).
+case "$1" in
+    remove|abort-install|disappear)
+        dpkg-divert --package lsw --remove --rename \
+            --divert /usr/bin/lsw.suckless-tools /usr/bin/lsw
+        ;;
+esac
+
+exit 0
