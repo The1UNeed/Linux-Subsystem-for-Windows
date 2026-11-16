@@ -66,7 +66,7 @@ app starts from the Linux app grid ([Paint](docs/images/coherence-launch-paint.p
 
 ## Install
 
-Ubuntu 24.04 or later: download `lsw_0.0.1.alpha.1_amd64.deb` from the
+Ubuntu 24.04 or later on x86-64 (amd64): download `lsw_0.0.1.alpha.1_amd64.deb` from the
 [releases page](https://github.com/The1UNeed/Linux-Subsystem-for-Windows/releases),
 then, in the folder you saved it to, install it with apt:
 
