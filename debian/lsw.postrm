@@ -14,9 +14,9 @@ case "$1" in
         remove_diversion
         ;;
     abort-upgrade)
-        # Back to a version without this diversion (0.0.1~alpha): undo the
-        # one preinst just added, as that version never removes it.
-        if dpkg --compare-versions "$2" lt "0.0.1~alpha+1"; then
+        # Back to 0.0.1~alpha, the only version without this diversion: undo
+        # the one preinst just added, as that version never removes it.
+        if dpkg --compare-versions "$2" le "0.0.1~alpha"; then
             remove_diversion
         fi
         ;;
