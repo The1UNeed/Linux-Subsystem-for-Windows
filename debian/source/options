@@ -1,0 +1,8 @@
+# Keep build output out of the source package when it is built from a tree
+# that was already compiled (a bare tar-ignore keeps dpkg's VCS defaults).
+tar-ignore
+tar-ignore = target
+tar-ignore = fuzz/target
+tar-ignore = fuzz/corpus
+tar-ignore = fuzz/artifacts
+tar-ignore = dist

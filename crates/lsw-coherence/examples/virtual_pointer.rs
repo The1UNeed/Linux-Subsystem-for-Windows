@@ -6,6 +6,7 @@
 //! move X Y
 //! click        (left button)
 //! rclick       (right button)
+//! down / up    (left button held / released: drags)
 //! ```
 
 use smithay_client_toolkit::reexports::protocols_wlr::virtual_pointer::v1::client::{
@@ -85,6 +86,15 @@ fn main() -> anyhow::Result<()> {
                 queue.roundtrip(&mut State)?;
                 std::thread::sleep(std::time::Duration::from_millis(80));
                 pointer.button(t + 5, button, ButtonState::Released);
+                pointer.frame();
+            }
+            ["down"] | ["up"] => {
+                let state = if parts[0] == "down" {
+                    ButtonState::Pressed
+                } else {
+                    ButtonState::Released
+                };
+                pointer.button(t, 0x110, state);
                 pointer.frame();
             }
             _ => eprintln!("unknown command: {line}"),

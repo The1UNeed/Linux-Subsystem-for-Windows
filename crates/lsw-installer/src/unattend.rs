@@ -251,10 +251,31 @@ pub fn render(o: &UnattendOptions) -> Result<String, UnattendError> {
       </UserData>
     </component>
   </settings>
+  <!-- No automatic BitLocker device encryption: Windows 11 turns it on when it
+       sees TPM 2.0 and Secure Boot, then rewrites the whole volume in software
+       AES during setup (about twice the writes, much slower on slow disks),
+       and keeps a clear key until a Microsoft account signs in. The VM's TPM
+       state sits next to its disk on the host, so it would not protect the
+       disk anyway; encrypt the host disk instead. BitLocker can still be
+       turned on by hand. -->
+  <settings pass="offlineServicing">
+    <component name="Microsoft-Windows-SecureStartup-FilterDriver" {COMPONENT_ATTRS}>
+      <PreventDeviceEncryption>true</PreventDeviceEncryption>
+    </component>
+  </settings>
   <settings pass="specialize">
     <component name="Microsoft-Windows-Shell-Setup" {COMPONENT_ATTRS}>
       <ComputerName>{computer}</ComputerName>
       <TimeZone>{tz}</TimeZone>
+    </component>
+    <component name="Microsoft-Windows-Deployment" {COMPONENT_ATTRS}>
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>reg.exe add HKLM\SYSTEM\CurrentControlSet\Control\BitLocker /v PreventDeviceEncryption /t REG_DWORD /d 1 /f</Path>
+          <Description>No automatic device encryption</Description>
+        </RunSynchronousCommand>
+      </RunSynchronous>
     </component>
   </settings>
   <settings pass="oobeSystem">
@@ -358,6 +379,20 @@ mod tests {
             xml.matches("wcm:keyValue=").count(),
             PE_DRIVERS.len() * PE_DRIVE_LETTERS.len()
         );
+    }
+
+    #[test]
+    fn automatic_device_encryption_is_prevented() {
+        let xml = render(&opts()).unwrap();
+        let offline = xml.find(r#"pass="offlineServicing""#).unwrap();
+        let filter = xml
+            .find("Microsoft-Windows-SecureStartup-FilterDriver")
+            .unwrap();
+        assert!(filter > offline);
+        assert!(xml.contains("<PreventDeviceEncryption>true</PreventDeviceEncryption>"));
+        assert!(xml.contains(
+            r"reg.exe add HKLM\SYSTEM\CurrentControlSet\Control\BitLocker /v PreventDeviceEncryption /t REG_DWORD /d 1 /f"
+        ));
     }
 
     #[test]

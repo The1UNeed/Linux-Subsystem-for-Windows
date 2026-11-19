@@ -38,7 +38,11 @@ pub fn data_home(paths: &VmPaths) -> anyhow::Result<PathBuf> {
 }
 
 /// Start an LSW program in the background (see [`lsw_daemon::detached`]).
-pub fn start_detached(program: &str, args: &[&str], unit: &str) -> std::io::Result<()> {
+pub fn start_detached(
+    program: &str,
+    args: &[&str],
+    unit: &str,
+) -> std::io::Result<lsw_daemon::detached::Started> {
     lsw_daemon::detached::start(program, args, unit)
 }
 

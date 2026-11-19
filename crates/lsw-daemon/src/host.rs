@@ -45,6 +45,23 @@ pub struct Binaries {
     pub virtiofsd: Option<PathBuf>,
     /// Needed by virtiofsd's unprivileged namespace sandbox.
     pub newuidmap: Option<PathBuf>,
+    /// virt-firmware's tool: enrolls Microsoft's keys where the
+    /// distribution ships no enrolled NVRAM template (Arch, CachyOS).
+    pub virt_fw_vars: Option<PathBuf>,
+}
+
+/// How a new VM gets Secure Boot with Microsoft's keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SecureBoot {
+    /// From the distribution's enrolled NVRAM template (Ubuntu's `ovmf`).
+    Template,
+    /// By enrolling the keys into the blank template with `virt-fw-vars`.
+    Enroll,
+    /// Secure Boot capable firmware, but no way to get the keys.
+    NoKeys,
+    /// No suitable OVMF firmware at all.
+    NoFirmware,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -60,10 +77,13 @@ pub struct HostReport {
     pub pipewire: bool,
     /// QEMU has the D-Bus display module (needed by the LSW app).
     pub qemu_dbus_display: bool,
+    /// QEMU has `-object monitor-qmp` (11+, which deprecates `-mon`).
+    pub qemu_monitor_object: bool,
     pub gpus: Vec<Gpu>,
     /// Usable GPU tiers, in [`GpuTier`] order (A first, D last; D is always present).
     pub tiers: Vec<GpuTier>,
     pub binaries: Binaries,
+    pub secure_boot: SecureBoot,
 }
 
 /// A blocking problem found by [`HostReport::problems`].
@@ -83,6 +103,11 @@ impl HostReport {
             .qemu
             .as_deref()
             .is_some_and(qemu_has_dbus_display);
+        report.qemu_monitor_object = report
+            .binaries
+            .qemu
+            .as_deref()
+            .is_some_and(qemu_has_monitor_object);
         report
     }
 
@@ -106,11 +131,22 @@ impl HostReport {
             iommu_groups,
             pipewire: false,
             qemu_dbus_display: false,
+            qemu_monitor_object: false,
             gpus,
             tiers: Vec::new(),
             binaries: find_binaries(path),
+            secure_boot: SecureBoot::NoFirmware,
         };
         report.tiers = report.usable_tiers();
+        report.secure_boot = if crate::firmware::find(root, true).is_some() {
+            SecureBoot::Template
+        } else if crate::firmware::find(root, false).is_none() {
+            SecureBoot::NoFirmware
+        } else if report.binaries.virt_fw_vars.is_some() {
+            SecureBoot::Enroll
+        } else {
+            SecureBoot::NoKeys
+        };
         report
     }
 
@@ -235,8 +271,28 @@ impl HostReport {
                 fix: "Install passt".into(),
             });
         }
+        if self.secure_boot == SecureBoot::NoKeys {
+            out.push(Problem {
+                what: "no UEFI firmware with Microsoft's Secure Boot keys: new VMs need \
+                       `lsw create --no-secure-boot`"
+                    .into(),
+                fix: "Install virt-firmware (Arch/CachyOS: LSW enrolls the keys with it)".into(),
+            });
+        }
         out
     }
+}
+
+/// Whether `qemu -object help` lists `monitor-qmp`.
+fn qemu_has_monitor_object(qemu: &Path) -> bool {
+    std::process::Command::new(qemu)
+        .args(["-object", "help"])
+        .output()
+        .is_ok_and(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(|l| l.trim() == "monitor-qmp")
+        })
 }
 
 /// Whether `qemu -display help` lists the D-Bus display (a loadable module
@@ -267,8 +323,10 @@ pub fn search_path() -> Vec<PathBuf> {
     if let Some(path) = std::env::var_os("PATH") {
         dirs.extend(std::env::split_paths(&path));
     }
-    // virtiofsd lives in libexec on several distributions.
+    // virtiofsd is outside $PATH: /usr/libexec (Debian, Ubuntu, Fedora),
+    // /usr/lib (Arch, CachyOS) or /usr/lib/qemu (older packages).
     dirs.push(PathBuf::from("/usr/libexec"));
+    dirs.push(PathBuf::from("/usr/lib"));
     dirs.push(PathBuf::from("/usr/lib/qemu"));
     dirs
 }
@@ -281,6 +339,7 @@ fn find_binaries(path: &[PathBuf]) -> Binaries {
         passt: find("passt"),
         virtiofsd: find("virtiofsd"),
         newuidmap: find("newuidmap"),
+        virt_fw_vars: find("virt-fw-vars"),
     }
 }
 
@@ -548,5 +607,14 @@ mod tests {
         assert_eq!(b.qemu.unwrap(), f.root().join("bundled/qemu-system-x86_64"));
         assert!(b.swtpm.is_some());
         assert!(b.passt.is_none());
+    }
+
+    #[test]
+    fn search_path_covers_every_distributions_virtiofsd() {
+        let dirs = search_path();
+        // Debian/Ubuntu/Fedora, then Arch/CachyOS (package `virtiofsd`).
+        for dir in ["/usr/libexec", "/usr/lib"] {
+            assert!(dirs.contains(&PathBuf::from(dir)), "{dir} missing");
+        }
     }
 }

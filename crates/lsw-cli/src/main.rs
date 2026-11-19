@@ -19,7 +19,7 @@ use lsw_daemon::config::{
     Firmware, GpuTier, InstallMedia, Network, Profile, Share, VmConfig, parse_user_dirs,
 };
 use lsw_daemon::firmware;
-use lsw_daemon::host::HostReport;
+use lsw_daemon::host::{HostReport, SecureBoot};
 use lsw_daemon::paths::VmPaths;
 use lsw_daemon::qemu::{Audio, CONTROL_PORT_ID, DiskIo, LaunchOptions};
 use lsw_daemon::qmp::{Qmp, QmpError};
@@ -283,6 +283,23 @@ async fn lsw_main() -> anyhow::Result<()> {
     }
 }
 
+/// The VM's configuration, or an error that says how to create the VM.
+/// Checked before anything that would create the VM's directories.
+fn load_vm(paths: &VmPaths) -> anyhow::Result<VmConfig> {
+    if !paths.data.join(VmConfig::FILE_NAME).is_file() {
+        let name = paths.data.file_name().unwrap_or_default().to_string_lossy();
+        let flag = if name == "windows" {
+            String::new()
+        } else {
+            format!(" --name {name}")
+        };
+        bail!(
+            "there is no VM named {name:?}: create it with `lsw{flag} create`, then `lsw{flag} install`"
+        );
+    }
+    VmConfig::load(&paths.data)
+}
+
 fn doctor(json: bool) -> anyhow::Result<()> {
     let report = HostReport::probe();
     let problems = report.problems();
@@ -310,6 +327,15 @@ fn doctor(json: bool) -> anyhow::Result<()> {
         println!("IOMMU groups: {}", report.iommu_groups);
         println!("PipeWire:     {}", yes(report.pipewire));
         println!("D-Bus display: {}", yes(report.qemu_dbus_display));
+        println!(
+            "Secure Boot:  {}",
+            match report.secure_boot {
+                SecureBoot::Template => "yes (Microsoft keys from the OVMF package)",
+                SecureBoot::Enroll => "yes (Microsoft keys enrolled with virt-fw-vars)",
+                SecureBoot::NoKeys => "no (Microsoft keys missing)",
+                SecureBoot::NoFirmware => "no (no OVMF firmware)",
+            }
+        );
         for g in &report.gpus {
             println!(
                 "GPU:          {} {:04x}:{:04x} driver={} boot_vga={} vfs={} render={}",
@@ -408,9 +434,18 @@ async fn create(name: &str, paths: &VmPaths, a: CreateArgs) -> anyhow::Result<()
     if paths.data.join(VmConfig::FILE_NAME).exists() {
         bail!("VM {name:?} already exists in {}", paths.data.display());
     }
+    // Arguments first: nothing is downloaded for a command that will fail.
+    match (&a.source, &a.iso) {
+        (Source::Iso, None) => bail!("--source iso needs --iso PATH"),
+        (Source::Iso, Some(iso)) if !iso.is_file() => {
+            bail!("{} does not exist or is not a file", iso.display())
+        }
+        (Source::Consumer | Source::Evaluation, Some(_)) => {
+            bail!("--iso is only used with --source iso")
+        }
+        _ => {}
+    }
     let host = HostReport::probe();
-    paths.create()?;
-    let cache = guest::cache_dir(paths)?;
 
     let profile = match a.profile {
         ProfileArg::Productivity => Profile::Productivity,
@@ -418,6 +453,12 @@ async fn create(name: &str, paths: &VmPaths, a: CreateArgs) -> anyhow::Result<()
         ProfileArg::Games => Profile::Games,
     };
     let (mem, cpus, disk) = profile.capped(host.mem_total_mib, host.logical_cpus.max(2));
+    let (mem, cpus, disk) = (
+        a.memory.unwrap_or(mem),
+        a.cpus.unwrap_or(cpus),
+        a.disk.unwrap_or(disk),
+    );
+    lsw_daemon::config::check_resources(mem, cpus, disk)?;
     let tier = match a.tier {
         TierArg::Auto => host.recommended_tier(profile),
         TierArg::A if !lsw_daemon::gpu::TIER_A_DRIVER_READY => bail!(
@@ -448,13 +489,34 @@ async fn create(name: &str, paths: &VmPaths, a: CreateArgs) -> anyhow::Result<()
     // Secure Boot with Microsoft's keys, or an explicit decision not to:
     // never a silent downgrade.
     let want_secure_boot = !test_signing && !a.no_secure_boot;
-    let fw = match firmware::find(Path::new("/"), want_secure_boot) {
+    let root = Path::new("/");
+    // Where the distribution ships no enrolled NVRAM template (Arch's
+    // 'edk2-ovmf'), virt-fw-vars enrolls Microsoft's keys into the blank one.
+    let mut enroll_with = None;
+    let fw = match firmware::find(root, want_secure_boot) {
         Some(fw) => fw,
-        None if want_secure_boot && firmware::find(Path::new("/"), false).is_some() => bail!(
-            "no UEFI firmware with Microsoft's Secure Boot keys enrolled was found (Ubuntu's \
-             'ovmf' package has one; Arch's 'edk2-ovmf' does not). Install one, or run \
-             `lsw create --no-secure-boot` to create a VM with Secure Boot off."
-        ),
+        None if want_secure_boot => match (
+            firmware::find(root, false),
+            host.binaries.virt_fw_vars.clone(),
+        ) {
+            (Some(blank), Some(tool)) => {
+                enroll_with = Some(tool);
+                firmware::FirmwarePair {
+                    ms_keys_enrolled: true,
+                    ..blank
+                }
+            }
+            (Some(_), None) => bail!(
+                "no UEFI firmware with Microsoft's Secure Boot keys enrolled was found, and \
+                 `virt-fw-vars` is not installed to enroll them. Install the 'virt-firmware' \
+                 package (Arch/CachyOS; Ubuntu's 'ovmf' has the keys), or run \
+                 `lsw create --no-secure-boot` to create a VM with Secure Boot off."
+            ),
+            (None, _) => bail!(
+                "no OVMF firmware found; install the 'ovmf' (Ubuntu) or 'edk2-ovmf' (Arch) \
+                 package"
+            ),
+        },
         None => bail!(
             "no OVMF firmware found; install the 'ovmf' (Ubuntu) or 'edk2-ovmf' (Arch) package"
         ),
@@ -462,10 +524,19 @@ async fn create(name: &str, paths: &VmPaths, a: CreateArgs) -> anyhow::Result<()
     if !fw.ms_keys_enrolled {
         eprintln!("note: Secure Boot is off for this VM (--no-secure-boot).");
     }
+    // Every check passed: only now does the VM get a directory.
+    paths.create()?;
+    let cache = guest::cache_dir(paths)?;
     let vars = paths.data.join("OVMF_VARS.fd");
     // No vm.json yet: this VM is still being created (possibly a retry of
     // a failed creation), so its NVRAM must come from this template.
-    firmware::reset_vars(&fw, &vars)?;
+    match &enroll_with {
+        Some(tool) => {
+            eprintln!("Enrolling Microsoft's Secure Boot keys (virt-fw-vars)…");
+            firmware::enroll_microsoft(tool, &fw, &vars)?;
+        }
+        None => firmware::reset_vars(&fw, &vars)?,
+    }
 
     let client = download::client()?;
     let virtio_iso = cache.join(format!("virtio-win-{}.iso", download::VIRTIO_WIN_VERSION));
@@ -486,7 +557,9 @@ async fn create(name: &str, paths: &VmPaths, a: CreateArgs) -> anyhow::Result<()
     let (windows_iso, image_name, image_index) = match a.source {
         Source::Iso => {
             let iso = a.iso.context("--source iso needs --iso PATH")?;
-            anyhow::ensure!(iso.is_file(), "{} does not exist", iso.display());
+            // vm.json keeps it for `lsw install`, which may run elsewhere.
+            let iso = std::fs::canonicalize(&iso)
+                .with_context(|| format!("cannot open {}", iso.display()))?;
             (iso, a.edition.clone(), None)
         }
         Source::Consumer => {
@@ -563,10 +636,10 @@ async fn create(name: &str, paths: &VmPaths, a: CreateArgs) -> anyhow::Result<()
 
     let cfg = VmConfig {
         name: name.to_owned(),
-        memory_mib: a.memory.unwrap_or(mem),
-        vcpus: a.cpus.unwrap_or(cpus),
+        memory_mib: mem,
+        vcpus: cpus,
         disk_path: paths.data.join("disk.raw"),
-        disk_size_gib: a.disk.unwrap_or(disk),
+        disk_size_gib: disk,
         firmware: Firmware {
             code: fw.code,
             vars,
@@ -714,9 +787,17 @@ fn default_shares() -> Vec<Share> {
         .unwrap_or_else(|| home.join(".config"));
     let text = std::fs::read_to_string(config_home.join("user-dirs.dirs")).unwrap_or_default();
     let dirs = parse_user_dirs(&text, &home);
-    Share::defaults(&home, |key| {
-        dirs.iter().find(|(k, _)| k == key).map(|(_, p)| p.clone())
-    })
+    let lookup = |key: &str| dirs.iter().find(|(k, _)| k == key).map(|(_, p)| p.clone());
+    // Desktops without xdg-user-dirs (minimal Arch/CachyOS, tiling window
+    // managers) have none of these folders; shares are fixed when the VM is
+    // created, so create the missing ones now rather than share nothing.
+    for (key, fallback, _) in lsw_daemon::config::DEFAULT_FOLDERS {
+        let dir = lookup(key).unwrap_or_else(|| home.join(fallback));
+        if !dir.exists() && dir.starts_with(&home) && std::fs::create_dir_all(&dir).is_ok() {
+            eprintln!("Created {} to share it with Windows.", dir.display());
+        }
+    }
+    Share::defaults(&home, lookup)
 }
 
 fn launch_options(host: &HostReport, l: &LaunchArgs) -> LaunchOptions {
@@ -740,6 +821,7 @@ fn launch_options(host: &HostReport, l: &LaunchArgs) -> LaunchOptions {
         tools_iso: None,
         display_size: (1280, 800),
         sandbox: !l.no_sandbox,
+        monitor_objects: host.qemu_monitor_object,
     }
 }
 
@@ -898,6 +980,7 @@ async fn install(
     screenshot: Option<PathBuf>,
     l: &LaunchArgs,
 ) -> anyhow::Result<()> {
+    load_vm(paths)?;
     let mut stop = StopSignals::new()?;
     let _lock = vm::lock_vm(paths)?;
     let mut cfg = VmConfig::load(&paths.data)?;
@@ -990,12 +1073,6 @@ async fn install(
         "Installation finished in {:.1} minutes.",
         started.elapsed().as_secs_f64() / 60.0
     );
-    // Windows is installed: record it now, before the screenshot and the
-    // shutdown, so nothing that happens after can lose it.
-    cfg.install = None;
-    cfg.save(&paths.data)?;
-    // The setup image contains the account password.
-    let _ = std::fs::remove_file(&install.setup_iso);
     // Give the desktop a moment to settle for the screenshot (unless asked
     // to stop), then shut down. Best effort: a failed screenshot changes
     // nothing.
@@ -1022,11 +1099,39 @@ async fn install(
         }
     };
     esay!("{off}");
+    // Only a Windows shutdown that QEMU completed leaves a whole disk: a
+    // forced stop, a `quit` from outside or a failing QEMU may lose what
+    // Windows had not written yet.
+    if !matches!(off, vm::PowerOff::Clean(status) if status.success()) {
+        bail!(
+            "Windows did not shut down normally; see {}\nThe VM is not marked installed; \
+             run `lsw install` to start over.\n{}",
+            paths.qemu_log().display(),
+            vm::tail(&paths.qemu_log(), 30)
+        );
+    }
+    // Record Windows as installed only now. Until QEMU exits it ignores the
+    // guest's flushes (see qemu.rs), so a host crash before this point can
+    // leave any disk state: the VM stays "not installed" and `lsw install`
+    // starts over. With QEMU gone every write it completed is in the host
+    // page cache; sync it first.
+    let t = std::time::Instant::now();
+    vm::sync_storage(&cfg).context("writing the installed disk to storage")?;
+    esay!(
+        "Disk written to storage in {:.0} s.",
+        t.elapsed().as_secs_f64()
+    );
+    cfg.install = None;
+    cfg.save(&paths.data)?;
+    // The setup image contains the account password. Deleted only after the
+    // config above is on storage: until then, `lsw install` needs it.
+    let _ = std::fs::remove_file(&install.setup_iso);
     say!("Windows is installed. Start it with: lsw run");
     Ok(())
 }
 
 async fn run(paths: &VmPaths, l: &LaunchArgs) -> anyhow::Result<()> {
+    load_vm(paths)?;
     // Ctrl+C, SIGTERM (systemctl stop, logout, host shutdown) and SIGHUP
     // (the terminal closed) shut Windows down instead of leaving it
     // running unsupervised. Handled from the start: one that arrives while
@@ -1432,7 +1537,12 @@ async fn attach_session(
     .await;
     match attached {
         Ok(r) => r.map(|()| s),
-        Err(_) => bail!("the guest agent did not answer (is it running in Windows?)"),
+        // The session channel takes one client: with the LSW window open,
+        // this connection waits behind it.
+        Err(_) => bail!(
+            "the guest agent did not answer: the LSW window may be using it (close the window \
+             and try again), or the agent is not running in Windows"
+        ),
     }
 }
 
@@ -1510,8 +1620,18 @@ async fn launch(name: &str, paths: &VmPaths, app: &str) -> anyhow::Result<()> {
         Duration::from_secs(2),
     )
     .await;
+    let mut supervisor = None;
     if status.is_err() {
-        guest::start_detached("lsw", &["--name", name, "run"], &format!("lsw-vm-{name}"))?;
+        // Nothing to start: say so now, not after the boot timeout.
+        let cfg = load_vm(paths)?;
+        if cfg.install.is_some() {
+            bail!("Windows is not installed yet; run `lsw install` first");
+        }
+        supervisor = Some(guest::start_detached(
+            "lsw",
+            &["--name", name, "run"],
+            &format!("lsw-vm-{name}"),
+        )?);
     }
     // Wait for the agent (a cold start takes Windows' boot time).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
@@ -1525,6 +1645,19 @@ async fn launch(name: &str, paths: &VmPaths, app: &str) -> anyhow::Result<()> {
             && r.agent == Some(true)
         {
             break;
+        }
+        if let Some(s) = supervisor.as_mut()
+            && !s.running()
+        {
+            // Another supervisor (`lsw@NAME` starting at login) got the VM
+            // first: ours stopped at once; wait for that one instead.
+            if !vm::supervised(paths) {
+                bail!(
+                    "Windows stopped while starting; for the reason, {}",
+                    s.log_hint()
+                );
+            }
+            supervisor = None;
         }
         if tokio::time::Instant::now() > deadline {
             bail!("Windows did not become ready in time");
@@ -1575,7 +1708,7 @@ fn gpu(paths: &VmPaths, action: GpuAction) -> anyhow::Result<()> {
         }
         GpuAction::Assign { pci } => {
             // The VM must exist and be stopped before anything changes.
-            let mut cfg = VmConfig::load(&paths.data)?;
+            let mut cfg = load_vm(paths)?;
             let _lock = vm::lock_vm(paths)?;
             let addr = PciAddr::parse(&pci).context("expected a PCI address like 0000:01:00.0")?;
             // Before asking for privileges: one assignment at a time.
@@ -1598,7 +1731,7 @@ fn gpu(paths: &VmPaths, action: GpuAction) -> anyhow::Result<()> {
             println!("{addr} is assigned to Windows from the next start (tier B).");
         }
         GpuAction::Release => {
-            let mut cfg = VmConfig::load(&paths.data)?;
+            let mut cfg = load_vm(paths)?;
             let _lock = vm::lock_vm(paths)?;
             if let Some(first) = cfg.passthrough.first().cloned() {
                 let helper = ["/usr/lib/lsw/lsw-helper", "/usr/libexec/lsw-helper"]

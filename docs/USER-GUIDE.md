@@ -32,9 +32,15 @@ and use `--source iso --iso Win11.iso`. The Windows account is named after
 your Linux user; its password is stored in the VM directory
 (`credentials.json`, readable only by you).
 
-Secure Boot needs UEFI firmware with Microsoft's keys enrolled (Ubuntu's
-`ovmf` package). Where it is missing (Arch's `edk2-ovmf`), `lsw create` stops
-and explains; `--no-secure-boot` creates the VM with Secure Boot off.
+Secure Boot uses UEFI firmware with Microsoft's keys enrolled. Ubuntu's
+`ovmf` package ships them. Arch's and CachyOS's `edk2-ovmf` does not, so
+`lsw create` enrolls them itself with `virt-fw-vars` (package
+`virt-firmware`, which the Arch package depends on). Without either,
+`lsw create` stops and explains; `--no-secure-boot` creates the VM with
+Secure Boot off. `lsw doctor` shows which applies.
+
+On btrfs (CachyOS's default) the VM disk is created with copy-on-write off,
+as libvirt does, so Windows' writes do not fragment it.
 
 Profiles: Productivity 8 GB / 4 cores / 128 GB, Development and Games
 16 GB / 8 cores / 256 GB, never more than half of your machine. The disk is a
@@ -46,6 +52,20 @@ lsw install
 
 installs Windows without questions and reports progress. When it finishes,
 Windows has the virtio drivers, the LSW agent and WinFsp, and is shut down.
+
+While Windows installs, its disk writes go through the Linux page cache
+(Setup's constant flushes are not waited for); `lsw install` shuts Windows
+down and writes the disk to storage before it records Windows as installed.
+If the machine crashes during the installation, run `lsw install` again:
+Setup starts over on a clean disk.
+
+The Windows disk is not encrypted: LSW turns off Windows' automatic device
+encryption (BitLocker), which would otherwise rewrite the whole disk during
+setup. Its key would also be weaker than usual: the VM's TPM state is stored
+next to its disk, so anyone with a copy of the VM directory can unlock it.
+Encrypt your Linux disk to protect Windows' data at rest. BitLocker can
+still be turned on by hand inside Windows, for example to protect backups of
+the disk alone.
 
 Keep Windows supervised with the systemd user unit:
 

@@ -120,30 +120,34 @@ pub fn share_root(path: &Path, home: &Path) -> Result<PathBuf, String> {
     Ok(real)
 }
 
+/// The default pairing: XDG user-dirs key, fallback folder name in the home
+/// directory, Windows known folder.
+pub const DEFAULT_FOLDERS: [(&str, &str, KnownFolder); 6] = [
+    ("DESKTOP", "Desktop", KnownFolder::Desktop),
+    ("DOCUMENTS", "Documents", KnownFolder::Documents),
+    ("DOWNLOAD", "Downloads", KnownFolder::Downloads),
+    ("PICTURES", "Pictures", KnownFolder::Pictures),
+    ("MUSIC", "Music", KnownFolder::Music),
+    ("VIDEOS", "Videos", KnownFolder::Videos),
+];
+
 impl Share {
     /// The default pairing: Linux XDG user folders ↔ Windows known folders.
     /// Folders that do not exist on the host are skipped; the home directory
     /// itself is never shared.
     pub fn defaults(home: &Path, xdg: impl Fn(&str) -> Option<PathBuf>) -> Vec<Share> {
-        [
-            ("DESKTOP", "Desktop", KnownFolder::Desktop),
-            ("DOCUMENTS", "Documents", KnownFolder::Documents),
-            ("DOWNLOAD", "Downloads", KnownFolder::Downloads),
-            ("PICTURES", "Pictures", KnownFolder::Pictures),
-            ("MUSIC", "Music", KnownFolder::Music),
-            ("VIDEOS", "Videos", KnownFolder::Videos),
-        ]
-        .into_iter()
-        .filter_map(|(key, fallback, folder)| {
-            let dir = xdg(key).unwrap_or_else(|| home.join(fallback));
-            let root = share_root(&dir, home).ok()?;
-            Some(Share {
-                tag: format!("lsw-{}", fallback.to_ascii_lowercase()),
-                host_path: root,
-                folder,
+        DEFAULT_FOLDERS
+            .into_iter()
+            .filter_map(|(key, fallback, folder)| {
+                let dir = xdg(key).unwrap_or_else(|| home.join(fallback));
+                let root = share_root(&dir, home).ok()?;
+                Some(Share {
+                    tag: format!("lsw-{}", fallback.to_ascii_lowercase()),
+                    host_path: root,
+                    folder,
+                })
             })
-        })
-        .collect()
+            .collect()
     }
 }
 
@@ -230,6 +234,30 @@ pub struct VmConfig {
     pub install: Option<InstallMedia>,
 }
 
+/// A VM name is a directory name, part of socket paths and of systemd unit
+/// names: 1-32 characters of `[A-Za-z0-9_-]`, not starting with `-`
+/// (launchers pass it as `--name NAME`).
+pub fn check_vm_name(name: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        name.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+            && name.len() <= 32
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+        "VM name {name:?} is not allowed: use 1-32 characters of A-Z, a-z, 0-9, - and _, \
+         not starting with -"
+    );
+    Ok(())
+}
+
+/// The smallest VM Windows 11 installs on.
+pub fn check_resources(memory_mib: u32, vcpus: u16, disk_size_gib: u64) -> anyhow::Result<()> {
+    anyhow::ensure!(memory_mib >= 4096, "Windows 11 needs at least 4096 MiB");
+    anyhow::ensure!(vcpus >= 2, "Windows 11 needs at least 2 vCPUs");
+    anyhow::ensure!(disk_size_gib >= 64, "Windows 11 needs at least 64 GiB");
+    Ok(())
+}
+
 impl VmConfig {
     pub const FILE_NAME: &'static str = "vm.json";
 
@@ -240,32 +268,38 @@ impl VmConfig {
         Ok(cfg)
     }
 
-    /// Write atomically (temp file + rename) so a crash never leaves a
-    /// truncated config behind.
+    /// Write atomically and durably (temp file, fsync, rename, fsync of the
+    /// directory): after a crash the config is the old one or the new one,
+    /// never truncated, and once this returns it is the new one.
     pub fn save(&self, dir: &Path) -> anyhow::Result<()> {
+        use std::io::Write as _;
         self.validate()?;
         let tmp = dir.join(".vm.json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(&serde_json::to_vec_pretty(self)?)?;
+        file.sync_all()?;
+        drop(file);
         std::fs::rename(&tmp, dir.join(Self::FILE_NAME))?;
-        Ok(())
+        match std::fs::File::open(dir).and_then(|d| d.sync_all()) {
+            Ok(()) => Ok(()),
+            // Some filesystems (vboxsf, …) cannot sync a directory (EINVAL);
+            // the new config is in place all the same.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+                ) =>
+            {
+                tracing::debug!("cannot sync {}: {e}", dir.display());
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            !self.name.is_empty()
-                && self.name.len() <= 32
-                && self
-                    .name
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
-            "VM name must be 1-32 characters of [A-Za-z0-9_-]"
-        );
-        anyhow::ensure!(
-            self.memory_mib >= 4096,
-            "Windows 11 needs at least 4096 MiB"
-        );
-        anyhow::ensure!(self.vcpus >= 2, "Windows 11 needs at least 2 vCPUs");
-        anyhow::ensure!(self.disk_size_gib >= 64, "Windows 11 needs at least 64 GiB");
+        check_vm_name(&self.name)?;
+        check_resources(self.memory_mib, self.vcpus, self.disk_size_gib)?;
         anyhow::ensure!(
             self.shares.len() <= MAX_SHARES,
             "at most {MAX_SHARES} shared folders"

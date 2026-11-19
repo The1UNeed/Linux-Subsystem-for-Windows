@@ -7,6 +7,12 @@
 #   sudo packaging/tests/deb-install.sh ./lsw_<version>_amd64.deb
 set -euo pipefail
 NEW=$(realpath "$1")
+# Every check starts from a system without LSW: with it installed,
+# suckless-tools' /usr/bin/lsw below would be LSW's.
+if dpkg-query -W -f='${db:Status-Status}' lsw 2>/dev/null | grep -qvxE 'not-installed|config-files'; then
+    echo "lsw is installed: remove it first (sudo apt-get purge lsw)" >&2
+    exit 2
+fi
 export DEBIAN_FRONTEND=noninteractive
 work=$(mktemp -d)
 failures=0
