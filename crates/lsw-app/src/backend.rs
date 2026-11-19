@@ -212,6 +212,19 @@ async fn run(
     }
 }
 
+/// Input QEMU refuses is dropped, not a broken connection: a pointer
+/// position from the frame shown just before Windows changed resolution is
+/// outside the new one ("Invalid mouse position").
+fn input(r: zbus::Result<()>) -> zbus::Result<()> {
+    match r {
+        Err(zbus::Error::MethodError(name, detail, _)) => {
+            tracing::debug!("QEMU refused input: {name}: {}", detail.unwrap_or_default());
+            Ok(())
+        }
+        other => other,
+    }
+}
+
 /// One connection lifetime: display + session until something breaks.
 async fn session_loop(
     paths: &VmPaths,
@@ -265,11 +278,11 @@ async fn session_loop(
                 let Some(cmd) = cmd else { return Ok(()) };
                 match cmd {
                     Cmd::Key { qnum, down } => {
-                        if down { keyboard.press(qnum).await? } else { keyboard.release(qnum).await? }
+                        input(if down { keyboard.press(qnum).await } else { keyboard.release(qnum).await })?
                     }
-                    Cmd::MouseAbs { x, y } => mouse.set_abs_position(x, y).await?,
+                    Cmd::MouseAbs { x, y } => input(mouse.set_abs_position(x, y).await)?,
                     Cmd::Button { button, down } => {
-                        if down { mouse.press(button).await? } else { mouse.release(button).await? }
+                        input(if down { mouse.press(button).await } else { mouse.release(button).await })?
                     }
                     Cmd::Resize { width, height } => {
                         if (width, height) != last_size && width >= 640 && height >= 480 {
@@ -285,6 +298,10 @@ async fn session_loop(
                         }
                     }
                     Cmd::HostClipboard(items) => {
+                        tracing::debug!(
+                            "Linux clipboard to Windows: {:?}",
+                            items.iter().map(|(f, d)| (f, d.len())).collect::<Vec<_>>()
+                        );
                         if let Some(s) = session.as_mut() {
                             s.offer(items).await?;
                         }
@@ -332,6 +349,7 @@ async fn session_loop(
                         }
                     }
                     Ok(SessionEvent::GuestClipboard { serial, formats }) => {
+                        tracing::debug!("Windows clipboard changed ({serial}): {formats:?}");
                         for f in guest_clip.offer(serial, &formats) {
                             if let Some(s) = session.as_mut() { s.fetch(serial, f).await?; }
                         }

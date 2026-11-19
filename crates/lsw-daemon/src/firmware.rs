@@ -85,6 +85,35 @@ pub fn find(root: &Path, want_secure_boot: bool) -> Option<FirmwarePair> {
         })
 }
 
+/// Write the VM's NVRAM from a blank template with Microsoft's keys
+/// enrolled and Secure Boot on (atomic). For distributions that ship no
+/// enrolled template (Arch, CachyOS). `tool` is virt-firmware's
+/// `virt-fw-vars`; its Microsoft OEM set is what Windows PCs ship: KEK CA
+/// 2011 and 2023, Windows Production PCA 2011, Windows UEFI CA 2023 and the
+/// third-party UEFI CAs.
+pub fn enroll_microsoft(tool: &Path, blank: &FirmwarePair, dest: &Path) -> anyhow::Result<()> {
+    let tmp = dest.with_extension("fd.tmp");
+    let out = std::process::Command::new(tool)
+        .arg("--input")
+        .arg(&blank.vars_template)
+        .arg("--output")
+        .arg(&tmp)
+        .args(["--enroll-microsoft", "--secure-boot"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| anyhow::anyhow!("cannot run {}: {e}", tool.display()))?;
+    if !out.status.success() || !tmp.is_file() {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::bail!(
+            "{} could not enroll Microsoft's Secure Boot keys: {}",
+            tool.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    std::fs::rename(tmp, dest)?;
+    Ok(())
+}
+
 /// Replace the VM's NVRAM with a fresh copy of the template (atomic). Used
 /// while a VM is being created, so a retried creation never keeps NVRAM
 /// from a template with a different Secure Boot state.
@@ -134,6 +163,47 @@ mod tests {
         touch(root.path(), "usr/share/edk2/x64/OVMF_VARS.4m.fd");
         assert!(find(root.path(), true).is_none());
         assert!(find(root.path(), false).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enrolls_microsoft_keys_with_virt_fw_vars() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let blank = tmp.path().join("OVMF_VARS.4m.fd");
+        std::fs::write(&blank, b"blank").unwrap();
+        // A stand-in for virt-fw-vars: records its arguments, writes --output.
+        let tool = tmp.path().join("virt-fw-vars");
+        std::fs::write(
+            &tool,
+            "#!/bin/sh\necho \"$@\" > \"$(dirname \"$0\")/args\"\nprintf enrolled > \"$4\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pair = FirmwarePair {
+            code: tmp.path().join("code.fd"),
+            vars_template: blank.clone(),
+            ms_keys_enrolled: false,
+        };
+        let dest = tmp.path().join("vm/OVMF_VARS.fd");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, b"old").unwrap();
+        enroll_microsoft(&tool, &pair, &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"enrolled");
+        let args = std::fs::read_to_string(tmp.path().join("args")).unwrap();
+        assert!(args.contains("--enroll-microsoft --secure-boot"), "{args}");
+        assert!(
+            args.starts_with(&format!("--input {}", blank.display())),
+            "{args}"
+        );
+        // A failing tool leaves the old NVRAM and no temp file behind.
+        std::fs::write(&tool, "#!/bin/sh\necho broken >&2\nexit 1\n").unwrap();
+        let err = enroll_microsoft(&tool, &pair, &dest)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("broken"), "{err}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"enrolled");
+        assert!(!dest.with_extension("fd.tmp").exists());
     }
 
     #[test]

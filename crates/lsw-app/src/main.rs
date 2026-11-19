@@ -81,12 +81,29 @@ fn main() -> glib::ExitCode {
     app.run_with_args::<&str>(&[])
 }
 
+/// Clipboard representations, each in one wire format.
+type ClipItems = Vec<(ClipFormat, Vec<u8>)>;
+
 struct View {
     window: adw::ApplicationWindow,
     toolbar: adw::ToolbarView,
     title: adw::WindowTitle,
     stack: gtk::Stack,
     status: adw::StatusPage,
+    start_button: gtk::Button,
+    /// The VM supervisor this window started, until Windows shows up.
+    starting: std::cell::RefCell<Option<lsw_daemon::detached::Started>>,
+    paths: VmPaths,
+    /// The Windows clipboard, kept until the user presses a key or clicks
+    /// in this window. A compositor takes the selection only with the
+    /// serial of such an event in the focused window; a refused claim is not
+    /// reported, and GTK would then ignore every later Linux copy as its own.
+    pending_clipboard: std::cell::RefCell<Option<ClipItems>>,
+    /// A key press or click happened since this window became active.
+    input_since_active: Cell<bool>,
+    /// The status page says why Start failed: the backend's retries must not
+    /// replace it until the next Start or connection.
+    start_failed: Cell<bool>,
     picture: gtk::Picture,
     frame: Arc<Frame>,
     cmds: UnboundedSender<Cmd>,
@@ -96,6 +113,18 @@ struct View {
 }
 
 impl View {
+    /// A key press or click in the window: the Windows clipboard may now
+    /// become the Linux one.
+    fn user_input(&self) {
+        self.input_since_active.set(true);
+        if let Some(items) = self.pending_clipboard.take() {
+            set_host_clipboard(
+                &gtk::prelude::WidgetExt::display(&self.window).clipboard(),
+                items,
+            );
+        }
+    }
+
     fn send(&self, cmd: Cmd) {
         let _ = self.cmds.send(cmd);
     }
@@ -240,6 +269,12 @@ fn build_window(app: &adw::Application, options: Options) {
         title,
         stack,
         status,
+        start_button: start_button.clone(),
+        starting: Default::default(),
+        paths: paths_for_size.clone(),
+        pending_clipboard: Default::default(),
+        input_since_active: Cell::new(false),
+        start_failed: Cell::new(false),
         picture: picture.clone(),
         frame,
         cmds,
@@ -281,13 +316,16 @@ fn build_window(app: &adw::Application, options: Options) {
     start_button.connect_clicked(glib::clone!(
         #[weak]
         view,
-        move |b| {
-            b.set_sensitive(false);
-            view.status.set_description(Some("Starting Windows…"));
-            if let Err(e) = start_vm(&vm_name) {
-                view.status
-                    .set_description(Some(&format!("Could not start Windows: {e}")));
-                b.set_sensitive(true);
+        move |b| match start_vm(&vm_name) {
+            Ok(started) => {
+                b.set_sensitive(false);
+                view.start_failed.set(false);
+                view.status.set_description(Some("Starting Windows…"));
+                view.starting.replace(Some(started));
+            }
+            Err(e) => {
+                view.start_failed.set(true);
+                view.status.set_description(Some(&e));
             }
         }
     ));
@@ -301,6 +339,7 @@ fn build_window(app: &adw::Application, options: Options) {
         #[upgrade_or]
         glib::Propagation::Proceed,
         move |_, keyval, keycode, state| {
+            view.user_input();
             let lsw_mod =
                 state.contains(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SUPER_MASK);
             if lsw_mod && matches!(keyval, gdk::Key::f | gdk::Key::F) {
@@ -342,6 +381,7 @@ fn build_window(app: &adw::Application, options: Options) {
         view,
         move |w| {
             if !w.is_active() {
+                view.input_since_active.set(false);
                 for qnum in std::mem::take(&mut *view.held.borrow_mut()) {
                     view.send(Cmd::Key { qnum, down: false });
                 }
@@ -367,6 +407,7 @@ fn build_window(app: &adw::Application, options: Options) {
         #[weak]
         view,
         move |g, _, x, y| {
+            view.user_input();
             view.picture.grab_focus();
             if let Some((x, y)) = view.to_frame(x, y) {
                 view.send(Cmd::MouseAbs { x, y });
@@ -459,9 +500,13 @@ fn build_window(app: &adw::Application, options: Options) {
         #[weak]
         view,
         move |cb| {
+            tracing::debug!("Linux clipboard changed (ours: {})", cb.is_local());
             if cb.is_local() {
                 return; // our own copy of the Windows clipboard
             }
+            // A newer Linux copy: a Windows clipboard still waiting for a
+            // click must not replace it.
+            view.pending_clipboard.take();
             let cb = cb.clone();
             glib::spawn_future_local(async move {
                 if let Some(items) = read_host_clipboard(&cb).await {
@@ -485,6 +530,9 @@ fn build_window(app: &adw::Application, options: Options) {
             while let Ok(msg) = ui_rx.recv().await {
                 match msg {
                     UiMsg::Connected => {
+                        view.starting.take();
+                        view.start_failed.set(false);
+                        view.start_button.set_sensitive(true);
                         view.title.set_subtitle("Running");
                         view.stack.set_visible_child_name("display");
                         view.picture.grab_focus();
@@ -509,14 +557,44 @@ fn build_window(app: &adw::Application, options: Options) {
                         view.title
                             .set_subtitle(&format!("Running · LSW agent {version}"));
                     }
-                    UiMsg::GuestClipboard(items) => set_host_clipboard(&clipboard, items),
+                    UiMsg::GuestClipboard(items) => {
+                        if view.window.is_active() && view.input_since_active.get() {
+                            view.pending_clipboard.take();
+                            set_host_clipboard(&clipboard, items);
+                        } else {
+                            view.pending_clipboard.replace(Some(items));
+                        }
+                    }
                     UiMsg::Disconnected(reason) => {
                         tracing::info!("not connected: {reason}");
                         view.title.set_subtitle("Not running");
-                        view.status.set_description(Some(&format!(
-                            "Start Windows to use your Windows apps.\n({reason})"
-                        )));
                         view.stack.set_visible_child_name("status");
+                        // The backend retries every few seconds while
+                        // Windows boots: keep saying so until it is up or
+                        // the supervisor this window started has stopped.
+                        let mut starting = view.starting.borrow_mut();
+                        let text = match starting.as_mut() {
+                            Some(s) => {
+                                // Still starting, by this window or by
+                                // another supervisor (`lsw@NAME`).
+                                if s.running() || lsw_daemon::vm::supervised(&view.paths) {
+                                    continue;
+                                }
+                                view.start_failed.set(true);
+                                format!(
+                                    "Windows stopped while starting. For the reason, {}.",
+                                    s.log_hint()
+                                )
+                            }
+                            // Keep saying why Start failed.
+                            None if view.start_failed.get() => continue,
+                            None => {
+                                format!("Start Windows to use your Windows apps.\n({reason})")
+                            }
+                        };
+                        starting.take();
+                        view.status.set_description(Some(&text));
+                        view.start_button.set_sensitive(true);
                     }
                 }
             }
@@ -575,7 +653,7 @@ fn switch_to_coherence(window: &adw::ApplicationWindow, name: &str) {
         &["--name", name],
         &format!("lsw-coherence-{name}"),
     ) {
-        Ok(()) => window.close(),
+        Ok(_) => window.close(),
         Err(e) => tracing::warn!("cannot start Coherence: {e}"),
     }
 }
@@ -583,8 +661,31 @@ fn switch_to_coherence(window: &adw::ApplicationWindow, name: &str) {
 /// Start the VM supervisor in the background: as a transient systemd user
 /// unit when systemd is available (it then outlives the app and logs to
 /// the journal), otherwise as a plain child process.
-fn start_vm(name: &str) -> std::io::Result<()> {
+fn start_vm(name: &str) -> Result<lsw_daemon::detached::Started, String> {
+    let flag = if name == "windows" {
+        String::new()
+    } else {
+        format!(" --name {name}")
+    };
+    let cfg = VmPaths::resolve(name)
+        .ok()
+        .and_then(|p| lsw_daemon::config::VmConfig::load(&p.data).ok());
+    match cfg {
+        None => {
+            return Err(format!(
+                "There is no Windows VM yet. Create it in a terminal with `lsw{flag} create`, \
+                 then `lsw{flag} install`."
+            ));
+        }
+        Some(cfg) if cfg.install.is_some() => {
+            return Err(format!(
+                "Windows is not installed yet. Install it in a terminal with `lsw{flag} install`."
+            ));
+        }
+        Some(_) => {}
+    }
     lsw_daemon::detached::start("lsw", &["--name", name, "run"], &format!("lsw-vm-{name}"))
+        .map_err(|e| format!("Could not start Windows: {e}"))
 }
 
 /// Largest clipboard item read from the Linux side.
@@ -637,7 +738,7 @@ async fn read_host_clipboard(cb: &gdk::Clipboard) -> Option<Vec<(ClipFormat, Vec
     (!items.is_empty()).then_some(items)
 }
 
-fn set_host_clipboard(cb: &gdk::Clipboard, items: Vec<(ClipFormat, Vec<u8>)>) {
+fn set_host_clipboard(cb: &gdk::Clipboard, items: ClipItems) {
     let providers: Vec<gdk::ContentProvider> = items
         .into_iter()
         .map(|(format, data)| match format {
@@ -652,6 +753,7 @@ fn set_host_clipboard(cb: &gdk::Clipboard, items: Vec<(ClipFormat, Vec<u8>)>) {
             }
         })
         .collect();
+    tracing::debug!("Windows clipboard to Linux: {} format(s)", providers.len());
     let union = gdk::ContentProvider::new_union(&providers);
     if let Err(e) = cb.set_content(Some(&union)) {
         tracing::warn!("clipboard: {e}");

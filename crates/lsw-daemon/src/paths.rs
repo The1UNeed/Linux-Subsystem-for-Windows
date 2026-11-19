@@ -29,6 +29,8 @@ pub struct VmPaths {
 impl VmPaths {
     /// Resolve from the environment.
     pub fn resolve(name: &str) -> anyhow::Result<Self> {
+        // Before any path is built from it.
+        crate::config::check_vm_name(name)?;
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .filter(|h| h.is_absolute());
@@ -220,5 +222,24 @@ mod tests {
             "win",
         );
         assert!(p.create().is_err());
+    }
+
+    #[test]
+    fn names_that_leave_the_vm_directory_are_refused() {
+        for bad in [
+            "",
+            "../evil",
+            "a/b",
+            ".",
+            "..",
+            "win dows",
+            "-work",
+            "x".repeat(33).as_str(),
+        ] {
+            assert!(VmPaths::resolve(bad).is_err(), "{bad:?} accepted");
+        }
+        for good in ["windows", "Win_11-dev", "_work"] {
+            assert!(VmPaths::resolve(good).is_ok(), "{good:?} refused");
+        }
     }
 }

@@ -106,8 +106,10 @@ pub fn dib_to_png(dib: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Convert PNG to a packed 32 bpp top-down DIB (`BITMAPINFOHEADER`,
-/// `BI_RGB`), the form every Windows app can paste.
+/// Convert PNG to a packed 32 bpp bottom-up DIB (`BITMAPINFOHEADER`,
+/// `BI_RGB`), the form every Windows app can paste. Not top-down (negative
+/// height): .NET (WinForms and WPF) and the clipboard's CF_BITMAP synthesis
+/// return no image for it.
 pub fn png_to_dib(data: &[u8]) -> Option<Vec<u8>> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(data));
     decoder.set_transformations(png::Transformations::normalize_to_color8());
@@ -131,13 +133,16 @@ pub fn png_to_dib(data: &[u8]) -> Option<Vec<u8>> {
     let mut dib = Vec::with_capacity(40 + (w * h * 4) as usize);
     dib.extend_from_slice(&40u32.to_le_bytes());
     dib.extend_from_slice(&(w as i32).to_le_bytes());
-    dib.extend_from_slice(&(-(h as i32)).to_le_bytes()); // top-down
+    dib.extend_from_slice(&(h as i32).to_le_bytes()); // bottom-up
     dib.extend_from_slice(&1u16.to_le_bytes()); // planes
     dib.extend_from_slice(&32u16.to_le_bytes()); // bpp
     dib.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB
     dib.extend_from_slice(&(w * h * 4).to_le_bytes());
     dib.extend_from_slice(&[0u8; 16]); // resolution, palette counts
-    for row in buf[..frame.buffer_size()].chunks_exact(frame.line_size) {
+    for row in buf[..frame.buffer_size()]
+        .chunks_exact(frame.line_size)
+        .rev()
+    {
         for px in row.chunks_exact(channels).take(w as usize) {
             let (r, g, b, a) = match channels {
                 4 => (px[0], px[1], px[2], px[3]),
@@ -220,6 +225,18 @@ mod tests {
         let dib = png_to_dib(&png_data).unwrap();
         let again = dib_to_png(&dib).unwrap();
         assert_eq!(decode_rgba(&png_data), decode_rgba(&again));
+    }
+
+    #[test]
+    fn png_becomes_a_bottom_up_dib() {
+        let dib = png_to_dib(&dib_to_png(&dib24()).unwrap()).unwrap();
+        assert_eq!(
+            i32::from_le_bytes(dib[8..12].try_into().unwrap()),
+            2,
+            "positive height"
+        );
+        // The first stored row is the bottom one: blue, red (as BGRA).
+        assert_eq!(&dib[40..48], &[255, 0, 0, 255, 0, 0, 255, 255]);
     }
 
     #[test]

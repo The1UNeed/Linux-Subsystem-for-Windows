@@ -6,6 +6,6 @@ Comment=Run Windows apps on Linux
 Exec=lsw-app
 Icon=dev.lsw.Lsw
 Categories=System;Emulator;
-Keywords=windows;vm;lsw;virtual machine;
+Keywords=vm;lsw;virtual machine;win11;
 StartupNotify=true
 StartupWMClass=dev.lsw.Lsw

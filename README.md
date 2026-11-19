@@ -26,7 +26,7 @@ app starts from the Linux app grid ([Paint](docs/images/coherence-launch-paint.p
 | Unattended install | Downloads Windows 11 from Microsoft (refused unless it matches the SHA-256 Microsoft publishes), the 90-day Enterprise Evaluation (HTTPS from Microsoft; Microsoft publishes no checksum for it) or uses your ISO. Secure Boot with Microsoft's keys, TPM 2.0, no hardware-requirement bypasses. About 20 minutes. |
 | Coherence | Each Windows window is a native Wayland window; Windows draws its own title bar. Title-bar drags and edge drags are native moves and resizes. |
 | Windows apps in the app grid | One launcher per installed Windows app (Store and desktop), with its icon, grouped in a "Windows Apps" folder on GNOME. Clicking one starts Windows if needed. |
-| Window and Full Screen views | The whole Windows desktop in the LSW app; Windows follows the window size, and Full Screen runs at the monitor's native resolution. |
+| Window and Full Screen views | The whole Windows desktop in the LSW app. Full Screen runs at the monitor's native resolution; in a window, Windows takes the window's size when its display driver offers that mode, otherwise the largest mode that fits (the window letterboxes it). |
 | Shared folders | Linux Desktop, Documents, Downloads, Pictures, Music and Videos are the same folders in Windows (virtiofs, sandboxed). |
 | Clipboard | Text, HTML and images, both ways, in the Window and Full Screen views. |
 | Sound | Windows plays through PipeWire. The microphone is off in this alpha. |
@@ -45,9 +45,6 @@ app starts from the Linux app grid ([Paint](docs/images/coherence-launch-paint.p
   assignment does not survive a host restart.
 * The clipboard is not shared while you use Coherence (it is in the Window
   and Full Screen views).
-* Secure Boot needs UEFI firmware with Microsoft's keys enrolled. Ubuntu's
-  `ovmf` has it; Arch's `edk2-ovmf` does not, so on CachyOS/Arch `lsw create`
-  stops and explains (`--no-secure-boot` creates the VM with Secure Boot off).
 * Not yet: Windows tray icons and notifications on the Linux desktop,
   opening links in the Linux browser, file associations, drag and drop,
   saving the VM to disk when idle (shared folders block QEMU 8.2's state

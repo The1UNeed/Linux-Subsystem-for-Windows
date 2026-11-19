@@ -107,23 +107,38 @@ pub enum UsbError {
         vendor: u16,
         product: u16,
     },
+    #[error("cannot open {path}: {source}")]
+    Open {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("{0} is not plugged into Windows")]
+    NotAttached(String),
     #[error(transparent)]
     Qmp(#[from] QmpError),
 }
 
 /// Plug `device` into the VM.
 pub async fn attach(qmp: &mut Qmp, device: &UsbDevice) -> Result<(), UsbError> {
-    if std::fs::OpenOptions::new()
+    match std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(&device.node)
-        .is_err()
     {
-        return Err(UsbError::Permission {
-            path: device.node.clone(),
-            vendor: device.vendor_id,
-            product: device.product_id,
-        });
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Err(UsbError::Permission {
+                path: device.node.clone(),
+                vendor: device.vendor_id,
+                product: device.product_id,
+            });
+        }
+        Err(source) => {
+            return Err(UsbError::Open {
+                path: device.node.clone(),
+                source,
+            });
+        }
     }
     qmp.execute(
         "device_add",
@@ -141,9 +156,19 @@ pub async fn attach(qmp: &mut Qmp, device: &UsbDevice) -> Result<(), UsbError> {
 
 /// Unplug a device previously attached with [`attach`].
 pub async fn detach(qmp: &mut Qmp, device: &UsbDevice) -> Result<(), UsbError> {
-    qmp.execute("device_del", Some(json!({ "id": device.qemu_id() })))
-        .await?;
-    Ok(())
+    match qmp
+        .execute("device_del", Some(json!({ "id": device.qemu_id() })))
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(QmpError::Command { class, .. }) if class == "DeviceNotFound" => {
+            Err(UsbError::NotAttached(format!(
+                "{:04x}:{:04x}",
+                device.vendor_id, device.product_id
+            )))
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[cfg(test)]

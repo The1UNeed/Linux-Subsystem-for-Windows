@@ -34,6 +34,28 @@ pub fn lock_vm(paths: &VmPaths) -> anyhow::Result<std::fs::File> {
     }
 }
 
+/// Whether a supervisor (`lsw run`, `lsw install`, `lsw@NAME`) holds the
+/// VM's lock right now. Never creates anything.
+pub fn supervised(paths: &VmPaths) -> bool {
+    let Ok(file) = std::fs::OpenOptions::new()
+        .write(true)
+        .open(paths.data.join("supervisor.lock"))
+    else {
+        return false;
+    };
+    matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+}
+
+/// Make what QEMU wrote to the VM's disk and NVRAM durable. Needed after
+/// running with the install-time write-back cache, before anything relies
+/// on the installation being on disk.
+pub fn sync_storage(cfg: &VmConfig) -> std::io::Result<()> {
+    for path in [&cfg.disk_path, &cfg.firmware.vars] {
+        std::fs::File::open(path)?.sync_all()?;
+    }
+    Ok(())
+}
+
 /// Create the raw system disk as a sparse file (no space used until Windows
 /// writes). An existing disk is never touched.
 pub fn create_sparse_disk(path: &Path, size_gib: u64) -> std::io::Result<bool> {
@@ -44,9 +66,25 @@ pub fn create_sparse_disk(path: &Path, size_gib: u64) -> std::io::Result<bool> {
         .write(true)
         .create_new(true)
         .open(path)?;
+    disable_cow(&f);
     f.set_len(size_gib * 1024 * 1024 * 1024)?;
     Ok(true)
 }
+
+/// On copy-on-write filesystems (btrfs, the CachyOS default) a VM disk
+/// fragments under the guest's random writes and is compressed too: turn
+/// CoW off, as libvirt does. Only takes effect on an empty file; elsewhere
+/// (ext4, xfs) the flag is not supported and nothing changes.
+#[cfg(target_os = "linux")]
+fn disable_cow(f: &std::fs::File) {
+    use rustix::fs::{IFlags, ioctl_getflags, ioctl_setflags};
+    if let Ok(flags) = ioctl_getflags(f) {
+        let _ = ioctl_setflags(f, flags | IFlags::NOCOW);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn disable_cow(_: &std::fs::File) {}
 
 /// A VM that is not running.
 #[derive(Debug, Clone)]
@@ -277,6 +315,9 @@ const POWER_BUTTON_REPEAT: Duration = Duration::from_secs(10);
 pub enum PowerOff {
     /// Windows shut down and QEMU exited.
     Clean(ExitStatus),
+    /// QEMU exited without Windows shutting down (quit from outside, or it
+    /// failed).
+    Quit(ExitStatus),
     /// Windows did not shut down within the grace period; QEMU was stopped.
     Forced(Duration, ExitStatus),
 }
@@ -285,6 +326,7 @@ impl std::fmt::Display for PowerOff {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PowerOff::Clean(s) => write!(f, "VM powered off ({s})."),
+            PowerOff::Quit(s) => write!(f, "QEMU exited before Windows shut down ({s})."),
             PowerOff::Forced(grace, _) => write!(
                 f,
                 "Windows did not shut down within {} s; the VM was stopped.",
@@ -292,6 +334,14 @@ impl std::fmt::Display for PowerOff {
             ),
         }
     }
+}
+
+/// Windows powered off: not a panic or reset (also `guest: true`), not a
+/// `quit` from a monitor.
+fn is_guest_shutdown(e: &crate::qmp::Event) -> bool {
+    e.name == "SHUTDOWN"
+        && e.data.get("guest").and_then(serde_json::Value::as_bool) == Some(true)
+        && e.data.get("reason").and_then(serde_json::Value::as_str) == Some("guest-shutdown")
 }
 
 /// Something happened to a running VM.
@@ -362,14 +412,32 @@ impl Running {
             let next = (tokio::time::Instant::now() + POWER_BUTTON_REPEAT).min(deadline);
             match tokio::time::timeout_at(next, self.qemu.wait()).await {
                 Ok(status) => {
+                    let by_guest = self.saw_guest_shutdown().await;
                     self.reap_helpers().await;
-                    return Ok(PowerOff::Clean(status?));
+                    let status = status?;
+                    return Ok(if by_guest {
+                        PowerOff::Clean(status)
+                    } else {
+                        PowerOff::Quit(status)
+                    });
                 }
                 Err(_) if next >= deadline => {
                     tracing::warn!("guest did not power off within {grace:?}; quitting QEMU");
                     return Ok(PowerOff::Forced(grace, self.kill().await?));
                 }
                 Err(_) => {}
+            }
+        }
+    }
+
+    /// After QEMU exited: whether its last events say Windows powered off.
+    async fn saw_guest_shutdown(&mut self) -> bool {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(2), self.qmp.next_event()).await {
+                Ok(Ok(e)) if is_guest_shutdown(&e) => return true,
+                Ok(Ok(_)) => {}
+                // The monitor closed (or went quiet): no such event.
+                _ => return false,
             }
         }
     }
@@ -522,6 +590,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_windows_powering_off_counts_as_its_shutdown() {
+        let event = |data| crate::qmp::Event {
+            name: "SHUTDOWN".into(),
+            data,
+        };
+        assert!(is_guest_shutdown(&event(
+            serde_json::json!({"guest": true, "reason": "guest-shutdown"})
+        )));
+        // `lsw ctl quit` (QEMU 11: reason host-qmp-quit); Windows crashing.
+        for (guest, reason) in [
+            (false, "host-qmp-quit"),
+            (true, "guest-panic"),
+            (true, "guest-reset"),
+        ] {
+            assert!(!is_guest_shutdown(&event(
+                serde_json::json!({"guest": guest, "reason": reason})
+            )));
+        }
+        assert!(!is_guest_shutdown(&crate::qmp::Event {
+            name: "POWERDOWN".into(),
+            data: serde_json::json!({}),
+        }));
+    }
+
+    #[test]
     fn only_one_supervisor_per_vm() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = VmPaths::with_bases(
@@ -530,9 +623,12 @@ mod tests {
             &tmp.path().join("h"),
             "win",
         );
+        assert!(!supervised(&paths));
         let first = lock_vm(&paths).unwrap();
+        assert!(supervised(&paths));
         assert!(lock_vm(&paths).is_err());
         drop(first);
+        assert!(!supervised(&paths));
         assert!(lock_vm(&paths).is_ok());
     }
 

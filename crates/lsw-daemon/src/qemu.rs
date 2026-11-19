@@ -94,6 +94,9 @@ pub struct LaunchOptions {
     pub display_size: (u32, u32),
     /// Enable QEMU's seccomp sandbox.
     pub sandbox: bool,
+    /// QMP monitors as `-object monitor-qmp` (QEMU 11+, where `-mon` is
+    /// deprecated) instead of `-mon`.
+    pub monitor_objects: bool,
 }
 
 impl Default for LaunchOptions {
@@ -105,6 +108,7 @@ impl Default for LaunchOptions {
             tools_iso: None,
             display_size: (1280, 800),
             sandbox: true,
+            monitor_objects: false,
         }
     }
 }
@@ -192,9 +196,21 @@ pub fn build_args(cfg: &VmConfig, paths: &VmPaths, opts: &LaunchOptions) -> Vec<
     push(&["-device", "tpm-crb,tpmdev=tpm0"]);
 
     // System disk: raw, virtio-blk with a dedicated iothread.
-    let io = match opts.disk_io {
-        DiskIo::IoUring => "cache=none,aio=io_uring",
-        DiskIo::Threads => "cache=writeback,aio=threads",
+    let io = if cfg.install.is_some() {
+        // Windows Setup writes ~11 GB in small random writes and flushes
+        // all the time; with O_DIRECT each one waits for the disk, which on
+        // a slow disk makes the installation take hours. While installing,
+        // the host page cache takes them and coalesces them (write-back,
+        // guest flushes ignored); `lsw install` records Windows as installed
+        // only after QEMU has exited and it has synced the disk. A host
+        // crash before that only means installing again (Setup repartitions
+        // the disk).
+        "cache=unsafe,aio=threads"
+    } else {
+        match opts.disk_io {
+            DiskIo::IoUring => "cache=none,aio=io_uring",
+            DiskIo::Threads => "cache=writeback,aio=threads",
+        }
     };
     push(&["-object", "iothread,id=io0"]);
     push(&[
@@ -425,7 +441,17 @@ pub fn build_args(cfg: &VmConfig, paths: &VmPaths, opts: &LaunchOptions) -> Vec<
     push(&["-chardev", &serial]);
     push(&["-device", "isa-serial,chardev=ser0"]);
 
-    // Control.
+    // Control: four QMP monitors.
+    let monitor = |chardev: &str| -> [String; 2] {
+        if opts.monitor_objects {
+            [
+                "-object".into(),
+                format!("monitor-qmp,id=mon-{chardev},chardev={chardev}"),
+            ]
+        } else {
+            ["-mon".into(), format!("chardev={chardev},mode=control")]
+        }
+    };
     push(&[
         "-chardev",
         &format!(
@@ -433,7 +459,8 @@ pub fn build_args(cfg: &VmConfig, paths: &VmPaths, opts: &LaunchOptions) -> Vec<
             p(&paths.qmp_socket())
         ),
     ]);
-    push(&["-mon", "chardev=qmp,mode=control"]);
+    let m = monitor("qmp");
+    push(&[&m[0], &m[1]]);
     // Second monitor for `lsw ctl` and tests while the supervisor owns the first.
     push(&[
         "-chardev",
@@ -442,7 +469,8 @@ pub fn build_args(cfg: &VmConfig, paths: &VmPaths, opts: &LaunchOptions) -> Vec<
             p(&paths.ctl_socket())
         ),
     ]);
-    push(&["-mon", "chardev=qmpctl,mode=control"]);
+    let m = monitor("qmpctl");
+    push(&[&m[0], &m[1]]);
     // Third monitor for the UI (passes the display socket with `add_client`).
     push(&[
         "-chardev",
@@ -451,7 +479,8 @@ pub fn build_args(cfg: &VmConfig, paths: &VmPaths, opts: &LaunchOptions) -> Vec<
             p(&paths.ui_qmp_socket())
         ),
     ]);
-    push(&["-mon", "chardev=qmpui,mode=control"]);
+    let m = monitor("qmpui");
+    push(&[&m[0], &m[1]]);
     // Fourth monitor for the Coherence client, which may run beside the
     // Window view.
     push(&[
@@ -461,7 +490,8 @@ pub fn build_args(cfg: &VmConfig, paths: &VmPaths, opts: &LaunchOptions) -> Vec<
             p(&paths.coherence_qmp_socket())
         ),
     ]);
-    push(&["-mon", "chardev=qmpcoh,mode=control"]);
+    let m = monitor("qmpcoh");
+    push(&[&m[0], &m[1]]);
     push(&["-pidfile", &p(&paths.qemu_pidfile())]);
     push(&["-boot", "menu=off,strict=on"]);
 
@@ -545,6 +575,29 @@ mod tests {
 
     fn joined(args: &[String]) -> String {
         args.join(" ")
+    }
+
+    #[test]
+    fn installing_caches_the_disk_on_the_host_running_does_not() {
+        let dir = Path::new("/data/win");
+        let paths = VmPaths::with_bases(
+            Path::new("/data"),
+            Path::new("/run"),
+            Path::new("/home/u/.cache/lsw/sock"),
+            "win",
+        );
+        let mut c = cfg(dir);
+        let running = joined(&build_args(&c, &paths, &LaunchOptions::default()));
+        assert!(running.contains("disk.raw,if=none,id=disk0,format=raw,cache=none,aio=io_uring"));
+        c.install = Some(crate::config::InstallMedia {
+            windows_iso: "/c/win.iso".into(),
+            virtio_win_iso: "/c/virtio.iso".into(),
+            setup_iso: dir.join("setup.iso"),
+        });
+        let installing = joined(&build_args(&c, &paths, &LaunchOptions::default()));
+        assert!(
+            installing.contains("disk.raw,if=none,id=disk0,format=raw,cache=unsafe,aio=threads")
+        );
     }
 
     #[test]
@@ -653,12 +706,15 @@ mod tests {
             tools_iso: Some("/d/tools.iso".into()),
             display_size: (2560, 1440),
             sandbox: false,
+            monitor_objects: true,
             disk_io: DiskIo::Threads,
             display: Display::VncUnix("/r/vnc.sock".into()),
         };
         let s = joined(&build_args(&c, &paths, &opts));
         assert!(!s.contains("virtio-net"));
         assert!(!s.contains("-sandbox"));
+        assert!(s.contains("-object monitor-qmp,id=mon-qmpctl,chardev=qmpctl"));
+        assert!(!s.contains("-mon "));
         assert!(s.contains("cache=writeback,aio=threads"));
         assert!(s.contains("-vnc unix:/r/vnc.sock"));
         assert!(s.contains("file=/d/tools.iso,if=none,id=cdtools,media=cdrom,readonly=on"));
@@ -695,6 +751,7 @@ mod tests {
             ..LaunchOptions::default()
         };
         let s = joined(&build_args(&c, &paths, &opts));
+        assert!(s.contains("-mon chardev=qmpcoh,mode=control"));
         assert!(s.contains("socket,id=fs0,path=/home/u/.cache/lsw/sock/win/fs0.sock"));
         assert!(s.contains(
             "vhost-user-fs-pci,chardev=fs1,tag=lsw-music,queue-size=1024,bus=pcie.0,addr=0x11"
